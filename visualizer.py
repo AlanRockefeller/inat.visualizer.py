@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QStatusBar, QFileDialog, QLabel, QListWidget, QMessageBox,
                              QProgressBar, QColorDialog, QTextEdit, QSplashScreen, QDialog,
                              QDialogButtonBox, QSlider, QSpinBox, QSizePolicy)
-from PyQt6.QtCore import QSettings, Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtCore import QSettings, Qt, QTimer, QThread, pyqtSignal, QObject, QMutex, QWaitCondition, QMutexLocker
 from PyQt6.QtGui import QAction, QFont, QColor, QPixmap, QDoubleValidator, QGuiApplication
 import pyinaturalist
 import pandas as pd
@@ -50,7 +50,210 @@ pyinaturalist.user_agent = "iNaturalist Seasonal Visualizer/1.0 (Contact: your_e
 
 # --- Constants for MapDialog ---
 MAX_TILES_PER_REQUEST = 100
-MAX_CACHE_SIZE = 500  # Max number of tiles to keep in memory
+MAX_CACHE_SIZE = 500  # Max number of tiles to keep in memory (RAM)
+TILE_CACHE_DIR_NAME = "tile_cache"
+MAX_DISK_CACHE_SIZE_MB = 200
+
+class DiskTileCache:
+    """Persistent disk cache for map tiles with size limit and LRU pruning."""
+    def __init__(self, parent_dir, max_size_mb=MAX_DISK_CACHE_SIZE_MB):
+        self.cache_dir = Path(parent_dir) / TILE_CACHE_DIR_NAME
+        self.max_size_mb = max_size_mb
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_path(self, z, x, y):
+        return self.cache_dir / str(z) / str(x) / f"{y}.png"
+
+    def get_tile(self, z, x, y):
+        path = self.get_path(z, x, y)
+        if path.exists():
+            try:
+                # Update mtime for LRU
+                path.touch()
+                return Image.open(path).convert("RGB")
+            except Exception as e:
+                logging.warning(f"Corrupt tile in disk cache {path}: {e}")
+        return None
+
+    def put_tile(self, z, x, y, image_bytes):
+        path = self.get_path(z, x, y)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic write
+        temp_path = path.with_suffix(f".tmp.{os.getpid()}.{time.time()}")
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(image_bytes)
+            os.replace(temp_path, path)
+            self._prune_if_needed()
+        except Exception as e:
+            logging.error(f"Failed to write tile to disk {path}: {e}")
+            if temp_path.exists():
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+    def _prune_if_needed(self):
+        # Simple probability-based check to avoid scanning on every write
+        if np.random.random() > 0.05: 
+            return
+
+        total_size = 0
+        files = []
+        for p in self.cache_dir.rglob("*.png"):
+            try:
+                stat = p.stat()
+                total_size += stat.st_size
+                files.append((stat.st_mtime, p, stat.st_size))
+            except OSError:
+                pass
+
+        if total_size > self.max_size_mb * 1024 * 1024:
+            # Sort by mtime (oldest first)
+            files.sort()
+            deleted_size = 0
+            target_reduction = total_size * 0.2 # clear 20%
+            for mtime, p, size in files:
+                try:
+                    p.unlink()
+                    deleted_size += size
+                    if deleted_size >= target_reduction:
+                        break
+                except OSError:
+                    pass
+            # Try to remove empty dirs
+            for p in self.cache_dir.rglob("*"):
+                if p.is_dir():
+                    try:
+                        p.rmdir() # Only removes if empty
+                    except OSError:
+                        pass
+
+class TileLoaderWorker(QThread):
+    """Background worker to fetch map tiles."""
+    view_ready = pyqtSignal(int, object, tuple)  # job_id, composite_image, extent
+
+    def __init__(self, working_dir):
+        super().__init__()
+        self.disk_cache = DiskTileCache(working_dir)
+        self.ram_cache = OrderedDict()
+        self.mutex = QMutex()
+        self.wait_condition = QWaitCondition()
+        self._pending_job = None  # (job_id, zoom, x_min, x_max, y_min, y_max)
+        self._running = True
+        
+    def request_view(self, job_id, zoom, x_min, x_max, y_min, y_max):
+        with QMutexLocker(self.mutex):
+            self._pending_job = (job_id, zoom, x_min, x_max, y_min, y_max)
+            self.wait_condition.wakeOne()
+
+    def stop(self):
+        with QMutexLocker(self.mutex):
+            self._running = False
+            self.wait_condition.wakeOne()
+        self.wait()
+
+    def run(self):
+        session = requests.Session()
+        session.headers.update({"User-Agent": pyinaturalist.user_agent})
+
+        while True:
+            job = None
+            with QMutexLocker(self.mutex):
+                while self._pending_job is None and self._running:
+                    self.wait_condition.wait(self.mutex)
+                if not self._running:
+                    return
+                job = self._pending_job
+                self._pending_job = None # Clear it so we don't repeat unless new one comes
+            
+            if not job: 
+                continue
+
+            job_id, zoom, x_min, x_max, y_min, y_max = job
+            self._process_job(session, job_id, zoom, x_min, x_max, y_min, y_max)
+
+    def _process_job(self, session, job_id, zoom, x_min, x_max, y_min, y_max):
+        x_range = range(x_min, x_max + 1)
+        y_range = range(y_min, y_max + 1)
+        
+        tiles = []
+        tile_positions = []
+        
+        for x in x_range:
+            for y in y_range:
+                # Basic stale check
+                with QMutexLocker(self.mutex):
+                    if self._pending_job is not None and self._pending_job[0] > job_id:
+                        return # Abort this job
+
+                tile_key = (zoom, x, y)
+                img = None
+                
+                # 1. RAM Cache
+                if tile_key in self.ram_cache:
+                    img = self.ram_cache[tile_key]
+                    self.ram_cache.move_to_end(tile_key)
+                
+                # 2. Disk Cache
+                if not img:
+                    img = self.disk_cache.get_tile(zoom, x, y)
+                    if img:
+                        self.ram_cache[tile_key] = img
+                        if len(self.ram_cache) > MAX_CACHE_SIZE:
+                            self.ram_cache.popitem(last=False)
+                
+                # 3. Network
+                if not img:
+                    url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
+                    try:
+                        resp = session.get(url, timeout=2.0)
+                        if resp.status_code == 200:
+                            img_bytes = resp.content
+                            img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                            
+                            # Update caches
+                            self.ram_cache[tile_key] = img
+                            if len(self.ram_cache) > MAX_CACHE_SIZE:
+                                self.ram_cache.popitem(last=False)
+                            self.disk_cache.put_tile(zoom, x, y, img_bytes)
+                        else:
+                            logging.debug(f"Tile {zoom}/{x}/{y} HTTP {resp.status_code}")
+                    except RequestException as e:
+                        logging.debug(f"Failed to load tile {zoom}/{x}/{y}: {e}")
+
+                if img:
+                    tiles.append(img)
+                    tile_positions.append((x, y))
+
+        if not tiles:
+            return
+
+        # Stitch
+        min_x = min(p[0] for p in tile_positions)
+        min_y = min(p[1] for p in tile_positions)
+        
+        tile_w, tile_h = tiles[0].size
+        w = (max(p[0] for p in tile_positions) - min_x + 1) * tile_w
+        h = (max(p[1] for p in tile_positions) - min_y + 1) * tile_h
+        
+        composite = Image.new('RGB', (w, h), (230, 230, 230))
+        for img, (x, y) in zip(tiles, tile_positions):
+            composite.paste(img, ((x - min_x) * tile_w, (y - min_y) * tile_h))
+            
+        # Calculate extent
+        def num2deg(xtile, ytile, zoom):
+            n = 2.0 ** zoom
+            lon_deg = xtile / n * 360.0 - 180.0
+            lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * ytile / n)))
+            lat_deg = np.degrees(lat_rad)
+            return lat_deg, lon_deg
+
+        north, west = num2deg(min_x, min_y, zoom)
+        south, east = num2deg(max(p[0] for p in tile_positions) + 1, max(p[1] for p in tile_positions) + 1, zoom)
+        
+        # Emit result
+        self.view_ready.emit(job_id, composite, (west, east, south, north))
 
 class DatabaseProgressTracker:
     """Track database operation progress without impacting performance"""
@@ -159,9 +362,6 @@ class CustomSplashScreen(QSplashScreen):
 
 class MapDialog(QDialog):
     """Interactive map dialog for setting coordinates and radius using matplotlib"""
-
-    # Shared LRU tile cache for all MapDialog instances
-    tile_cache = OrderedDict()
     
     def __init__(self, parent=None, lat=37.7749, lon=-122.4194, radius=10):
         super().__init__(parent)
@@ -169,9 +369,15 @@ class MapDialog(QDialog):
         self.lat = lat
         self.lon = lon
         self.radius = radius
-
-        # Use the shared class-level cache via an instance attribute
-        self.tile_cache = MapDialog.tile_cache
+        
+        # Worker setup
+        working_dir = parent.working_dir if parent else os.getcwd()
+        self.worker = TileLoaderWorker(working_dir)
+        self.worker.view_ready.connect(self.on_view_ready)
+        self.worker.start()
+        
+        self.job_counter = 0
+        self.current_job_id = 0
         
         self.setWindowTitle("Interactive Map - Set Location")
         self.setModal(True)
@@ -180,7 +386,6 @@ class MapDialog(QDialog):
         w = int(screen.width() * 0.75)
         h = int(screen.height() * 0.75)
         self.resize(w, h)
-
         
         # Create layout
         layout = QVBoxLayout(self)
@@ -188,22 +393,18 @@ class MapDialog(QDialog):
         # Controls layout
         controls_layout = QHBoxLayout()
         
-        # Instructions
         instructions = QLabel("Click on the map to set location. Use mouse wheel to zoom.")
         instructions.setStyleSheet("font-weight: bold; color: #333;")
         controls_layout.addWidget(instructions)
         
-        # Radius control
         radius_label = QLabel("Radius (km):")
         self.radius_spinbox = QSpinBox()
         self.radius_spinbox.setRange(1, 1000)
         self.radius_spinbox.setValue(int(radius))
         self.radius_spinbox.valueChanged.connect(self.update_radius)
         
-        # Current coordinates display
         self.coord_label = QLabel(f"Lat: {lat:.4f}, Lon: {lon:.4f}")
         
-        # Add controls to layout
         controls_layout.addWidget(radius_label)
         controls_layout.addWidget(self.radius_spinbox)
         controls_layout.addWidget(self.coord_label)
@@ -211,511 +412,206 @@ class MapDialog(QDialog):
         
         layout.addLayout(controls_layout)
         
-        # Create matplotlib figure
         self.figure, self.ax = plt.subplots()
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.canvas.setMinimumSize(800, 600)
         layout.addWidget(self.canvas, stretch=1)
         
-        # Dialog buttons
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
+
+        # Timer for debounced reloads
+        self.update_timer = QTimer()
+        self.update_timer.setSingleShot(True)
+        self.update_timer.setInterval(200) # 200ms debounce
+        self.update_timer.timeout.connect(self.request_tiles_for_current_view)
         
         # Initialize the map
-        self.init_map()
+        self.ax.set_xlim(self.lon - 5, self.lon + 5)
+        self.ax.set_ylim(self.lat - 5, self.lat + 5)
         
+        self.ax.set_xlabel('Longitude', fontsize=12, fontweight='bold')
+        self.ax.set_ylabel('Latitude', fontsize=12, fontweight='bold')
+        self.ax.set_title('High-Resolution Interactive Map - Click to Set Location', fontsize=14, fontweight='bold')
+        self.ax.grid(False)
+        
+        # Overlays
+        self.marker, = self.ax.plot([], [], 'ro', markersize=12, markeredgecolor='darkred', markeredgewidth=3, zorder=10)
+        self.circle, = self.ax.plot([], [], 'r-', linewidth=3, alpha=0.8, zorder=5)
+        self.update_overlays()
+
         # Connect mouse events
         self.canvas.mpl_connect('button_press_event', self.on_click)
         self.canvas.mpl_connect('scroll_event', self.on_scroll)
 
-        # --- Pan support state & handlers ---
+        # Pan support
         self._is_panning = False
         self._last_pan_pos = None
         self.canvas.mpl_connect('button_press_event', self.on_mouse_press)
         self.canvas.mpl_connect('button_release_event', self.on_mouse_release)
         self.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
+
+        # Trigger initial load
+        self.request_tiles_for_current_view()
         
-    def init_map(self):
-        """Initialize the map display with high-resolution map tiles"""
-        # Clear the axes
-        self.ax.clear()
+    def closeEvent(self, event):
+        self.worker.stop()
+        super().closeEvent(event)
         
-        # Set up the map bounds based on current location
-        lat_range = 10.0  # degrees
-        lon_range = 10.0  # degrees
-        
-        # Calculate bounds
-        lat_min = self.lat - lat_range/2
-        lat_max = self.lat + lat_range/2
-        lon_min = self.lon - lon_range/2
-        lon_max = self.lon + lon_range/2
-        
-        # Load high-resolution map tiles
-        self.load_map_tiles(lat_min, lat_max, lon_min, lon_max)
-        
-        # Add current location marker
-        self.marker, = self.ax.plot(self.lon, self.lat, 'ro', markersize=12, markeredgecolor='darkred', markeredgewidth=3, zorder=10)
-        
-        # Add radius circle
-        circle_lons = []
-        circle_lats = []
-        for angle in np.linspace(0, 2*np.pi, 100):
-            # Convert radius from km to degrees (approximate)
-            lat_offset = self.radius / 111.0  # 1 degree ≈ 111 km
-            lon_offset = self.radius / (111.0 * np.cos(np.radians(self.lat)))
-            
-            circle_lat = self.lat + lat_offset * np.sin(angle)
-            circle_lon = self.lon + lon_offset * np.cos(angle)
-            circle_lats.append(circle_lat)
-            circle_lons.append(circle_lon)
-        
-        self.circle, = self.ax.plot(circle_lons, circle_lats, 'r-', linewidth=3, alpha=0.8, zorder=5)
-        
-        # Set map bounds
-        self.ax.set_xlim(lon_min, lon_max)
-        self.ax.set_ylim(lat_min, lat_max)
-        
-        # Add labels and title
-        self.ax.set_xlabel('Longitude', fontsize=12, fontweight='bold')
-        self.ax.set_ylabel('Latitude', fontsize=12, fontweight='bold')
-        self.ax.set_title('High-Resolution Interactive Map - Click to Set Location', fontsize=14, fontweight='bold')
-        
-        # Remove default grid since we have map tiles
-        self.ax.grid(False)
-        
-        # Refresh the canvas
-        self.canvas.draw()
-
-    def load_map_tiles(self, lat_min, lat_max, lon_min, lon_max):
-        """Load, cache, and display map tiles from OpenStreetMap with error handling."""
-        network_error = False
-
-        # Determine zoom level based on span
-        lat_diff = lat_max - lat_min
-        lon_diff = lon_max - lon_min
-
-        if lat_diff > 20 or lon_diff > 20:
-            zoom = 2
-        elif lat_diff > 10 or lon_diff > 10:
-            zoom = 4
-        elif lat_diff > 5 or lon_diff > 5:
-            zoom = 6
-        elif lat_diff > 2 or lon_diff > 2:
-            zoom = 8
-        elif lat_diff > 1 or lon_diff > 1:
-            zoom = 8
-        else:
-            zoom = 12
-
-        def deg2num(lat_deg, lon_deg, zoom):
-            lat_rad = np.radians(lat_deg)
-            n = 2.0 ** zoom
-            xtile = int((lon_deg + 180.0) / 360.0 * n)
-            ytile = int((1.0 - np.arcsinh(np.tan(lat_rad)) / np.pi) / 2.0 * n)
-            return xtile, ytile
-
-        def tile_count(z):
-            x1, y1 = deg2num(lat_max, lon_min, z)
-            x2, y2 = deg2num(lat_min, lon_max, z)
-            xmn, xmx = sorted((x1, x2))
-            ymn, ymx = sorted((y1, y2))
-            return z, xmn, xmx, ymn, ymx, (xmx - xmn + 1) * (ymx - ymn + 1)
-
-        # pick a zoom that fits the budget
-        while True:
-            z, x_min, x_max, y_min, y_max, num_tiles = tile_count(zoom)
-            if num_tiles <= MAX_TILES_PER_REQUEST or zoom <= 0:
-                zoom = z # Update the zoom level to the one that fits
-                break
-            zoom -= 1
-
-        x_range = list(range(x_min, x_max + 1))
-        y_range = list(range(y_min, y_max + 1))
-
-        logging.info(
-            f"Requesting tiles zoom={zoom}, x={x_min}-{x_max}, y={y_min}-{y_max} "
-            f"({len(x_range)}x{len(y_range)} = {num_tiles} tiles)"
-        )
-
-        tiles = []
-        tile_positions = []
-
-        # Use same UA as pyinaturalist (includes contact info)
-        headers = {"User-Agent": pyinaturalist.user_agent}
-
-        for x in x_range:
-            if network_error:
-                break
-            for y in y_range:
-                tile_key = (zoom, x, y)
-                if tile_key in self.tile_cache:
-                    img = self.tile_cache[tile_key]
-                    tiles.append(img)
-                    tile_positions.append((x, y))
-                    self.tile_cache.move_to_end(tile_key)
-                    continue
-
-                url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
-                try:
-                    resp = requests.get(url, headers=headers, timeout=2.0)
-                    status = resp.status_code
-                    if status != 200:
-                        logging.error(f"Tile {zoom}/{x}/{y} HTTP {status}")
-                    resp.raise_for_status()
-
-                    img = Image.open(BytesIO(resp.content)).convert("RGB")
-                    tiles.append(img)
-                    tile_positions.append((x, y))
-                    self.tile_cache[tile_key] = img
-
-                    # Enforce cache size limit (LRU)
-                    if len(self.tile_cache) > MAX_CACHE_SIZE:
-                        self.tile_cache.popitem(last=False)
-
-                except RequestException as e:
-                    logging.error(f"Failed to load tile {zoom}/{x}/{y}: {e}")
-                    network_error = True
-                    break  # Stop fetching tiles on first network error
-
-        if network_error or not tiles:
-            # Fallback: simple background and message
-            self.ax.clear()
-            self.ax.set_facecolor('#e6f3ff')
-            self.ax.text(
-                0.5, 0.5,
-                "Map tiles unavailable / Using fallback display\n"
-                "(see inat_visualizer.log for details)",
-                transform=self.ax.transAxes,
-                ha='center',
-                va='center',
-                fontsize=12,
-            )
-            self.canvas.draw()
-            return
-
-        # Stitch tiles into a composite image
-        min_x_tile = min(p[0] for p in tile_positions)
-        max_x_tile = max(p[0] for p in tile_positions)
-        min_y_tile = min(p[1] for p in tile_positions)
-        max_y_tile = max(p[1] for p in tile_positions)
-
-        tile_width, tile_height = tiles[0].size
-        grid_width = (max_x_tile - min_x_tile + 1)
-        grid_height = (max_y_tile - min_y_tile + 1)
-
-        composite = Image.new('RGB', (grid_width * tile_width, grid_height * tile_height), (230, 230, 230))
-
-        for img, (x, y) in zip(tiles, tile_positions):
-            paste_x = (x - min_x_tile) * tile_width
-            paste_y = (y - min_y_tile) * tile_height
-            composite.paste(img, (paste_x, paste_y))
-
-        def num2deg(xtile, ytile, zoom):
-            n = 2.0 ** zoom
-            lon_deg = xtile / n * 360.0 - 180.0
-            lat_rad = np.arctan(np.sinh(np.pi * (1 - 2 * ytile / n)))
-            lat_deg = np.degrees(lat_rad)
-            return lat_deg, lon_deg
-
-        # Standard OSM extent: west/east from x, south/north from y
-        north, west = num2deg(min_x_tile, min_y_tile, zoom)           # NW corner
-        south, east = num2deg(max_x_tile + 1, max_y_tile + 1, zoom)   # SE corner
-
-        self.ax.imshow(
-            np.array(composite),
-            extent=[west, east, south, north],
-            origin='upper',
-            alpha=0.9,
-        )
-        # Prevent distortion
-        self.ax.set_aspect('equal', adjustable='box')
-
-        # Track current map tile coverage (in degrees)
-        self.current_lon_min = west
-        self.current_lon_max = east
-        self.current_lat_min = south
-        self.current_lat_max = north
-
-    def _reload_tiles_for_view(self, lon_min, lon_max, lat_min, lat_max):
-        """Clear axes, load tiles for the new view, and redraw overlays."""
-        # Clear and load tiles for the requested bounds
-        self.ax.clear()
-        self.load_map_tiles(lat_min, lat_max, lon_min, lon_max)
-
-        # Enforce the exact view the user requested
-        self.ax.set_xlim(lon_min, lon_max)
-        self.ax.set_ylim(lat_min, lat_max)
-
-        # Re-add marker
-        self.marker, = self.ax.plot(
-            self.lon, self.lat,
-            'ro', markersize=12,
-            markeredgecolor='darkred', markeredgewidth=3, zorder=10
-        )
-
-        # Re-add radius circle
-        circle_lons = []
-        circle_lats = []
-        for angle in np.linspace(0, 2 * np.pi, 100):
-            lat_offset = self.radius / 111.0
-            lon_offset = self.radius / (111.0 * np.cos(np.radians(self.lat)))
-
-            circle_lat = self.lat + lat_offset * np.sin(angle)
-            circle_lon = self.lon + lon_offset * np.cos(angle)
-            circle_lats.append(circle_lat)
-            circle_lons.append(circle_lon)
-
-        self.circle, = self.ax.plot(
-            circle_lons, circle_lats,
-            'r-', linewidth=3, alpha=0.8, zorder=5
-        )
-
-        # Labels/title
-        self.ax.set_xlabel('Longitude', fontsize=12, fontweight='bold')
-        self.ax.set_ylabel('Latitude', fontsize=12, fontweight='bold')
-        self.ax.set_title(
-            'High-Resolution Interactive Map - Click to Set Location',
-            fontsize=14, fontweight='bold'
-        )
-        self.ax.grid(False)
-
-        self.canvas.draw_idle()
-
-
-    def maybe_reload_tiles(self, lat_min, lat_max, lon_min, lon_max):
-        """Reload map tiles if the view goes outside current coverage or changes a lot."""
-        # If we don't yet know current coverage, just reload once
-        if not hasattr(self, "current_lat_min"):
-            self._reload_tiles_for_view(lon_min, lon_max, lat_min, lat_max)
-            return
-
-        view_width = lon_max - lon_min
-        view_height = lat_max - lat_min
-
-        cur_width = self.current_lon_max - self.current_lon_min
-        cur_height = self.current_lat_max - self.current_lat_min
-
-        # Safety in case something odd happens
-        if cur_width <= 0 or cur_height <= 0:
-            self._reload_tiles_for_view(lon_min, lon_max, lat_min, lat_max)
-            return
-
-        # Are we still inside the existing composite (with a small margin)?
-        margin_frac = 0.10  # 10 % margin
-        lon_margin = cur_width * margin_frac
-        lat_margin = cur_height * margin_frac
-
-        inside_lon = (
-            lon_min >= self.current_lon_min - lon_margin and
-            lon_max <= self.current_lon_max + lon_margin
-        )
-        inside_lat = (
-            lat_min >= self.current_lat_min - lat_margin and
-            lat_max <= self.current_lat_max + lat_margin
-        )
-
-        # Has the zoom changed a lot (much larger or much smaller view)?
-        too_zoomed_out = (view_width > cur_width * 1.5) or (view_height > cur_height * 1.5)
-        too_zoomed_in = (view_width < cur_width / 2.0) or (view_height < cur_height / 2.0)
-
-        needs_reload = (not (inside_lon and inside_lat)) or too_zoomed_out or too_zoomed_in
-
-        if needs_reload:
-            self._reload_tiles_for_view(lon_min, lon_max, lat_min, lat_max)
-        else:
-            # Just redraw the existing image with the new limits
-            self.canvas.draw_idle()
-
-
-    def on_click(self, event):
-        """Handle mouse click events (set marker on plain left-click)."""
-        if event.inaxes != self.ax:
-            return
-
-        # Only treat *plain* left-click as "set location"
-        if event.button == 1 and event.key not in ('control', 'ctrl'):
-            # Update coordinates
-            self.lat = event.ydata
-            self.lon = event.xdata
-
-            # Update marker position
-            self.marker.set_data([self.lon], [self.lat])
-
-            # Update circle position
-            circle_lons = []
-            circle_lats = []
-            for angle in np.linspace(0, 2 * np.pi, 100):
-                lat_offset = self.radius / 111.0
-                lon_offset = self.radius / (111.0 * np.cos(np.radians(self.lat)))
-
-                circle_lat = self.lat + lat_offset * np.sin(angle)
-                circle_lon = self.lon + lon_offset * np.cos(angle)
-                circle_lats.append(circle_lat)
-                circle_lons.append(circle_lon)
-
-            self.circle.set_data(circle_lons, circle_lats)
-
-            # Update coordinate label
-            self.coord_label.setText(f"Lat: {self.lat:.4f}, Lon: {self.lon:.4f}")
-
-            # Refresh the canvas
-            self.canvas.draw()
-
-        
-    
-    def on_scroll(self, event):
-        """Smooth, cursor-centered zoom; reload tiles when needed."""
-        if event.inaxes != self.ax or event.xdata is None or event.ydata is None:
-            return
-
+    def request_tiles_for_current_view(self):
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
-
-        # Scroll up -> zoom in, scroll down -> zoom out
-        if event.button == 'up':
-            scale = 1.0 / 1.2   # zoom in
-        elif event.button == 'down':
-            scale = 1.2         # zoom out
-        else:
-            return
-
-        width = x1 - x0
-        height = y1 - y0
-        if width == 0 or height == 0:
-            return
-
-        relx = (event.xdata - x0) / width
-        rely = (event.ydata - y0) / height
-
-        new_width = width * scale
-        new_height = height * scale
-
-        new_xmin = event.xdata - relx * new_width
-        new_xmax = new_xmin + new_width
-        new_ymin = event.ydata - rely * new_height
-        new_ymax = new_ymin + new_height
-
-        # Clamp to world bounds
-        new_xmin = max(-180.0, new_xmin)
-        new_xmax = min(180.0, new_xmax)
-        new_ymin = max(-85.0, new_ymin)
-        new_ymax = min(85.0, new_ymax)
-
-        # Apply new limits
-        self.ax.set_xlim(new_xmin, new_xmax)
-        self.ax.set_ylim(new_ymin, new_ymax)
-
-        # Decide whether to reload tiles or just redraw
-        self.maybe_reload_tiles(new_ymin, new_ymax, new_xmin, new_xmax)
-
-    def update_radius(self, value):
-        """Update the radius circle"""
-        self.radius = value
         
-        # Update circle
+        # Calculate optimal zoom
+        try:
+            bbox = self.ax.get_window_extent().transformed(self.figure.dpi_scale_trans.inverted())
+            width_px = bbox.width * self.figure.dpi
+        except Exception:
+            width_px = 800
+
+        lon_span = abs(x1 - x0)
+        if lon_span == 0 or width_px <= 0: return
+        
+        # Target: pixel density.
+        target_scale = 1.5
+        needed_2z = (target_scale * width_px * 360.0) / (256.0 * max(0.0001, lon_span))
+        zoom = int(math.log2(needed_2z)) if needed_2z > 0 else 0
+        zoom = max(0, min(zoom, 16))
+        
+        # Check tile budget
+        def get_tile_range(z):
+            n = 2.0 ** z
+            xtile_min = int((x0 + 180.0) / 360.0 * n)
+            xtile_max = int((x1 + 180.0) / 360.0 * n)
+            
+            def lat2y(lat):
+                return (1.0 - math.asinh(math.tan(math.radians(max(-85, min(85, lat))))) / math.pi) / 2.0 * n
+            
+            y_a = int(lat2y(y1)) # y1 is max lat (top)
+            y_b = int(lat2y(y0)) # y0 is min lat (bottom)
+            return z, xtile_min, xtile_max, min(y_a, y_b), max(y_a, y_b)
+
+        while zoom >= 0:
+            z, x_min, x_max, y_min, y_max = get_tile_range(zoom)
+            num_tiles = (x_max - x_min + 1) * (y_max - y_min + 1)
+            if num_tiles <= MAX_TILES_PER_REQUEST:
+                break
+            zoom -= 1
+        
+        # Submit job
+        self.job_counter += 1
+        self.current_job_id = self.job_counter
+        self.worker.request_view(self.current_job_id, zoom, x_min, x_max, y_min, y_max)
+        
+    def on_view_ready(self, job_id, composite, extent):
+        if job_id < self.current_job_id:
+            return 
+        
+        for img in list(self.ax.images):
+            img.remove()
+        
+        self.ax.imshow(np.array(composite), extent=extent, origin='upper', alpha=0.9)
+        self.ax.set_aspect('equal', adjustable='box')
+        
+        # Redraw overlays
+        self.update_overlays()
+        self.canvas.draw_idle()
+
+    def update_overlays(self):
+        self.marker.set_data([self.lon], [self.lat])
+        
         circle_lons = []
         circle_lats = []
         for angle in np.linspace(0, 2*np.pi, 100):
             lat_offset = self.radius / 111.0
             lon_offset = self.radius / (111.0 * np.cos(np.radians(self.lat)))
-            
-            circle_lat = self.lat + lat_offset * np.sin(angle)
-            circle_lon = self.lon + lon_offset * np.cos(angle)
-            circle_lats.append(circle_lat)
-            circle_lons.append(circle_lon)
+            circle_lats.append(self.lat + lat_offset * np.sin(angle))
+            circle_lons.append(self.lon + lon_offset * np.cos(angle))
         
         self.circle.set_data(circle_lons, circle_lats)
-        self.canvas.draw()
-        
+        self.coord_label.setText(f"Lat: {self.lat:.4f}, Lon: {self.lon:.4f}")
+
+    def on_click(self, event):
+        if event.inaxes != self.ax: return
+        if event.button == 1 and event.key not in ('control', 'ctrl'):
+            self.lat = event.ydata
+            self.lon = event.xdata
+            self.update_overlays()
+            self.canvas.draw_idle()
+
+    def update_radius(self, value):
+        self.radius = value
+        self.update_overlays()
+        self.canvas.draw_idle()
+
     def accept(self):
-        """Accept the dialog and update parent coordinates"""
-        # Update parent coordinates
         if self.parent:
             self.parent.lat_input.setText(f"{self.lat:.4f}")
             self.parent.lon_input.setText(f"{self.lon:.4f}")
             self.parent.radius_input.setText(str(self.radius))
-        
         super().accept()
 
     def on_mouse_press(self, event):
-        """Start panning on right-click or Ctrl+left-click."""
-        if event.inaxes != self.ax:
-            return
-
-        is_right = (event.button == 3)
-        is_ctrl_left = (event.button == 1 and event.key in ('control', 'ctrl'))
-
-        if is_right or is_ctrl_left:
-            if event.xdata is None or event.ydata is None:
-                return
+        if event.inaxes != self.ax: return
+        if event.button == 3 or (event.button == 1 and event.key in ('control', 'ctrl')):
             self._is_panning = True
             self._last_pan_pos = (event.xdata, event.ydata)
-            # Optional: change cursor to a "grabbing" hand
             try:
                 self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
-            except Exception:
-                pass  # In case backend doesn't support custom cursor
+            except Exception: pass
 
     def on_mouse_release(self, event):
-        """Stop panning when mouse button is released."""
         if self._is_panning:
             self._is_panning = False
             self._last_pan_pos = None
-
-            # After pan ends, maybe reload tiles around the final view
-            x0, x1 = self.ax.get_xlim()
-            y0, y1 = self.ax.get_ylim()
-            self.maybe_reload_tiles(y0, y1, x0, x1)
-
             try:
                 self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
-            except Exception:
-                pass
+            except Exception: pass
+            self.update_timer.start()
 
     def on_mouse_move(self, event):
-        """Pan the map while dragging."""
-        if not self._is_panning or event.inaxes != self.ax:
-            return
-        if event.xdata is None or event.ydata is None or self._last_pan_pos is None:
-            return
-
+        if not self._is_panning or event.inaxes != self.ax: return
+        if self._last_pan_pos is None: return
+        
+        dx = event.xdata - self._last_pan_pos[0]
+        dy = event.ydata - self._last_pan_pos[1]
+        
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
-
-        last_x, last_y = self._last_pan_pos
-        dx = event.xdata - last_x
-        dy = event.ydata - last_y
-
-        # Adjust limits so the map follows the mouse
-        new_x0 = x0 - dx
-        new_x1 = x1 - dx
-        new_y0 = y0 - dy
-        new_y1 = y1 - dy
-
-        # Clamp to world bounds
-        span_x = new_x1 - new_x0
-        span_y = new_y1 - new_y0
-
-        # Keep the same span but clamp the center
-        center_x = (new_x0 + new_x1) / 2
-        center_y = (new_y0 + new_y1) / 2
-
-        center_x = min(180.0 - span_x / 2, max(-180.0 + span_x / 2, center_x))
-        center_y = min(85.0 - span_y / 2, max(-85.0 + span_y / 2, center_y))
-
-        new_x0 = center_x - span_x / 2
-        new_x1 = center_x + span_x / 2
-        new_y0 = center_y - span_y / 2
-        new_y1 = center_y + span_y / 2
-
+        
+        self.ax.set_xlim(x0 - dx, x1 - dx)
+        self.ax.set_ylim(y0 - dy, y1 - dy)
+        self.canvas.draw_idle()
+        
+    def on_scroll(self, event):
+        if event.inaxes != self.ax: return
+        scale = 1.0/1.2 if event.button == 'up' else 1.2
+        
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        w, h = x1 - x0, y1 - y0
+        
+        mx = event.xdata
+        my = event.ydata
+        
+        new_w = w * scale
+        new_h = h * scale
+        
+        relx = (mx - x0) / w
+        rely = (my - y0) / h
+        
+        new_x0 = mx - relx * new_w
+        new_x1 = new_x0 + new_w
+        new_y0 = my - rely * new_h
+        new_y1 = new_y0 + new_h
+        
         self.ax.set_xlim(new_x0, new_x1)
         self.ax.set_ylim(new_y0, new_y1)
-
-        self._last_pan_pos = (event.xdata, event.ydata)
         self.canvas.draw_idle()
+        self.update_timer.start()
 
 
 class EnhancedProgressWidget(QWidget):
