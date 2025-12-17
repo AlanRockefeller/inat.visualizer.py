@@ -70,7 +70,8 @@ class DiskTileCache:
             try:
                 # Update mtime for LRU
                 path.touch()
-                return Image.open(path).convert("RGB")
+                with Image.open(path) as img:
+                     return img.convert("RGB").copy()
             except Exception as e:
                 logging.warning(f"Corrupt tile in disk cache {path}: {e}")
         return None
@@ -86,7 +87,7 @@ class DiskTileCache:
             os.replace(temp_path, path)
             self._prune_if_needed()
         except Exception as e:
-            logging.error(f"Failed to write tile to disk {path}: {e}")
+            logging.exception(f"Failed to write tile to disk {path}: {e}")
             if temp_path.exists():
                 try:
                     os.remove(temp_path)
@@ -113,7 +114,7 @@ class DiskTileCache:
             files.sort()
             deleted_size = 0
             target_reduction = total_size * 0.2 # clear 20%
-            for mtime, p, size in files:
+            for _mtime, p, size in files:
                 try:
                     p.unlink()
                     deleted_size += size
@@ -176,6 +177,9 @@ class TileLoaderWorker(QThread):
     def _process_job(self, session, job_id, zoom, x_min, x_max, y_min, y_max):
         x_range = range(x_min, x_max + 1)
         y_range = range(y_min, y_max + 1)
+        # Store for extent calculation
+        self._job_x_max = x_max
+        self._job_y_max = y_max
         
         tiles = []
         tile_positions = []
@@ -238,7 +242,7 @@ class TileLoaderWorker(QThread):
         h = (max(p[1] for p in tile_positions) - min_y + 1) * tile_h
         
         composite = Image.new('RGB', (w, h), (230, 230, 230))
-        for img, (x, y) in zip(tiles, tile_positions):
+        for img, (x, y) in zip(tiles, tile_positions, strict=True):
             composite.paste(img, ((x - min_x) * tile_w, (y - min_y) * tile_h))
             
         # Calculate extent
@@ -250,7 +254,7 @@ class TileLoaderWorker(QThread):
             return lat_deg, lon_deg
 
         north, west = num2deg(min_x, min_y, zoom)
-        south, east = num2deg(max(p[0] for p in tile_positions) + 1, max(p[1] for p in tile_positions) + 1, zoom)
+        south, east = num2deg(x_max + 1, y_max + 1, zoom)
         
         # Emit result
         self.view_ready.emit(job_id, composite, (west, east, south, north))
@@ -293,7 +297,7 @@ class DatabaseProgressTracker:
 class CustomSplashScreen(QSplashScreen):
     """Splash screen that scales to fit the screen without overflowing."""
 
-    def __init__(self, image_path, parent=None, scale_factor=1.4):
+    def __init__(self, image_path, parent=None, scale_factor=2.2):
         # Load the base image
         original_pixmap = QPixmap(image_path)
 
@@ -393,7 +397,7 @@ class MapDialog(QDialog):
         # Controls layout
         controls_layout = QHBoxLayout()
         
-        instructions = QLabel("Click on the map to set location. Use mouse wheel to zoom.")
+        instructions = QLabel("Interactive map")
         instructions.setStyleSheet("font-weight: bold; color: #333;")
         controls_layout.addWidget(instructions)
         
@@ -403,10 +407,21 @@ class MapDialog(QDialog):
         self.radius_spinbox.setValue(int(radius))
         self.radius_spinbox.valueChanged.connect(self.update_radius)
         
+        # Zoom buttons
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setFixedSize(30, 30)
+        zoom_in_btn.clicked.connect(lambda: self.zoom_map(1.0/1.5))
+        
+        zoom_out_btn = QPushButton("-")
+        zoom_out_btn.setFixedSize(30, 30)
+        zoom_out_btn.clicked.connect(lambda: self.zoom_map(1.5))
+
         self.coord_label = QLabel(f"Lat: {lat:.4f}, Lon: {lon:.4f}")
         
         controls_layout.addWidget(radius_label)
         controls_layout.addWidget(self.radius_spinbox)
+        controls_layout.addWidget(zoom_in_btn)
+        controls_layout.addWidget(zoom_out_btn)
         controls_layout.addWidget(self.coord_label)
         controls_layout.addStretch()
         
@@ -435,11 +450,12 @@ class MapDialog(QDialog):
         
         self.ax.set_xlabel('Longitude', fontsize=12, fontweight='bold')
         self.ax.set_ylabel('Latitude', fontsize=12, fontweight='bold')
-        self.ax.set_title('High-Resolution Interactive Map - Click to Set Location', fontsize=14, fontweight='bold')
+        self.ax.set_title('Interactive Map - Click to set location, right-click (or Ctrl+Click) to pan. Scroll or use buttons to zoom.', fontsize=14, fontweight='bold')
         self.ax.grid(False)
         
-        # Overlays
-        self.marker, = self.ax.plot([], [], 'ro', markersize=12, markeredgecolor='darkred', markeredgewidth=3, zorder=10)
+        # Overlays - adjust marker size for 4K visibility if needed (using scale_factor from parent if available)
+        marker_size = 12 * (parent.scale_factor if parent and hasattr(parent, 'scale_factor') else 1.0)
+        self.marker, = self.ax.plot([], [], 'ro', markersize=marker_size, markeredgecolor='darkred', markeredgewidth=3, zorder=10)
         self.circle, = self.ax.plot([], [], 'r-', linewidth=3, alpha=0.8, zorder=5)
         self.update_overlays()
 
@@ -473,13 +489,14 @@ class MapDialog(QDialog):
             width_px = 800
 
         lon_span = abs(x1 - x0)
-        if lon_span == 0 or width_px <= 0: return
+        if lon_span == 0 or width_px <= 0: 
+            return
         
         # Target: pixel density.
         target_scale = 1.5
         needed_2z = (target_scale * width_px * 360.0) / (256.0 * max(0.0001, lon_span))
         zoom = int(math.log2(needed_2z)) if needed_2z > 0 else 0
-        zoom = max(0, min(zoom, 16))
+        zoom = max(0, min(zoom, 15))  # Changed max zoom to 15
         
         # Check tile budget
         def get_tile_range(z):
@@ -495,7 +512,7 @@ class MapDialog(QDialog):
             return z, xtile_min, xtile_max, min(y_a, y_b), max(y_a, y_b)
 
         while zoom >= 0:
-            z, x_min, x_max, y_min, y_max = get_tile_range(zoom)
+            _z, x_min, x_max, y_min, y_max = get_tile_range(zoom)
             num_tiles = (x_max - x_min + 1) * (y_max - y_min + 1)
             if num_tiles <= MAX_TILES_PER_REQUEST:
                 break
@@ -542,6 +559,30 @@ class MapDialog(QDialog):
             self.update_overlays()
             self.canvas.draw_idle()
 
+    def zoom_map(self, scale):
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        
+        # Center of view
+        cx = (x0 + x1) / 2
+        cy = (y0 + y1) / 2
+        
+        w = x1 - x0
+        h = y1 - y0
+        
+        new_w = w * scale
+        new_h = h * scale
+        
+        new_x0 = cx - new_w / 2
+        new_x1 = cx + new_w / 2
+        new_y0 = cy - new_h / 2
+        new_y1 = cy + new_h / 2
+        
+        self.ax.set_xlim(new_x0, new_x1)
+        self.ax.set_ylim(new_y0, new_y1)
+        self.canvas.draw_idle()
+        self.update_timer.start()
+
     def update_radius(self, value):
         self.radius = value
         self.update_overlays()
@@ -556,12 +597,16 @@ class MapDialog(QDialog):
 
     def on_mouse_press(self, event):
         if event.inaxes != self.ax: return
-        if event.button == 3 or (event.button == 1 and event.key in ('control', 'ctrl')):
+        # Pan on: Right Click (3), OR Left Click (1) with Control OR Shift
+        is_pan_click = (event.button == 3) or (event.button == 1 and event.key in ('control', 'ctrl', 'shift'))
+        
+        if is_pan_click:
             self._is_panning = True
             self._last_pan_pos = (event.xdata, event.ydata)
             try:
                 self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
-            except Exception: pass
+            except Exception: 
+                logging.debug("Failed to set cursor")
 
     def on_mouse_release(self, event):
         if self._is_panning:
@@ -588,7 +633,7 @@ class MapDialog(QDialog):
         
     def on_scroll(self, event):
         if event.inaxes != self.ax: return
-        scale = 1.0/1.2 if event.button == 'up' else 1.2
+        scale = 1.0/1.5 if event.button == 'up' else 1.5
         
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
@@ -829,7 +874,7 @@ class INatSeasonalVisualizer(QMainWindow):
         self.splash_screen = splash_screen
         self.settings = QSettings("xAI", "iNatSeasonalVisualizer")
         self.scale_factor = scale_factor
-        self.base_font_size = 14  # Centralized base font size in points
+        self.base_font_size = 26  # Centralized base font size in points
         self.api_call_count = 0  # Initialize API call counter
         # In-memory cache for taxon IDs and descendants
         # Persisted to taxon_cache.json to minimize API calls and avoid recomputing descendants
