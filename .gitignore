@@ -4,10 +4,12 @@
 taxoncache.json
 duckdb.query
 *.zip.url
+todo.txt
 
 # Cache/tiles
 tilecache*.png
 tilecache/
+tile_cache/
 
 # Other generated
 __pycache__/
