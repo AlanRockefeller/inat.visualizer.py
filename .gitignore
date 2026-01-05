@@ -5,6 +5,8 @@ taxoncache.json
 duckdb.query
 *.zip.url
 todo.txt
+taxon_cache.json
+printcsv.py
 
 # Cache/tiles
 tilecache*.png
