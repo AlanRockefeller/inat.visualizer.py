@@ -246,7 +246,7 @@ When you run the program, it may create:
 - `taxon_cache.json` (API/taxon cache)
 - `descendant_taxons.txt` (optional manual descendant list)
 - `tile_cache/` (map tile disk cache)
-- `observations.parquet` + `taxonomy.parquet` (Quite large, if downloaded)
+- `observations.parquet` + `taxonomy.parquet` (Quite large (1 gb), if downloaded)
 
 ---
 
@@ -256,4 +256,4 @@ MIT
 
 
 
-GitHub: https://github.com/AlanRockefeller/inat.visualizer.py
+[GitHub Repository](https://github.com/AlanRockefeller/inat.visualizer.py)
