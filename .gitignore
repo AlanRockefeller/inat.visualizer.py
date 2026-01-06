@@ -1,0 +1,18 @@
+# Data files
+*.parquet
+*.csv
+taxoncache.json
+duckdb.query
+*.zip.url
+todo.txt
+taxon_cache.json
+printcsv.py
+
+# Cache/tiles
+tilecache*.png
+tilecache/
+tile_cache/
+
+# Other generated
+__pycache__/
+*.pyc
