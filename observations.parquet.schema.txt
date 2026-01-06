@@ -1,0 +1,11 @@
+┌──────────────────┬──────────────┬─────────┬─────────┬─────────┬─────────┐
+│   column_name    │ column_type  │  null   │   key   │ default │  extra  │
+│     varchar      │   varchar    │ varchar │ varchar │ varchar │ varchar │
+├──────────────────┼──────────────┼─────────┼─────────┼─────────┼─────────┤
+│ id               │ BIGINT       │ YES     │         │         │         │
+│ decimalLatitude  │ DECIMAL(8,3) │ YES     │         │         │         │
+│ decimalLongitude │ DECIMAL(8,3) │ YES     │         │         │         │
+│ taxonID          │ BIGINT       │ YES     │         │         │         │
+│ taxonRank        │ VARCHAR      │ YES     │         │         │         │
+│ eventDate        │ DATE         │ YES     │         │         │         │
+└──────────────────┴──────────────┴─────────┴─────────┴─────────┴─────────┘

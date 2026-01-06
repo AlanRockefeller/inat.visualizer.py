@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                              QFormLayout, QLineEdit, QPushButton, QComboBox, QMenuBar,
                              QStatusBar, QFileDialog, QLabel, QListWidget, QMessageBox,
                              QProgressBar, QColorDialog, QTextEdit, QSplashScreen, QDialog,
-                             QDialogButtonBox, QSlider, QSpinBox, QSizePolicy)
+                             QDialogButtonBox, QSlider, QSpinBox, QSizePolicy, QInputDialog)
 from PyQt6.QtCore import QSettings, Qt, QTimer, QThread, pyqtSignal, QObject, QMutex, QWaitCondition, QMutexLocker
 from PyQt6.QtGui import QAction, QFont, QColor, QPixmap, QDoubleValidator, QGuiApplication
 import pyinaturalist
@@ -328,7 +328,7 @@ class CustomSplashScreen(QSplashScreen):
         super().__init__(scaled_pixmap)
 
         # Window flags
-        self.setWindowFlags(Qt.WindowType.SplashScreen | Qt.WindowType.WindowStaysOnTopHint)
+        self.setWindowFlags(Qt.WindowType.SplashScreen | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 
         # Center on screen
@@ -874,8 +874,13 @@ class INatSeasonalVisualizer(QMainWindow):
         self.splash_screen = splash_screen
         self.settings = QSettings("xAI", "iNatSeasonalVisualizer")
         self.scale_factor = scale_factor
-        self.base_font_size = 26  # Centralized base font size in points
+        
+        # Robustly load font sizes with safe positional type argument
+        self.app_font_size = self.settings.value("app_font_size", 12, int)
+        self.graph_font_size = self.settings.value("graph_font_size", 12, int)
+        
         self.api_call_count = 0  # Initialize API call counter
+        self.last_plot_args = None # Initialize plot arguments cache
         # In-memory cache for taxon IDs and descendants
         # Persisted to taxon_cache.json to minimize API calls and avoid recomputing descendants
         self.taxon_cache = {}
@@ -1141,12 +1146,12 @@ class INatSeasonalVisualizer(QMainWindow):
 
         # Scale matplotlib fonts globally
         matplotlib.rcParams.update({
-            'font.size': self.base_font_size * scale_factor,
-            'axes.labelsize': self.base_font_size * scale_factor,
-            'axes.titlesize': (self.base_font_size + 2) * scale_factor,  # Title is slightly larger
-            'xtick.labelsize': (self.base_font_size - 1) * scale_factor,  # Ticks are slightly smaller
-            'ytick.labelsize': (self.base_font_size - 1) * scale_factor,
-            'legend.fontsize': self.base_font_size * scale_factor,
+            'font.size': self.graph_font_size * scale_factor,
+            'axes.labelsize': self.graph_font_size * scale_factor,
+            'axes.titlesize': (self.graph_font_size + 2) * scale_factor,  # Title is slightly larger
+            'xtick.labelsize': (self.graph_font_size - 1) * scale_factor,  # Ticks are slightly smaller
+            'ytick.labelsize': (self.graph_font_size - 1) * scale_factor,
+            'legend.fontsize': self.graph_font_size * scale_factor,
         })
 
         # Central widget and main vertical layout
@@ -1281,7 +1286,7 @@ class INatSeasonalVisualizer(QMainWindow):
         # Status bar (already set in __init__)
 
         # Apply initial theme
-        self.toggle_theme(self.settings.value("theme", "light"))
+        self.apply_stylesheet()
 
     def parse_coordinate_input(self, text):
         """Parse coordinate string (e.g. 'lat, lon') and update inputs"""
@@ -1345,10 +1350,71 @@ class INatSeasonalVisualizer(QMainWindow):
         window_bg_action.triggered.connect(self.choose_window_bg_color)
         edit_menu.addAction(window_bg_action)
 
-    def toggle_theme(self, mode):
-        """Toggle between dark and light mode for UI and graph"""
-        # Set font size in stylesheet to ensure consistency across theme changes
-        font_size_pt = int(self.base_font_size * self.scale_factor)
+        self.app_font_size_action = QAction(f"Change App Font Size ({self.app_font_size}pt)", self)
+        self.app_font_size_action.triggered.connect(self.change_app_font_size)
+        edit_menu.addAction(self.app_font_size_action)
+
+        self.graph_font_size_action = QAction(f"Change Graph Font Size ({self.graph_font_size}pt)", self)
+        self.graph_font_size_action.triggered.connect(self.change_graph_font_size)
+        edit_menu.addAction(self.graph_font_size_action)
+
+    def _refresh_font_menu_labels(self):
+        """Update font size menu actions with current values"""
+        if getattr(self, "app_font_size_action", None):
+            self.app_font_size_action.setText(f"Change App Font Size ({self.app_font_size}pt)")
+        if getattr(self, "graph_font_size_action", None):
+            self.graph_font_size_action.setText(f"Change Graph Font Size ({self.graph_font_size}pt)")
+
+    def change_app_font_size(self):
+        """Prompt user to change the application font size"""
+        current_size = self.app_font_size
+        new_size, ok = QInputDialog.getInt(
+            self, "App Font Size", "Select app font size (pt):", 
+            value=current_size, min=8, max=72
+        )
+        if ok:
+            self.app_font_size = new_size
+            self.settings.setValue("app_font_size", new_size)
+            self._refresh_font_menu_labels()
+            self.apply_stylesheet()
+
+    def change_graph_font_size(self):
+        """Prompt user to change the graph font size"""
+        current_size = self.graph_font_size
+        new_size, ok = QInputDialog.getInt(
+            self, "Graph Font Size", "Select graph font size (pt):", 
+            value=current_size, min=8, max=72
+        )
+        if ok:
+            self.graph_font_size = new_size
+            self.settings.setValue("graph_font_size", new_size)
+            self._refresh_font_menu_labels()
+            
+            # Update matplotlib settings
+            scale_factor = self.scale_factor
+            matplotlib.rcParams.update({
+                'font.size': self.graph_font_size * scale_factor,
+                'axes.labelsize': self.graph_font_size * scale_factor,
+                'axes.titlesize': (self.graph_font_size + 2) * scale_factor,
+                'xtick.labelsize': (self.graph_font_size - 1) * scale_factor,
+                'ytick.labelsize': (self.graph_font_size - 1) * scale_factor,
+                'legend.fontsize': self.graph_font_size * scale_factor,
+            })
+            
+            # Replot if data exists
+            if hasattr(self, 'last_plot_args') and self.last_plot_args:
+                self.plot_observations(**self.last_plot_args)
+                if getattr(self, "figure", None):
+                    try:
+                        self.figure.tight_layout()
+                    except Exception: pass
+            elif self.canvas:
+                self.canvas.draw_idle()
+
+    def apply_stylesheet(self):
+        """Apply the application stylesheet based on current theme and font settings"""
+        mode = self.settings.value("theme", "light")
+        font_size_pt = int(self.app_font_size * self.scale_factor)
         font_stylesheet = f"font-size: {font_size_pt}pt;"
 
         custom_bg_color = self.settings.value("graph_bg_color")
@@ -1362,7 +1428,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.setStyleSheet(font_stylesheet + f"background-color: {bg_color}; color: {contrasting_color};")
             self.central_widget.setStyleSheet("QLineEdit, QComboBox, QPushButton, QListWidget, QProgressBar, QLabel { background-color: #3e3e3e; color: #ffffff; }")
             # Graph dark mode
-            if self.canvas:
+            if getattr(self, "canvas", None) and getattr(self, "figure", None) and getattr(self, "ax", None):
                 graph_contrasting_color = self.get_contrasting_text_color(effective_bg_hex)
                 self.figure.set_facecolor(bg_color)
                 self.ax.set_facecolor(custom_bg_color if custom_bg_color else "#3e3e3e")
@@ -1378,7 +1444,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.setStyleSheet(font_stylesheet + f"background-color: {bg_color}; color: {contrasting_color};")
             self.central_widget.setStyleSheet("QLineEdit, QComboBox, QPushButton, QListWidget, QProgressBar, QLabel { background-color: #ffffff; color: #000000; }")
             # Graph light mode
-            if self.canvas:
+            if getattr(self, "canvas", None) and getattr(self, "figure", None) and getattr(self, "ax", None):
                 graph_contrasting_color = self.get_contrasting_text_color(effective_bg_hex)
                 self.figure.set_facecolor(bg_color)
                 self.ax.set_facecolor(custom_bg_color if custom_bg_color else "white")
@@ -1388,9 +1454,14 @@ class INatSeasonalVisualizer(QMainWindow):
                 self.ax.title.set_color(graph_contrasting_color)
                 for spine in self.ax.spines.values():
                     spine.set_color(graph_contrasting_color)
-        self.settings.setValue("theme", mode)
-        if self.canvas:
+        
+        if getattr(self, "canvas", None) and getattr(self, "figure", None):
             self.canvas.draw_idle()
+
+    def toggle_theme(self, mode):
+        """Toggle between dark and light mode for UI and graph"""
+        self.settings.setValue("theme", mode)
+        self.apply_stylesheet()
 
 
     def choose_color(self):
@@ -1413,7 +1484,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.bg_color_input.setText(color_name)
             self.settings.setValue("graph_bg_color", color_name)
             # Re-apply the current theme to update the background
-            self.toggle_theme(self.settings.value("theme", "light"))
+            self.apply_stylesheet()
 
     def choose_window_bg_color(self):
         """Open a color dialog to choose the main window background color."""
@@ -1424,7 +1495,7 @@ class INatSeasonalVisualizer(QMainWindow):
             color_name = color.name()
             self.settings.setValue("window_bg_color", color_name)
             # Re-apply the current theme to update the background
-            self.toggle_theme(self.settings.value("theme", "light"))
+            self.apply_stylesheet()
 
     def open_map_dialog(self):
         """Open the interactive map dialog"""
@@ -1460,6 +1531,8 @@ class INatSeasonalVisualizer(QMainWindow):
             self.settings.setValue("radius", float(self.radius_input.text()))
             self.settings.setValue("graph_color", self.color_input.text())
             self.settings.setValue("graph_bg_color", self.bg_color_input.text())
+            self.settings.setValue("app_font_size", self.app_font_size)
+            self.settings.setValue("graph_font_size", self.graph_font_size)
             QMessageBox.information(self, "Settings", "Settings saved successfully.")
         except ValueError as e:
             QMessageBox.warning(self, "Settings", f"Invalid input: {str(e)}")
@@ -1739,6 +1812,19 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def plot_observations(self, observations, lat, lon, radius, organism, date_from, date_to, view, source="API"):
         """Plot observations (from API or local)"""
+        # Save arguments for replotting (e.g., when font size changes)
+        self.last_plot_args = {
+            "observations": observations,
+            "lat": lat,
+            "lon": lon,
+            "radius": radius,
+            "organism": organism,
+            "date_from": date_from,
+            "date_to": date_to,
+            "view": view,
+            "source": source
+        }
+
         if not observations:
             self.show_placeholder(f"No {source} observations found.")
             return False
@@ -1801,11 +1887,31 @@ class INatSeasonalVisualizer(QMainWindow):
         self.ax.set_xticklabels(labels, rotation=45)
         self.ax.set_xlabel("Time of Year")
         self.ax.set_ylabel("Observation Count")
-        self.ax.set_title(f"Seasonal Observations for {organism or 'All Organisms'} within {radius} km of ({lat:.3f}, {lon:.3f})")
         
+        title_text = f"Seasonal Observations for {organism or 'All Organisms'} within {radius} km of ({lat:.3f}, {lon:.3f})"
+        title_obj = self.ax.set_title(title_text)
+        
+        # Robustly shrink title font using actual renderer measurement
+        try:
+            # Ensure a renderer exists and extents are valid
+            if self.canvas:
+                self.canvas.draw()
+                renderer = self.canvas.get_renderer()
+                
+                if renderer:
+                    bbox = title_obj.get_window_extent(renderer=renderer)
+                    ax_bbox = self.ax.get_window_extent(renderer=renderer)
+                    
+                    # Check if title width exceeds 95% of axes width
+                    if bbox.width > ax_bbox.width * 0.95:
+                        scale_ratio = (ax_bbox.width * 0.95) / bbox.width
+                        new_size = max(8, title_obj.get_fontsize() * scale_ratio)
+                        title_obj.set_fontsize(new_size)
+        except Exception as e:
+            logging.warning(f"Failed to resize title: {e}")
+            
         # Apply theme to graph
-        current_theme = self.settings.value("theme", "light")
-        self.toggle_theme(current_theme)  # Reapply theme to update graph colors
+        self.apply_stylesheet()  # Reapply theme to update graph colors
         
         self.canvas.draw_idle()
         QTimer.singleShot(0, self.clamp_to_screen)
@@ -2377,26 +2483,41 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s"
     )
 
+    if args.debug:
+        print(f"DEBUG: Logging level set to {log_level}")
+
     # Check environment
+    if args.debug:
+        print("DEBUG: Checking environment...")
     env_error = check_environment()
     if env_error:
         print(env_error)
         sys.exit(1)
+    if args.debug:
+        print("DEBUG: Environment check passed.")
 
     # --- High DPI stability setup (Wayland + Qt6) ---
     QApplication.setHighDpiScaleFactorRoundingPolicy( Qt.HighDpiScaleFactorRoundingPolicy.RoundPreferFloor)
 
     # Create QApplication first
+    if args.debug:
+        print("DEBUG: Creating QApplication...")
     app = QApplication(sys.argv)
+    if args.debug:
+        print("DEBUG: QApplication created.")
     
     # Show splash screen
     splash_image_path = os.path.join(os.getcwd(), "splash_screen.jpg")
     if os.path.exists(splash_image_path):
+        if args.debug:
+            print(f"DEBUG: Splash screen found at {splash_image_path}. Initializing...")
         splash = CustomSplashScreen(splash_image_path)
         splash.update_status("Starting iNaturalist Seasonal Visualizer...")
         QApplication.processEvents()
         time.sleep(0.5)  # Brief pause to show splash screen
     else:
+        if args.debug:
+            print(f"DEBUG: Splash screen not found at {splash_image_path}. Skipping.")
         splash = None
         logging.warning(f"Splash screen image not found at {splash_image_path}")
     
@@ -2406,15 +2527,26 @@ def main():
         QApplication.processEvents()
         time.sleep(0.3)
     
+    if args.debug:
+        print("DEBUG: Initializing main window (INatSeasonalVisualizer)...")
     window = INatSeasonalVisualizer(lat=args.lat, lon=args.lon, radius=args.radius, scale_factor=args.scale_factor, splash_screen=splash)
+    if args.debug:
+        print("DEBUG: Main window initialized.")
     
     if splash:
         splash.update_status("Application ready!")
         QApplication.processEvents()
         time.sleep(0.5)
+        if args.debug:
+            print("DEBUG: Closing splash screen...")
         splash.close()
     
+    if args.debug:
+        print("DEBUG: Showing main window maximized...")
     window.showMaximized()
+    
+    if args.debug:
+        print("DEBUG: Starting event loop (app.exec)...")
     sys.exit(app.exec())
 
 if __name__ == "__main__":
