@@ -87,8 +87,23 @@ from PyQt6.QtWidgets import (
 )
 from requests.exceptions import HTTPError, RequestException
 
+
 # Configure pyinaturalist with User-Agent
-pyinaturalist.user_agent = "iNaturalist Seasonal Visualizer/1.0 (Contact: your_email@example.com)"  # type: ignore[attr-defined]
+def build_app_user_agent() -> str:
+    """Build a proper User-Agent string for application requests."""
+    # Build email from parts to avoid simple scraping
+    user_part = "alan" + "rockefeller"
+    domain_part = "gmail.com"
+    email = f"{user_part}@{domain_part}"
+
+    app_name = "iNaturalist Seasonal Visualizer"
+    repo_url = "https://github.com/AlanRockefeller/inat.visualizer.py"
+
+    return f"{app_name} ({repo_url}; contact: {email})"
+
+
+pyinaturalist.user_agent = build_app_user_agent()  # type: ignore[attr-defined]
+
 
 # --- Constants for MapDialog ---
 MAX_TILES_PER_REQUEST = 100
@@ -185,6 +200,8 @@ class TileLoaderWorker(QThread):
     """Background worker to fetch map tiles."""
 
     view_ready = pyqtSignal(int, object, tuple)  # job_id, composite_image, extent
+    network_error = pyqtSignal(str)
+    network_recovered = pyqtSignal()
 
     def __init__(self, working_dir: str | Path) -> None:
         super().__init__()
@@ -192,14 +209,17 @@ class TileLoaderWorker(QThread):
         self.ram_cache = OrderedDict()
         self.mutex = QMutex()
         self.wait_condition = QWaitCondition()
-        self._pending_job = None  # (job_id, zoom, x_min, x_max, y_min, y_max)
+        self._pending_job = None  # (job_id, zoom, x0, x1, y0, y1)
         self._running = True
+        self.last_network_request_time = 0.0
+        self._network_suspended_until = 0.0
+        self._notified_error = False
 
     def request_view(
-        self, job_id: int, zoom: int, x_min: int, x_max: int, y_min: int, y_max: int
+        self, job_id: int, zoom: int, x0: float, x1: float, y0: float, y1: float
     ) -> None:
         with QMutexLocker(self.mutex):
-            self._pending_job = (job_id, zoom, x_min, x_max, y_min, y_max)
+            self._pending_job = (job_id, zoom, x0, x1, y0, y1)
             self.wait_condition.wakeOne()
 
     def stop(self) -> None:
@@ -210,7 +230,7 @@ class TileLoaderWorker(QThread):
 
     def run(self) -> None:
         session = requests.Session()
-        session.headers.update({"User-Agent": pyinaturalist.user_agent})  # type: ignore
+        session.headers.update({"User-Agent": build_app_user_agent()})
 
         while True:
             job = None
@@ -227,24 +247,88 @@ class TileLoaderWorker(QThread):
             if not job:
                 continue
 
-            job_id, zoom, x_min, x_max, y_min, y_max = job
-            self._process_job(session, job_id, zoom, x_min, x_max, y_min, y_max)
+            job_id, base_zoom, x0, x1, y0, y1 = job
+            self._process_job(session, job_id, base_zoom, x0, x1, y0, y1)
+
+    def _get_tile_range(
+        self, z: int, x0: float, x1: float, y0: float, y1: float
+    ) -> tuple[int, int, int, int]:
+        n = 2.0**z
+        xtile_min = int((x0 + 180.0) / 360.0 * n)
+        xtile_max = int((x1 + 180.0) / 360.0 * n)
+
+        def lat2y(lat):
+            return (
+                (
+                    1.0
+                    - math.asinh(math.tan(math.radians(max(-85.0, min(85.0, lat)))))
+                    / math.pi
+                )
+                / 2.0
+                * n
+            )
+
+        y_a = int(lat2y(y1))
+        y_b = int(lat2y(y0))
+        return (
+            min(xtile_min, xtile_max),
+            max(xtile_min, xtile_max),
+            min(y_a, y_b),
+            max(y_a, y_b),
+        )
 
     def _process_job(
         self,
         session: requests.Session,
         job_id: int,
-        zoom: int,
-        x_min: int,
-        x_max: int,
-        y_min: int,
-        y_max: int,
+        base_zoom: int,
+        x0: float,
+        x1: float,
+        y0: float,
+        y1: float,
     ) -> None:
+        # Conservative tile budgeting
+        MAX_UNCACHED_TILES = 16
+        MAX_TOTAL_TILES = 100
+
+        zoom = base_zoom
+        while zoom >= 0:
+            x_min, x_max, y_min, y_max = self._get_tile_range(zoom, x0, x1, y0, y1)
+            total_tiles = (x_max - x_min + 1) * (y_max - y_min + 1)
+
+            if total_tiles > MAX_TOTAL_TILES:
+                zoom -= 1
+                continue
+
+            # Count uncached tiles
+            uncached = 0
+            for tx in range(x_min, x_max + 1):
+                for ty in range(y_min, y_max + 1):
+                    # For stale jobs, return early to avoid deep computation
+                    with QMutexLocker(self.mutex):
+                        if (
+                            self._pending_job is not None
+                            and self._pending_job[0] > job_id
+                        ):
+                            return
+
+                    key = (zoom, tx, ty)
+                    if key not in self.ram_cache:
+                        path_str = self.disk_cache.get_path(zoom, tx, ty)
+                        if not Path(path_str).exists():
+                            uncached += 1
+
+            if uncached <= MAX_UNCACHED_TILES:
+                break
+            # Back off to load less map resolution, saving tile bandwidth
+            zoom -= 1
+
+        if zoom < 0:
+            zoom = 0
+
+        x_min, x_max, y_min, y_max = self._get_tile_range(zoom, x0, x1, y0, y1)
         x_range = range(x_min, x_max + 1)
         y_range = range(y_min, y_max + 1)
-        # Store for extent calculation
-        self._job_x_max = x_max
-        self._job_y_max = y_max
 
         tiles = []
         tile_positions = []
@@ -263,6 +347,8 @@ class TileLoaderWorker(QThread):
                 if tile_key in self.ram_cache:
                     img = self.ram_cache[tile_key]
                     self.ram_cache.move_to_end(tile_key)
+                    if logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.debug(f"RAM cache hit: {zoom}/{x}/{y}")
 
                 # 2. Disk Cache
                 if img is None:
@@ -271,13 +357,41 @@ class TileLoaderWorker(QThread):
                         self.ram_cache[tile_key] = img
                         if len(self.ram_cache) > MAX_CACHE_SIZE:
                             self.ram_cache.popitem(last=False)
+                        if logging.getLogger().isEnabledFor(logging.DEBUG):
+                            logging.debug(f"Disk cache hit: {zoom}/{x}/{y}")
 
                 # 3. Network
                 if img is None:
+                    # Skip if we are temporarily suspending network
+                    if time.time() < self._network_suspended_until:
+                        continue
+
+                    # Throttling
+                    now = time.time()
+                    elapsed = now - self.last_network_request_time
+                    throttle_delay = 0.15  # 150ms between tile fetches
+                    if elapsed < throttle_delay:
+                        time.sleep(throttle_delay - elapsed)
+                        # Re-check stale after sleep
+                        with QMutexLocker(self.mutex):
+                            if (
+                                self._pending_job is not None
+                                and self._pending_job[0] > job_id
+                            ):
+                                return
+
+                    self.last_network_request_time = time.time()
+
                     url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
                     try:
-                        resp = session.get(url, timeout=2.0)
+                        resp = session.get(url, timeout=3.0)
                         if resp.status_code == 200:
+                            if self._notified_error:
+                                self._notified_error = False
+                                self.network_recovered.emit()
+
+                            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                                logging.debug(f"Network fetch: {zoom}/{x}/{y}")
                             img_bytes = resp.content
                             img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
@@ -290,6 +404,14 @@ class TileLoaderWorker(QThread):
                             logging.debug(
                                 f"Tile {zoom}/{x}/{y} HTTP {resp.status_code}"
                             )
+                            if resp.status_code in (403, 429, 418):
+                                if not self._notified_error:
+                                    self._notified_error = True
+                                    self.network_error.emit(
+                                        f"Map service refused requests (HTTP {resp.status_code}). Backing off."
+                                    )
+                                self._network_suspended_until = time.time() + 15.0
+                                continue
                     except RequestException as e:
                         logging.debug(f"Failed to load tile {zoom}/{x}/{y}: {e}")
 
@@ -320,8 +442,13 @@ class TileLoaderWorker(QThread):
             lat_deg = np.degrees(lat_rad)
             return lat_deg, lon_deg
 
+        # Use the actual bounding box of downloaded tiles
         north, west = num2deg(min_x, min_y, zoom)
-        south, east = num2deg(x_max + 1, y_max + 1, zoom)
+        south, east = num2deg(
+            max(p[0] for p in tile_positions) + 1,
+            max(p[1] for p in tile_positions) + 1,
+            zoom,
+        )
 
         # Emit result
         self.view_ready.emit(job_id, composite, (west, east, south, north))
@@ -477,6 +604,8 @@ class MapDialog(QDialog):
         working_dir = parent.working_dir if parent else os.getcwd()
         self.worker = TileLoaderWorker(working_dir)
         self.worker.view_ready.connect(self.on_view_ready)
+        self.worker.network_error.connect(self.on_network_error)
+        self.worker.network_recovered.connect(self.on_network_recovered)
         self.worker.start()
 
         self.job_counter = 0
@@ -520,11 +649,18 @@ class MapDialog(QDialog):
 
         self.coord_label = QLabel(f"Lat: {lat:.4f}, Lon: {lon:.4f}")
 
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet(
+            "color: red; font-weight: bold; margin-left: 10px;"
+        )
+        self.status_label.hide()
+
         controls_layout.addWidget(radius_label)
         controls_layout.addWidget(self.radius_spinbox)
         controls_layout.addWidget(zoom_in_btn)
         controls_layout.addWidget(zoom_out_btn)
         controls_layout.addWidget(self.coord_label)
+        controls_layout.addWidget(self.status_label)
         controls_layout.addStretch()
 
         layout.addLayout(controls_layout)
@@ -579,6 +715,26 @@ class MapDialog(QDialog):
         (self.circle,) = self.ax.plot([], [], "r-", linewidth=3, alpha=0.8, zorder=5)
         self.update_overlays()
 
+        # OpenStreetMap attribution overlay
+        self.ax.text(
+            0.99,
+            0.01,
+            "© OpenStreetMap contributors",
+            verticalalignment="bottom",
+            horizontalalignment="right",
+            transform=self.ax.transAxes,
+            color="#333333",
+            fontsize=9,
+            fontweight="bold",
+            bbox=dict(
+                facecolor="white",
+                alpha=0.85,
+                edgecolor="gray",
+                boxstyle="round,pad=0.3",
+            ),
+            zorder=20,
+        )
+
         # Connect mouse events
         self.canvas.mpl_connect("button_press_event", self.on_click)  # type: ignore[arg-type]
         self.canvas.mpl_connect("scroll_event", self.on_scroll)  # type: ignore[arg-type]
@@ -620,39 +776,20 @@ class MapDialog(QDialog):
         zoom = int(math.log2(needed_2z)) if needed_2z > 0 else 0
         zoom = max(0, min(zoom, 15))  # Changed max zoom to 15
 
-        # Check tile budget
-        def get_tile_range(z):
-            n = 2.0**z
-            xtile_min = int((x0 + 180.0) / 360.0 * n)
-            xtile_max = int((x1 + 180.0) / 360.0 * n)
-
-            def lat2y(lat):
-                return (
-                    (
-                        1.0
-                        - math.asinh(math.tan(math.radians(max(-85, min(85, lat)))))
-                        / math.pi
-                    )
-                    / 2.0
-                    * n
-                )
-
-            y_a = int(lat2y(y1))  # y1 is max lat (top)
-            y_b = int(lat2y(y0))  # y0 is min lat (bottom)
-            return z, xtile_min, xtile_max, min(y_a, y_b), max(y_a, y_b)
-
-        x_min = x_max = y_min = y_max = 0
-        while zoom >= 0:
-            _z, x_min, x_max, y_min, y_max = get_tile_range(zoom)
-            num_tiles = (x_max - x_min + 1) * (y_max - y_min + 1)
-            if num_tiles <= MAX_TILES_PER_REQUEST:
-                break
-            zoom -= 1
-
-        # Submit job
+        # Check tile budget (now pushed down to Worker for uncached tile budgeting)
+        # We just send the target zoom and boundary.
         self.job_counter += 1
         self.current_job_id = self.job_counter
-        self.worker.request_view(self.current_job_id, zoom, x_min, x_max, y_min, y_max)
+        self.worker.request_view(
+            self.current_job_id, zoom, float(x0), float(x1), float(y0), float(y1)
+        )
+
+    def on_network_error(self, message: str) -> None:
+        self.status_label.setText(message)
+        self.status_label.show()
+
+    def on_network_recovered(self) -> None:
+        self.status_label.hide()
 
     def on_view_ready(
         self, job_id: int, composite, extent: tuple[float, float, float, float]
