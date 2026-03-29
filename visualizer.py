@@ -450,7 +450,8 @@ class TileLoaderWorker(QThread):
                 self.retry_complete.emit()
 
     def _retry_skipped_tiles(self, session: requests.Session) -> bool:
-        skipped = list(self._skipped_tiles)
+        with QMutexLocker(self.mutex):
+            skipped = list(self._skipped_tiles)
         recovered_any = False
         for tile_key in skipped:
             with QMutexLocker(self.mutex):
