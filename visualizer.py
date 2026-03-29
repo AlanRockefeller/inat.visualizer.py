@@ -4,49 +4,83 @@
 # Requires:  libxcb-cursor0 libxkbcommon-x11-0
 
 import os
-os.environ["QT_QPA_PLATFORM"] = "xcb"   # run Qt via XWayland (usually avoids the Wayland protocol crash)
 
+# Must be set before PyQt6 initializes to route Qt through XWayland.
+os.environ["QT_QPA_PLATFORM"] = "xcb"
 
-import sys
+# --- stdlib ---
 import argparse
-import numpy as np
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QFormLayout, QLineEdit, QPushButton, QComboBox, QMenuBar,
-                             QStatusBar, QFileDialog, QLabel, QListWidget, QMessageBox,
-                             QProgressBar, QColorDialog, QTextEdit, QSplashScreen, QDialog,
-                             QDialogButtonBox, QSlider, QSpinBox, QSizePolicy, QInputDialog)
-from PyQt6.QtCore import QSettings, Qt, QTimer, QThread, pyqtSignal, QObject, QMutex, QWaitCondition, QMutexLocker
-from PyQt6.QtGui import QAction, QFont, QColor, QPixmap, QDoubleValidator, QGuiApplication
-import pyinaturalist
-import pandas as pd
-from datetime import datetime
-import os
-import time
-import requests
-from requests.exceptions import HTTPError
-from urllib.parse import urlencode
-import duckdb
-import math
+from typing import Any
 import importlib
-import platform
 import json
 import logging
-from pathlib import Path
-
-# Set matplotlib backend to PyQt6 before importing matplotlib
-import matplotlib
-matplotlib.use('QtAgg')  # Explicitly use PyQt6 backend
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-import requests
-from PIL import Image
-from io import BytesIO
-
-from requests.exceptions import RequestException
+import math
+import platform
+import sys
+import time
 from collections import OrderedDict
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from urllib.parse import urlencode
+
+# --- third-party ---
+import duckdb
+import matplotlib
+
+matplotlib.use("QtAgg")  # Must be set before importing matplotlib.pyplot.
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pyinaturalist
+import requests
+from matplotlib.backend_bases import MouseEvent
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from PIL import Image
+from PyQt6.QtCore import (
+    QMutex,
+    QMutexLocker,
+    QObject,
+    QSettings,
+    Qt,
+    QThread,
+    QTimer,
+    QWaitCondition,
+    pyqtSignal,
+)
+from PyQt6.QtGui import QAction, QCloseEvent, QColor, QDoubleValidator, QFont, QGuiApplication, QPixmap
+from PyQt6.QtWidgets import (
+    QApplication,
+    QColorDialog,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMainWindow,
+    QMenuBar,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QSpinBox,
+    QSplashScreen,
+    QStatusBar,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+from requests.exceptions import HTTPError, RequestException
 
 # Configure pyinaturalist with User-Agent
-pyinaturalist.user_agent = "iNaturalist Seasonal Visualizer/1.0 (Contact: your_email@example.com)"
+pyinaturalist.user_agent = "iNaturalist Seasonal Visualizer/1.0 (Contact: your_email@example.com)"  # type: ignore[attr-defined]
 
 # --- Constants for MapDialog ---
 MAX_TILES_PER_REQUEST = 100
@@ -56,27 +90,28 @@ MAX_DISK_CACHE_SIZE_MB = 200
 
 class DiskTileCache:
     """Persistent disk cache for map tiles with size limit and LRU pruning."""
-    def __init__(self, parent_dir, max_size_mb=MAX_DISK_CACHE_SIZE_MB):
+
+    def __init__(self, parent_dir: str | Path, max_size_mb: int = MAX_DISK_CACHE_SIZE_MB) -> None:
         self.cache_dir = Path(parent_dir) / TILE_CACHE_DIR_NAME
         self.max_size_mb = max_size_mb
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def get_path(self, z, x, y):
+    def get_path(self, z: int, x: int, y: int) -> Path:
         return self.cache_dir / str(z) / str(x) / f"{y}.png"
 
-    def get_tile(self, z, x, y):
+    def get_tile(self, z: int, x: int, y: int) -> "Image.Image | None":
         path = self.get_path(z, x, y)
         if path.exists():
             try:
                 # Update mtime for LRU
                 path.touch()
                 with Image.open(path) as img:
-                     return img.convert("RGB").copy()
+                    return img.convert("RGB").copy()
             except Exception as e:
                 logging.warning(f"Corrupt tile in disk cache {path}: {e}")
         return None
 
-    def put_tile(self, z, x, y, image_bytes):
+    def put_tile(self, z: int, x: int, y: int, image_bytes: bytes) -> None:
         path = self.get_path(z, x, y)
         path.parent.mkdir(parents=True, exist_ok=True)
         # Atomic write
@@ -94,7 +129,7 @@ class DiskTileCache:
                 except OSError:
                     pass
 
-    def _prune_if_needed(self):
+    def _prune_if_needed(self) -> None:
         # Simple probability-based check to avoid scanning on every write
         if np.random.random() > 0.05: 
             return
@@ -113,7 +148,7 @@ class DiskTileCache:
             # Sort by mtime (oldest first)
             files.sort()
             deleted_size = 0
-            target_reduction = total_size * 0.2 # clear 20%
+            target_reduction = total_size * 0.2  # clear 20%
             for _mtime, p, size in files:
                 try:
                     p.unlink()
@@ -122,19 +157,23 @@ class DiskTileCache:
                         break
                 except OSError:
                     pass
-            # Try to remove empty dirs
-            for p in self.cache_dir.rglob("*"):
-                if p.is_dir():
-                    try:
-                        p.rmdir() # Only removes if empty
-                    except OSError:
-                        pass
+            # Remove empty dirs; sort deepest-first so children are removed before parents.
+            dirs = sorted(
+                (p for p in self.cache_dir.rglob("*") if p.is_dir()),
+                key=lambda p: len(p.parts),
+                reverse=True,
+            )
+            for p in dirs:
+                try:
+                    p.rmdir()  # Only removes if empty
+                except OSError:
+                    pass
 
 class TileLoaderWorker(QThread):
     """Background worker to fetch map tiles."""
     view_ready = pyqtSignal(int, object, tuple)  # job_id, composite_image, extent
 
-    def __init__(self, working_dir):
+    def __init__(self, working_dir: str | Path) -> None:
         super().__init__()
         self.disk_cache = DiskTileCache(working_dir)
         self.ram_cache = OrderedDict()
@@ -143,20 +182,20 @@ class TileLoaderWorker(QThread):
         self._pending_job = None  # (job_id, zoom, x_min, x_max, y_min, y_max)
         self._running = True
         
-    def request_view(self, job_id, zoom, x_min, x_max, y_min, y_max):
+    def request_view(self, job_id: int, zoom: int, x_min: int, x_max: int, y_min: int, y_max: int) -> None:
         with QMutexLocker(self.mutex):
             self._pending_job = (job_id, zoom, x_min, x_max, y_min, y_max)
             self.wait_condition.wakeOne()
 
-    def stop(self):
+    def stop(self) -> None:
         with QMutexLocker(self.mutex):
             self._running = False
             self.wait_condition.wakeOne()
         self.wait()
 
-    def run(self):
+    def run(self) -> None:
         session = requests.Session()
-        session.headers.update({"User-Agent": pyinaturalist.user_agent})
+        session.headers.update({"User-Agent": pyinaturalist.user_agent})  # type: ignore
 
         while True:
             job = None
@@ -174,7 +213,16 @@ class TileLoaderWorker(QThread):
             job_id, zoom, x_min, x_max, y_min, y_max = job
             self._process_job(session, job_id, zoom, x_min, x_max, y_min, y_max)
 
-    def _process_job(self, session, job_id, zoom, x_min, x_max, y_min, y_max):
+    def _process_job(
+        self,
+        session: requests.Session,
+        job_id: int,
+        zoom: int,
+        x_min: int,
+        x_max: int,
+        y_min: int,
+        y_max: int,
+    ) -> None:
         x_range = range(x_min, x_max + 1)
         y_range = range(y_min, y_max + 1)
         # Store for extent calculation
@@ -200,15 +248,15 @@ class TileLoaderWorker(QThread):
                     self.ram_cache.move_to_end(tile_key)
                 
                 # 2. Disk Cache
-                if not img:
+                if img is None:
                     img = self.disk_cache.get_tile(zoom, x, y)
-                    if img:
+                    if img is not None:
                         self.ram_cache[tile_key] = img
                         if len(self.ram_cache) > MAX_CACHE_SIZE:
                             self.ram_cache.popitem(last=False)
                 
                 # 3. Network
-                if not img:
+                if img is None:
                     url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
                     try:
                         resp = session.get(url, timeout=2.0)
@@ -260,23 +308,23 @@ class TileLoaderWorker(QThread):
         self.view_ready.emit(job_id, composite, (west, east, south, north))
 
 class DatabaseProgressTracker:
-    """Track database operation progress without impacting performance"""
-    
-    def __init__(self, progress_widget):
+    """Track database operation progress without impacting performance."""
+
+    def __init__(self, progress_widget: "EnhancedProgressWidget") -> None:
         self.progress_widget = progress_widget
         self.operation_start = None
         self.last_update = None
         self.estimated_total = None
-        
-    def start_operation(self, operation_name, estimated_total=None):
-        """Start tracking a database operation"""
+
+    def start_operation(self, operation_name: str, estimated_total: int | None = None) -> None:
+        """Start tracking a database operation."""
         self.operation_start = time.time()
         self.last_update = self.operation_start
         self.estimated_total = estimated_total
         self.progress_widget.start_progress(estimated_total or 0, f"Starting {operation_name}...")
         
-    def update_progress(self, current_count=None, message=None):
-        """Update progress during database operation"""
+    def update_progress(self, current_count: int | None = None, message: str | None = None) -> None:
+        """Update progress during database operation."""
         current_time = time.time()
         
         if current_count is not None and self.estimated_total:
@@ -287,8 +335,8 @@ class DatabaseProgressTracker:
             
         self.last_update = current_time
         
-    def finish_operation(self, final_count=None, message=None):
-        """Finish tracking the operation"""
+    def finish_operation(self, final_count: int | None = None, message: str | None = None) -> None:
+        """Finish tracking the operation."""
         if final_count is not None:
             self.progress_widget.finish_progress(f"{message or 'Operation completed'}: {final_count} results")
         else:
@@ -297,14 +345,19 @@ class DatabaseProgressTracker:
 class CustomSplashScreen(QSplashScreen):
     """Splash screen that scales to fit the screen without overflowing."""
 
-    def __init__(self, image_path, parent=None, scale_factor=2.2):
+    def __init__(self, image_path: str, parent=None, scale_factor: float = 2.2) -> None:
         # Load the base image
         original_pixmap = QPixmap(image_path)
 
         # Get the screen geometry
-        screen = QApplication.primaryScreen().geometry()
-        screen_w = screen.width()
-        screen_h = screen.height()
+        _primary = QApplication.primaryScreen()
+        if _primary is None:
+            logging.warning("No primary screen detected; using fallback splash dimensions")
+            screen_x, screen_y, screen_w, screen_h = 0, 0, 1920, 1080
+        else:
+            _geom = _primary.geometry()
+            screen_x, screen_y = _geom.x(), _geom.y()
+            screen_w, screen_h = _geom.width(), _geom.height()
 
         # Compute target size based on desired scale factor
         target_w = original_pixmap.width() * scale_factor
@@ -328,13 +381,17 @@ class CustomSplashScreen(QSplashScreen):
         super().__init__(scaled_pixmap)
 
         # Window flags
-        self.setWindowFlags(Qt.WindowType.SplashScreen | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint)
+        self.setWindowFlags(
+            Qt.WindowType.SplashScreen
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.FramelessWindowHint
+        )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 
         # Center on screen
         self.move(
-            screen.x() + (screen_w - self.width()) // 2,
-            screen.y() + (screen_h - self.height()) // 2
+            screen_x + (screen_w - self.width()) // 2,
+            screen_y + (screen_h - self.height()) // 2,
         )
 
         # Status label
@@ -359,7 +416,7 @@ class CustomSplashScreen(QSplashScreen):
         self.show()
         QApplication.processEvents()
 
-    def update_status(self, message):
+    def update_status(self, message: str) -> None:
         self.status_label.setText(message)
         QApplication.processEvents()
 
@@ -367,9 +424,9 @@ class CustomSplashScreen(QSplashScreen):
 class MapDialog(QDialog):
     """Interactive map dialog for setting coordinates and radius using matplotlib"""
     
-    def __init__(self, parent=None, lat=37.7749, lon=-122.4194, radius=10):
+    def __init__(self, parent: "INatSeasonalVisualizer | None" = None, lat: float = 37.7749, lon: float = -122.4194, radius: float = 10) -> None:
         super().__init__(parent)
-        self.parent = parent
+        self._main_window = parent
         self.lat = lat
         self.lon = lon
         self.radius = radius
@@ -386,10 +443,13 @@ class MapDialog(QDialog):
         self.setWindowTitle("Interactive Map - Set Location")
         self.setModal(True)
 
-        screen = QApplication.primaryScreen().geometry()
-        w = int(screen.width() * 0.75)
-        h = int(screen.height() * 0.75)
-        self.resize(w, h)
+        _primary = QApplication.primaryScreen()
+        if _primary is not None:
+            screen = _primary.geometry()
+            self.resize(int(screen.width() * 0.75), int(screen.height() * 0.75))
+        else:
+            logging.warning("No primary screen detected; using fallback dialog size")
+            self.resize(1200, 800)
         
         # Create layout
         layout = QVBoxLayout(self)
@@ -410,7 +470,7 @@ class MapDialog(QDialog):
         # Zoom buttons
         zoom_in_btn = QPushButton("+")
         zoom_in_btn.setFixedSize(30, 30)
-        zoom_in_btn.clicked.connect(lambda: self.zoom_map(1.0/1.5))
+        zoom_in_btn.clicked.connect(lambda: self.zoom_map(1.0 / 1.5))
         
         zoom_out_btn = QPushButton("-")
         zoom_out_btn.setFixedSize(30, 30)
@@ -460,24 +520,24 @@ class MapDialog(QDialog):
         self.update_overlays()
 
         # Connect mouse events
-        self.canvas.mpl_connect('button_press_event', self.on_click)
-        self.canvas.mpl_connect('scroll_event', self.on_scroll)
+        self.canvas.mpl_connect('button_press_event', self.on_click)           # type: ignore[arg-type]
+        self.canvas.mpl_connect('scroll_event', self.on_scroll)                # type: ignore[arg-type]
 
         # Pan support
         self._is_panning = False
-        self._last_pan_pos = None
-        self.canvas.mpl_connect('button_press_event', self.on_mouse_press)
-        self.canvas.mpl_connect('button_release_event', self.on_mouse_release)
-        self.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)
+        self._last_pan_pos: tuple[float, float] | None = None
+        self.canvas.mpl_connect('button_press_event', self.on_mouse_press)     # type: ignore[arg-type]
+        self.canvas.mpl_connect('button_release_event', self.on_mouse_release) # type: ignore[arg-type]
+        self.canvas.mpl_connect('motion_notify_event', self.on_mouse_move)     # type: ignore[arg-type]
 
         # Trigger initial load
         self.request_tiles_for_current_view()
         
-    def closeEvent(self, event):
+    def closeEvent(self, a0: QCloseEvent | None) -> None:
         self.worker.stop()
-        super().closeEvent(event)
+        super().closeEvent(a0)
         
-    def request_tiles_for_current_view(self):
+    def request_tiles_for_current_view(self) -> None:
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
         
@@ -511,6 +571,7 @@ class MapDialog(QDialog):
             y_b = int(lat2y(y0)) # y0 is min lat (bottom)
             return z, xtile_min, xtile_max, min(y_a, y_b), max(y_a, y_b)
 
+        x_min = x_max = y_min = y_max = 0
         while zoom >= 0:
             _z, x_min, x_max, y_min, y_max = get_tile_range(zoom)
             num_tiles = (x_max - x_min + 1) * (y_max - y_min + 1)
@@ -523,7 +584,7 @@ class MapDialog(QDialog):
         self.current_job_id = self.job_counter
         self.worker.request_view(self.current_job_id, zoom, x_min, x_max, y_min, y_max)
         
-    def on_view_ready(self, job_id, composite, extent):
+    def on_view_ready(self, job_id: int, composite, extent: tuple[float, float, float, float]) -> None:
         if job_id < self.current_job_id:
             return 
         
@@ -537,7 +598,7 @@ class MapDialog(QDialog):
         self.update_overlays()
         self.canvas.draw_idle()
 
-    def update_overlays(self):
+    def update_overlays(self) -> None:
         self.marker.set_data([self.lon], [self.lat])
         
         circle_lons = []
@@ -551,15 +612,19 @@ class MapDialog(QDialog):
         self.circle.set_data(circle_lons, circle_lats)
         self.coord_label.setText(f"Lat: {self.lat:.4f}, Lon: {self.lon:.4f}")
 
-    def on_click(self, event):
-        if event.inaxes != self.ax: return
+    def on_click(self, event: MouseEvent) -> None:
+        if event.inaxes != self.ax:
+            return
+        xdata, ydata = event.xdata, event.ydata
         if event.button == 1 and event.key not in ('control', 'ctrl'):
-            self.lat = event.ydata
-            self.lon = event.xdata
+            if xdata is None or ydata is None:
+                return
+            self.lat = ydata
+            self.lon = xdata
             self.update_overlays()
             self.canvas.draw_idle()
 
-    def zoom_map(self, scale):
+    def zoom_map(self, scale: float) -> None:
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
         
@@ -583,46 +648,53 @@ class MapDialog(QDialog):
         self.canvas.draw_idle()
         self.update_timer.start()
 
-    def update_radius(self, value):
+    def update_radius(self, value: int) -> None:
         self.radius = value
         self.update_overlays()
         self.canvas.draw_idle()
 
-    def accept(self):
-        if self.parent:
-            self.parent.lat_input.setText(f"{self.lat:.4f}")
-            self.parent.lon_input.setText(f"{self.lon:.4f}")
-            self.parent.radius_input.setText(str(self.radius))
+    def accept(self) -> None:
+        if self._main_window:
+            self._main_window.lat_input.setText(f"{self.lat:.4f}")
+            self._main_window.lon_input.setText(f"{self.lon:.4f}")
+            self._main_window.radius_input.setText(str(self.radius))
         super().accept()
 
-    def on_mouse_press(self, event):
-        if event.inaxes != self.ax: return
+    def on_mouse_press(self, event: MouseEvent) -> None:
+        if event.inaxes != self.ax:
+            return
         # Pan on: Right Click (3), OR Left Click (1) with Control OR Shift
         is_pan_click = (event.button == 3) or (event.button == 1 and event.key in ('control', 'ctrl', 'shift'))
         
-        if is_pan_click:
+        xdata, ydata = event.xdata, event.ydata
+        if is_pan_click and xdata is not None and ydata is not None:
             self._is_panning = True
-            self._last_pan_pos = (event.xdata, event.ydata)
+            self._last_pan_pos = (xdata, ydata)
             try:
                 self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
             except Exception: 
                 logging.debug("Failed to set cursor")
 
-    def on_mouse_release(self, event):
+    def on_mouse_release(self, _event: MouseEvent) -> None:
         if self._is_panning:
             self._is_panning = False
             self._last_pan_pos = None
             try:
                 self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
-            except Exception: pass
+            except Exception:
+                pass
             self.update_timer.start()
 
-    def on_mouse_move(self, event):
-        if not self._is_panning or event.inaxes != self.ax: return
-        if self._last_pan_pos is None: return
-        
-        dx = event.xdata - self._last_pan_pos[0]
-        dy = event.ydata - self._last_pan_pos[1]
+    def on_mouse_move(self, event: MouseEvent) -> None:
+        if not self._is_panning or event.inaxes != self.ax:
+            return
+        if self._last_pan_pos is None:
+            return
+        xdata, ydata = event.xdata, event.ydata
+        if xdata is None or ydata is None:
+            return
+        dx = xdata - self._last_pan_pos[0]
+        dy = ydata - self._last_pan_pos[1]
         
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
@@ -631,9 +703,10 @@ class MapDialog(QDialog):
         self.ax.set_ylim(y0 - dy, y1 - dy)
         self.canvas.draw_idle()
         
-    def on_scroll(self, event):
-        if event.inaxes != self.ax: return
-        scale = 1.0/1.5 if event.button == 'up' else 1.5
+    def on_scroll(self, event: MouseEvent) -> None:
+        if event.inaxes != self.ax:
+            return
+        scale = 1.0 / 1.5 if event.button == 'up' else 1.5
         
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
@@ -660,25 +733,25 @@ class MapDialog(QDialog):
 
 
 class EnhancedProgressWidget(QWidget):
-    """Enhanced progress widget with detailed status information"""
-    
-    def __init__(self, parent=None):
+    """Enhanced progress widget with detailed status information."""
+
+    def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(0, 0, 0, 0)
-        
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+
         # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        self.layout.addWidget(self.progress_bar)
-        
+        self._layout.addWidget(self.progress_bar)
+
         # Status text
         self.status_text = QTextEdit()
         self.status_text.setMaximumHeight(80)
         self.status_text.setVisible(False)
         self.status_text.setReadOnly(True)
         self.status_text.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.layout.addWidget(self.status_text)
+        self._layout.addWidget(self.status_text)
         
         # Timer for updates
         self.timer = QTimer()
@@ -694,8 +767,8 @@ class EnhancedProgressWidget(QWidget):
         # Create database progress tracker
         self.db_tracker = DatabaseProgressTracker(self)
         
-    def start_progress(self, total_steps=0, message="Starting operation..."):
-        """Start progress tracking"""
+    def start_progress(self, total_steps: int = 0, message: str = "Starting operation...") -> None:
+        """Start progress tracking."""
         self.start_time = time.time()
         self.last_update = self.start_time
         self.current_step = 0
@@ -713,8 +786,8 @@ class EnhancedProgressWidget(QWidget):
         self._update_display()
         self.timer.start(100)  # Update every 100ms
         
-    def update_progress(self, step=None, message=None):
-        """Update progress"""
+    def update_progress(self, step: int | None = None, message: str | None = None) -> None:
+        """Update progress."""
         current_time = time.time()
         
         if step is not None:
@@ -731,8 +804,8 @@ class EnhancedProgressWidget(QWidget):
         self.last_update = current_time
         self._update_display()
         
-    def finish_progress(self, message="Operation completed"):
-        """Finish progress tracking"""
+    def finish_progress(self, message: str = "Operation completed") -> None:
+        """Finish progress tracking."""
         self.timer.stop()
         self.status_messages.append(f"[{self._format_time()}] {message}")
         self._update_display()
@@ -740,17 +813,17 @@ class EnhancedProgressWidget(QWidget):
         # Hide after a delay
         QTimer.singleShot(2000, self.hide_progress)
         
-    def hide_progress(self):
-        """Hide progress widget"""
+    def hide_progress(self) -> None:
+        """Hide progress widget."""
         self.progress_bar.setVisible(False)
         self.status_text.setVisible(False)
         
-    def _format_time(self):
-        """Format current time"""
+    def _format_time(self) -> str:
+        """Format current time."""
         return datetime.now().strftime("%H:%M:%S")
         
-    def _update_display(self):
-        """Update the display"""
+    def _update_display(self) -> None:
+        """Update the display."""
         if self.total_steps > 0:
             self.progress_bar.setValue(self.current_step)
             
@@ -768,13 +841,13 @@ class EnhancedProgressWidget(QWidget):
                 
         self.status_text.setPlainText(status_display)
         
-    def update_status(self):
-        """Timer callback for status updates"""
+    def update_status(self) -> None:
+        """Timer callback for status updates."""
         if self.start_time:
             self._update_display()
 
-def check_environment():
-    """Check if the environment is correctly set up, return error message if not"""
+def check_environment() -> str | None:
+    """Check if the environment is correctly set up, return error message if not."""
     errors = []
 
     # Check Python interpreter
@@ -843,11 +916,12 @@ def check_environment():
 class INatSeasonalVisualizer(QMainWindow):
     """Main application class for iNaturalist Seasonal Visualizer"""
     
-    def get_most_recent_date(self):
+    def get_most_recent_date(self) -> str:
         """Get the most recent date from the observations.parquet file."""
         if not os.path.exists(self.observations_file):
             return datetime.now().strftime("%Y-%m-%d")
 
+        con = None
         try:
             con = duckdb.connect()
             schema = con.execute(f"DESCRIBE SELECT * FROM '{self.observations_file}'").fetchall()
@@ -866,10 +940,17 @@ class INatSeasonalVisualizer(QMainWindow):
             logging.error(f"Failed to get most recent date from database: {str(e)}")
             return datetime.now().strftime("%Y-%m-%d")
         finally:
-            if 'con' in locals():
+            if con is not None:
                 con.close()
 
-    def __init__(self, lat=None, lon=None, radius=None, scale_factor=1.0, splash_screen=None):
+    def __init__(
+        self,
+        lat: float | None = None,
+        lon: float | None = None,
+        radius: float | None = None,
+        scale_factor: float = 1.0,
+        splash_screen=None,
+    ) -> None:
         super().__init__()
         self.splash_screen = splash_screen
         self.settings = QSettings("xAI", "iNatSeasonalVisualizer")
@@ -891,8 +972,8 @@ class INatSeasonalVisualizer(QMainWindow):
         self.observations_file = os.path.join(self.working_dir, "observations.parquet")
         
         # Initialize statusBar and enhanced progress widget early for download_missing_files
-        self.statusBar = QStatusBar()
-        self.setStatusBar(self.statusBar)
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
         self.enhanced_progress = EnhancedProgressWidget()
         
         # Add enhanced progress widget to a temporary layout for visibility during downloads
@@ -942,11 +1023,12 @@ class INatSeasonalVisualizer(QMainWindow):
             QApplication.processEvents()
         self.show_placeholder()
 
-    def load_database_stats(self):
+    def load_database_stats(self) -> None:
         """Query the parquet file to get total observations and unique taxa."""
         if not os.path.exists(self.observations_file):
             return
 
+        con = None
         try:
             con = duckdb.connect()
             # Check if taxonID column exists before running the main query
@@ -954,24 +1036,26 @@ class INatSeasonalVisualizer(QMainWindow):
             column_names = [row[0].lower() for row in schema]
             if 'taxonid' not in column_names:
                 logging.warning("taxonID column not found in observations.parquet. Cannot calculate unique taxa.")
-                self.total_observations = con.execute(f"SELECT COUNT(*) FROM '{self.observations_file}'").fetchone()[0]
+                _row = con.execute(f"SELECT COUNT(*) FROM '{self.observations_file}'").fetchone()
+                self.total_observations = _row[0] if _row else 0
                 self.unique_taxa = "N/A"
                 return
 
             result = con.execute(f"SELECT COUNT(*), COUNT(DISTINCT taxonID) FROM '{self.observations_file}'").fetchone()
-            self.total_observations = result[0]
-            self.unique_taxa = result[1]
+            if result:
+                self.total_observations = result[0]
+                self.unique_taxa = result[1]
             logging.info(f"Loaded database stats: {self.total_observations} observations, {self.unique_taxa} unique taxa.")
         except Exception as e:
             logging.error(f"Failed to load database stats: {str(e)}")
             self.total_observations = "Error"
             self.unique_taxa = "Error"
         finally:
-            if 'con' in locals():
+            if con is not None:
                 con.close()
 
-    def human_readable_size(self, size_bytes):
-        """Convert file size in bytes to human-readable format (e.g., KB, MB, GB)"""
+    def human_readable_size(self, size_bytes: int) -> str:
+        """Convert file size in bytes to human-readable format (e.g., KB, MB, GB)."""
         if size_bytes == 0:
             return "0 B"
         units = ["B", "KB", "MB", "GB", "TB"]
@@ -982,8 +1066,8 @@ class INatSeasonalVisualizer(QMainWindow):
             i += 1
         return f"{size:.2f} {units[i]}"
 
-    def download_missing_files(self):
-        """Check for missing parquet files and prompt user to download them"""
+    def download_missing_files(self) -> None:
+        """Check for missing parquet files and prompt user to download them."""
         files_to_download = []
         file_info = {
             "observations.parquet": {
@@ -1027,7 +1111,9 @@ class INatSeasonalVisualizer(QMainWindow):
         dialog.setText(message)
         dialog.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
         dialog.setDefaultButton(QMessageBox.StandardButton.Ok)
-        dialog.button(QMessageBox.StandardButton.Ok).setText("Download")
+        _ok_btn = dialog.button(QMessageBox.StandardButton.Ok)
+        if _ok_btn is not None:
+            _ok_btn.setText("Download")
         result = dialog.exec()
 
         if result == QMessageBox.StandardButton.Cancel:
@@ -1040,7 +1126,7 @@ class INatSeasonalVisualizer(QMainWindow):
             url = info["url"]
             human_size = self.human_readable_size(info["size"])
             logging.info(f"Downloading {filename} ({human_size}) from {url}")
-            self.statusBar.showMessage(f"Downloading {filename} ({human_size})...")
+            self.status_bar.showMessage(f"Downloading {filename} ({human_size})...")
             
             # Start enhanced progress tracking
             self.enhanced_progress.start_progress(100, f"Downloading {filename} ({human_size})")
@@ -1064,7 +1150,7 @@ class INatSeasonalVisualizer(QMainWindow):
                                 QApplication.processEvents()  # Update progress bar in real-time
 
                 logging.info(f"Successfully downloaded {filename} to {file_path}")
-                self.statusBar.showMessage(f"Downloaded {filename} ({human_size})")
+                self.status_bar.showMessage(f"Downloaded {filename} ({human_size})")
                 self.enhanced_progress.finish_progress(f"Successfully downloaded {filename}")
                 QApplication.processEvents()
 
@@ -1083,16 +1169,16 @@ class INatSeasonalVisualizer(QMainWindow):
             finally:
                 QApplication.processEvents()
 
-    def init_args(self, lat, lon, radius):
-        """Initialize command-line arguments"""
+    def init_args(self, lat: float | None, lon: float | None, radius: float | None) -> None:
+        """Initialize command-line arguments."""
         default_lat = lat if lat is not None else self.settings.value("latitude", 37.7749)
         default_lon = lon if lon is not None else self.settings.value("longitude", -122.4194)
         self.default_lat = f"{float(default_lat):.4f}"
         self.default_lon = f"{float(default_lon):.4f}"
         self.default_radius = radius if radius is not None else self.settings.value("radius", 10)
 
-    def load_taxon_cache(self):
-        """Load taxon cache from JSON file to avoid repeated API calls and taxonomy queries"""
+    def load_taxon_cache(self) -> None:
+        """Load taxon cache from JSON file to avoid repeated API calls and taxonomy queries."""
         try:
             if os.path.exists(self.taxon_cache_file):
                 with open(self.taxon_cache_file, 'r') as f:
@@ -1108,8 +1194,8 @@ class INatSeasonalVisualizer(QMainWindow):
             QMessageBox.warning(self, "Warning", f"Invalid or corrupted taxon_cache.json in {self.working_dir}. Starting with empty cache.")
             self.taxon_cache = {}
 
-    def save_taxon_cache(self):
-        """Save taxon cache to JSON file for persistence across sessions"""
+    def save_taxon_cache(self) -> None:
+        """Save taxon cache to JSON file for persistence across sessions."""
         try:
             with open(self.taxon_cache_file, 'w') as f:
                 json.dump(self.taxon_cache, f, indent=2)
@@ -1117,8 +1203,8 @@ class INatSeasonalVisualizer(QMainWindow):
         except Exception as e:
             logging.error(f"Failed to save taxon cache: {str(e)}")
 
-    def load_descendant_taxons_from_file(self, query):
-        """Load descendant taxon IDs from a user-provided file"""
+    def load_descendant_taxons_from_file(self, query: str) -> list[int] | None:
+        """Load descendant taxon IDs from a user-provided file."""
         try:
             if not os.path.exists(self.descendant_taxons_file):
                 return None
@@ -1133,8 +1219,8 @@ class INatSeasonalVisualizer(QMainWindow):
             logging.error(f"Failed to load descendant taxons from {self.descendant_taxons_file}: {str(e)}")
             return None
 
-    def init_ui(self):
-        """Initialize the user interface"""
+    def init_ui(self) -> None:
+        """Initialize the user interface."""
         self.setWindowTitle("iNaturalist Seasonal Visualizer")
 
         # Use the user-provided or default scale factor
@@ -1245,8 +1331,12 @@ class INatSeasonalVisualizer(QMainWindow):
         self.sidebar_layout.addRow("History:", self.history_list)
 
         # Keep the sidebar from expanding past a reasonable width
-        avail = QGuiApplication.primaryScreen().availableGeometry()
-        self.sidebar.setMaximumWidth(int(avail.width() * 0.35))  # tweak 0.30–0.45 as you like
+        _primary = QGuiApplication.primaryScreen()
+        if _primary is not None:
+            avail = _primary.availableGeometry()
+            self.sidebar.setMaximumWidth(int(avail.width() * 0.35))  # tweak 0.30–0.45 as you like
+        else:
+            logging.warning("No primary screen detected; skipping sidebar width cap")
 
         # Prevent long history strings from pushing size hints wider
         self.history_list.setTextElideMode(Qt.TextElideMode.ElideRight)
@@ -1288,8 +1378,8 @@ class INatSeasonalVisualizer(QMainWindow):
         # Apply initial theme
         self.apply_stylesheet()
 
-    def parse_coordinate_input(self, text):
-        """Parse coordinate string (e.g. 'lat, lon') and update inputs"""
+    def parse_coordinate_input(self, text: str) -> None:
+        """Parse coordinate string (e.g. 'lat, lon') and update inputs."""
         if ',' in text:
             parts = text.split(',')
             if len(parts) == 2:
@@ -1309,13 +1399,18 @@ class INatSeasonalVisualizer(QMainWindow):
                 except ValueError:
                     pass
 
-    def init_menu_bar(self):
-
-        """Initialize the menu bar"""
+    def init_menu_bar(self) -> None:
+        """Initialize the menu bar."""
         menu_bar = self.menuBar()
+        if menu_bar is None:
+            logging.warning("menuBar() returned None; skipping menu bar init")
+            return
 
         # File menu
         file_menu = menu_bar.addMenu("File")
+        if file_menu is None:
+            logging.warning("addMenu('File') returned None; skipping File menu")
+            return
         save_action = QAction("Save Settings", self)
         save_action.triggered.connect(self.save_settings)
         file_menu.addAction(save_action)
@@ -1334,6 +1429,9 @@ class INatSeasonalVisualizer(QMainWindow):
 
         # Edit menu
         edit_menu = menu_bar.addMenu("Edit")
+        if edit_menu is None:
+            logging.warning("addMenu('Edit') returned None; skipping Edit menu")
+            return
         theme_action = QAction("Toggle Dark/Light Mode", self)
         theme_action.triggered.connect(lambda: self.toggle_theme("dark" if self.settings.value("theme", "light") == "light" else "light"))
         edit_menu.addAction(theme_action)
@@ -1358,15 +1456,15 @@ class INatSeasonalVisualizer(QMainWindow):
         self.graph_font_size_action.triggered.connect(self.change_graph_font_size)
         edit_menu.addAction(self.graph_font_size_action)
 
-    def _refresh_font_menu_labels(self):
-        """Update font size menu actions with current values"""
+    def _refresh_font_menu_labels(self) -> None:
+        """Update font size menu actions with current values."""
         if getattr(self, "app_font_size_action", None):
             self.app_font_size_action.setText(f"Change App Font Size ({self.app_font_size}pt)")
         if getattr(self, "graph_font_size_action", None):
             self.graph_font_size_action.setText(f"Change Graph Font Size ({self.graph_font_size}pt)")
 
-    def change_app_font_size(self):
-        """Prompt user to change the application font size"""
+    def change_app_font_size(self) -> None:
+        """Prompt user to change the application font size."""
         current_size = self.app_font_size
         new_size, ok = QInputDialog.getInt(
             self, "App Font Size", "Select app font size (pt):", 
@@ -1378,8 +1476,8 @@ class INatSeasonalVisualizer(QMainWindow):
             self._refresh_font_menu_labels()
             self.apply_stylesheet()
 
-    def change_graph_font_size(self):
-        """Prompt user to change the graph font size"""
+    def change_graph_font_size(self) -> None:
+        """Prompt user to change the graph font size."""
         current_size = self.graph_font_size
         new_size, ok = QInputDialog.getInt(
             self, "Graph Font Size", "Select graph font size (pt):", 
@@ -1411,8 +1509,8 @@ class INatSeasonalVisualizer(QMainWindow):
             elif self.canvas:
                 self.canvas.draw_idle()
 
-    def apply_stylesheet(self):
-        """Apply the application stylesheet based on current theme and font settings"""
+    def apply_stylesheet(self) -> None:
+        """Apply the application stylesheet based on current theme and font settings."""
         mode = self.settings.value("theme", "light")
         font_size_pt = int(self.app_font_size * self.scale_factor)
         font_stylesheet = f"font-size: {font_size_pt}pt;"
@@ -1455,17 +1553,18 @@ class INatSeasonalVisualizer(QMainWindow):
                 for spine in self.ax.spines.values():
                     spine.set_color(graph_contrasting_color)
         
-        if getattr(self, "canvas", None) and getattr(self, "figure", None):
-            self.canvas.draw_idle()
+        _canvas = getattr(self, "canvas", None)
+        if _canvas is not None and getattr(self, "figure", None):
+            _canvas.draw_idle()
 
-    def toggle_theme(self, mode):
-        """Toggle between dark and light mode for UI and graph"""
+    def toggle_theme(self, mode: str) -> None:
+        """Toggle between dark and light mode for UI and graph."""
         self.settings.setValue("theme", mode)
         self.apply_stylesheet()
 
 
-    def choose_color(self):
-        """Open a color dialog to choose the graph color"""
+    def choose_color(self) -> None:
+        """Open a color dialog to choose the graph color."""
         color = QColorDialog.getColor(QColor(self.color_input.text()), self, "Choose Graph Color")
         if color.isValid():
             self.color_input.setText(color.name())
@@ -1474,7 +1573,7 @@ class INatSeasonalVisualizer(QMainWindow):
             if self.history_list.property("data"):
                 self.search_observations()  # Re-run last search to update color
 
-    def choose_bg_color(self):
+    def choose_bg_color(self) -> None:
         """Open a color dialog to choose the graph background color."""
         current_color_hex = self.settings.value("graph_bg_color", "#ffffff")
         color = QColorDialog.getColor(QColor(current_color_hex), self, "Choose Graph Background Color")
@@ -1486,7 +1585,7 @@ class INatSeasonalVisualizer(QMainWindow):
             # Re-apply the current theme to update the background
             self.apply_stylesheet()
 
-    def choose_window_bg_color(self):
+    def choose_window_bg_color(self) -> None:
         """Open a color dialog to choose the main window background color."""
         current_color_hex = self.settings.value("window_bg_color", "#ffffff")
         color = QColorDialog.getColor(QColor(current_color_hex), self, "Choose Window Background Color")
@@ -1497,8 +1596,8 @@ class INatSeasonalVisualizer(QMainWindow):
             # Re-apply the current theme to update the background
             self.apply_stylesheet()
 
-    def open_map_dialog(self):
-        """Open the interactive map dialog"""
+    def open_map_dialog(self) -> None:
+        """Open the interactive map dialog."""
         try:
             lat = float(self.lat_input.text().strip())
             lon = float(self.lon_input.text().strip())
@@ -1515,16 +1614,16 @@ class INatSeasonalVisualizer(QMainWindow):
             # Coordinates are updated in the dialog's accept method
             pass
 
-    def load_settings(self):
-        """Load saved settings"""
+    def load_settings(self) -> None:
+        """Load saved settings."""
         self.lat_input.setText(self.settings.value("latitude", self.default_lat))
         self.lon_input.setText(self.settings.value("longitude", self.default_lon))
         self.radius_input.setText(self.settings.value("radius", str(self.default_radius)))
         self.color_input.setText(self.settings.value("graph_color", "#1f77b4"))
         self.bg_color_input.setText(self.settings.value("graph_bg_color", ""))
 
-    def save_settings(self):
-        """Save current settings"""
+    def save_settings(self) -> None:
+        """Save current settings."""
         try:
             self.settings.setValue("latitude", float(self.lat_input.text()))
             self.settings.setValue("longitude", float(self.lon_input.text()))
@@ -1537,12 +1636,12 @@ class INatSeasonalVisualizer(QMainWindow):
         except ValueError as e:
             QMessageBox.warning(self, "Settings", f"Invalid input: {str(e)}")
 
-    def update_api_call_count(self):
-        """Update the API call count display"""
+    def update_api_call_count(self) -> None:
+        """Update the API call count display."""
         self.api_call_label.setText(f"API Calls: {self.api_call_count}")
 
-    def haversine(self, lat1, lon1, lat2, lon2):
-        """Calculate distance between two points in km using Haversine formula"""
+    def haversine(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Calculate distance between two points in km using Haversine formula."""
         R = 6371  # Earth's radius in km
         lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
         dlat = lat2 - lat1
@@ -1551,8 +1650,8 @@ class INatSeasonalVisualizer(QMainWindow):
         c = 2 * math.asin(math.sqrt(a))
         return R * c
 
-    def fetch_all_observations(self, params):
-        """Fetch all observations with pagination, rate limiting, and error handling"""
+    def fetch_all_observations(self, params: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+        """Fetch all observations with pagination, rate limiting, and error handling."""
         all_results = []
         page = 1
         per_page = 500  # Maximum per page for observations endpoint
@@ -1568,6 +1667,7 @@ class INatSeasonalVisualizer(QMainWindow):
             method = 'post'
             logging.info(f"Using POST request for {len(params['taxon_id'])} taxon IDs to avoid overly long URI.")
 
+        last_http_status: int | None = None
         while True:
             params["page"] = page
             params["per_page"] = per_page
@@ -1575,7 +1675,7 @@ class INatSeasonalVisualizer(QMainWindow):
 
             while retries <= max_retries:
                 try:
-                    self.statusBar.showMessage(f"Fetching page {page}...")
+                    self.status_bar.showMessage(f"Fetching page {page}...")
                     self.enhanced_progress.update_progress(message=f"Fetching page {page}...")
                     response = pyinaturalist.get_observations(**params, method=method)
                     self.api_call_count += 1  # Increment API call counter
@@ -1600,9 +1700,10 @@ class INatSeasonalVisualizer(QMainWindow):
 
                 except HTTPError as e:
                     if e.response.status_code in (429, 403):  # Too Many Requests or Forbidden
+                        last_http_status = e.response.status_code  # save before `e` is cleared by Python
                         retries += 1
                         wait_time = 2 ** retries  # Exponential backoff: 1s, 2s, 4s
-                        self.statusBar.showMessage(f"Error {e.response.status_code}, retrying in {wait_time}s (attempt {retries}/{max_retries})...")
+                        self.status_bar.showMessage(f"Error {last_http_status}, retrying in {wait_time}s (attempt {retries}/{max_retries})...")
                         self.enhanced_progress.update_progress(message=f"Rate limited, retrying in {wait_time}s (attempt {retries}/{max_retries})")
                         time.sleep(wait_time)
                     else:
@@ -1615,7 +1716,7 @@ class INatSeasonalVisualizer(QMainWindow):
             if retries > max_retries:
                 self.enhanced_progress.hide_progress()
                 error_msg = (
-                    f"Max retries exceeded for error {e.response.status_code}. "
+                    f"Max retries exceeded for error {last_http_status}. "
                     "You may be using anonymous API access, which has stricter rate limits. "
                     "To increase limits, set INATURALIST_APP_ID and INATURALIST_APP_SECRET in ~/.bashrc."
                 )
@@ -1624,8 +1725,8 @@ class INatSeasonalVisualizer(QMainWindow):
         self.enhanced_progress.hide_progress()
         return all_results, None
 
-    def get_taxon_id(self, query):
-        """Get taxon ID from query, using cache to minimize API calls"""
+    def get_taxon_id(self, query: str) -> int | None:
+        """Get taxon ID from query, using cache to minimize API calls."""
         if not query:
             return None
         # Check cache to avoid redundant API calls
@@ -1653,8 +1754,8 @@ class INatSeasonalVisualizer(QMainWindow):
             logging.error(error_msg)
             return None
 
-    def get_descendant_taxon_ids(self, query, taxon_id):
-        """Get all descendant taxon IDs for a given taxon using taxonomy.parquet"""
+    def get_descendant_taxon_ids(self, query: str, taxon_id: int) -> list[int]:
+        """Get all descendant taxon IDs for a given taxon using taxonomy.parquet."""
         cache_key = f"{query}_descendants"
         # Check cache to avoid recomputing descendants from taxonomy.parquet
         if cache_key in self.taxon_cache:
@@ -1669,12 +1770,13 @@ class INatSeasonalVisualizer(QMainWindow):
             return file_taxons
 
         # Query taxonomy.parquet
+        con = None
         try:
             if not os.path.exists(self.taxonomy_file):
                 raise FileNotFoundError(f"taxonomy.parquet not found in {self.working_dir}")
 
             con = duckdb.connect()
-            query = """
+            sql = """
                 WITH RECURSIVE descendants AS (
                     SELECT id FROM taxonomy WHERE id = ?
                     UNION ALL
@@ -1684,13 +1786,13 @@ class INatSeasonalVisualizer(QMainWindow):
                 SELECT id FROM descendants
             """
             con.execute(f"CREATE VIEW taxonomy AS SELECT * FROM '{self.taxonomy_file}'")
-            results = con.execute(query, [taxon_id]).fetchall()
+            results = con.execute(sql, [taxon_id]).fetchall()
             descendants = [row[0] for row in results]
-            
+
             # Include the parent taxon ID
             if taxon_id not in descendants:
                 descendants.append(taxon_id)
-            
+
             self.taxon_cache[cache_key] = descendants
             self.save_taxon_cache()
             logging.info(f"Retrieved {len(descendants)} descendant taxon IDs for {query} from taxonomy.parquet")
@@ -1720,9 +1822,12 @@ class INatSeasonalVisualizer(QMainWindow):
             else:
                 logging.info(f"Aborting descendant taxon ID fetch for {query}")
                 return []
+        finally:
+            if con is not None:
+                con.close()
 
-    def fetch_taxon_ids(self):
-        """Manually fetch taxon IDs for the current organism and save to cache"""
+    def fetch_taxon_ids(self) -> None:
+        """Manually fetch taxon IDs for the current organism and save to cache."""
         organism = self.organism_input.text().strip()
         if not organism:
             QMessageBox.warning(self, "Error", "Please enter an organism name.")
@@ -1734,7 +1839,7 @@ class INatSeasonalVisualizer(QMainWindow):
             return
 
         self.enhanced_progress.start_progress(0, f"Fetching taxon IDs for {organism}...")
-        self.statusBar.showMessage(f"Fetching taxon IDs for {organism}...")
+        self.status_bar.showMessage(f"Fetching taxon IDs for {organism}...")
 
         try:
             self.enhanced_progress.update_progress(message="Querying taxonomy database...")
@@ -1756,10 +1861,10 @@ class INatSeasonalVisualizer(QMainWindow):
             self.enhanced_progress.hide_progress()
             QMessageBox.critical(self, "Error", f"Failed to fetch taxon IDs: {str(e)}")
         finally:
-            self.statusBar.showMessage("Ready")
+            self.status_bar.showMessage("Ready")
 
-    def show_search_url(self):
-        """Show the iNaturalist URL for the current search parameters"""
+    def show_search_url(self) -> None:
+        """Show the iNaturalist URL for the current search parameters."""
         try:
             try:
                 lat = float(self.lat_input.text().strip())
@@ -1794,8 +1899,12 @@ class INatSeasonalVisualizer(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to generate URL: {str(e)}")
 
-    def clamp_to_screen(self):
+    def clamp_to_screen(self) -> None:
+        """Clamp the window geometry so it stays within the available screen area."""
         screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            logging.warning("No screen available; skipping window clamp")
+            return
         avail = screen.availableGeometry()
 
         g = self.frameGeometry()
@@ -1810,8 +1919,19 @@ class INatSeasonalVisualizer(QMainWindow):
         y = max(avail.top(),  min(self.y(), avail.bottom() - h))
         self.move(x, y)
 
-    def plot_observations(self, observations, lat, lon, radius, organism, date_from, date_to, view, source="API"):
-        """Plot observations (from API or local)"""
+    def plot_observations(
+        self,
+        observations: list[dict[str, Any]],
+        lat: float,
+        lon: float,
+        radius: float,
+        organism: str,
+        date_from: str,
+        date_to: str,
+        view: str,
+        source: str = "API",
+    ) -> bool:
+        """Plot observations (from API or local)."""
         # Save arguments for replotting (e.g., when font size changes)
         self.last_plot_args = {
             "observations": observations,
@@ -1849,8 +1969,8 @@ class INatSeasonalVisualizer(QMainWindow):
             self.show_placeholder(f"No valid observation dates found in {source} data.")
             return False
 
-        df = pd.DataFrame(dates, columns=["date"])
-        
+        df = pd.DataFrame(dates, columns=["date"])  # type: ignore[call-overload]
+
         if view == "daily":
             df["group"] = df["date"].dt.dayofyear
             bins = 366  # Account for leap years
@@ -1874,7 +1994,7 @@ class INatSeasonalVisualizer(QMainWindow):
         counts = df["group"].value_counts().sort_index()
         data = np.zeros(bins)
         for idx, count in counts.items():
-            index = int(idx) - 1
+            index = int(idx) - 1  # type: ignore[arg-type]
             if 0 <= index < bins:
                 data[index] = count
             else:
@@ -1913,7 +2033,8 @@ class INatSeasonalVisualizer(QMainWindow):
         # Apply theme to graph
         self.apply_stylesheet()  # Reapply theme to update graph colors
         
-        self.canvas.draw_idle()
+        if self.canvas:
+            self.canvas.draw_idle()
         QTimer.singleShot(0, self.clamp_to_screen)
 
         # Update history
@@ -1937,7 +2058,9 @@ class INatSeasonalVisualizer(QMainWindow):
         self.update_status_bar(observation_count)
         return True
 
-    def local_search(self):
+    def local_search(self) -> None:
+        """Query the local observations.parquet file and plot results."""
+        con = None
         try:
             lat = float(self.lat_input.text().strip())
             lon = float(self.lon_input.text().strip())
@@ -1963,7 +2086,7 @@ class INatSeasonalVisualizer(QMainWindow):
             con = duckdb.connect()
 
             # Register the haversine function
-            con.create_function("haversine", self.haversine, [float, float, float, float], float)
+            con.create_function("haversine", self.haversine, [float, float, float, float], float)  # type: ignore[arg-type]
 
             # Check schema
             schema = con.execute(f"DESCRIBE SELECT * FROM '{parquet_path}'").fetchall()
@@ -2038,7 +2161,7 @@ class INatSeasonalVisualizer(QMainWindow):
 
             # Start database progress tracking with estimated progress
             self.enhanced_progress.db_tracker.start_operation("local database search")
-            self.statusBar.showMessage("Performing local search...")
+            self.status_bar.showMessage("Performing local search...")
             QApplication.processEvents()
 
             # Get estimated count for better progress tracking
@@ -2055,7 +2178,8 @@ class INatSeasonalVisualizer(QMainWindow):
             if exclude_taxon_ids:
                 count_query += " AND taxonID NOT IN (" + ",".join([str(id) for id in exclude_taxon_ids]) + ")"
             
-            estimated_count = con.execute(count_query, count_params).fetchone()[0]
+            _count_row = con.execute(count_query, count_params).fetchone()
+            estimated_count = _count_row[0] if _count_row else 0
             self.enhanced_progress.db_tracker.estimated_total = estimated_count
             
             # Execute main query with progress updates
@@ -2076,7 +2200,7 @@ class INatSeasonalVisualizer(QMainWindow):
             ]
 
             self.enhanced_progress.db_tracker.finish_operation(len(observations), "Local search completed")
-            self.statusBar.showMessage("Local search completed.")
+            self.status_bar.showMessage("Local search completed.")
 
             # Plot results
             if observations:
@@ -2093,11 +2217,11 @@ class INatSeasonalVisualizer(QMainWindow):
             self.show_placeholder(f"Local search failed: {str(e)}")
             logging.error(f"Local search failed: {str(e)}")
         finally:
-            if 'con' in locals():
+            if con is not None:
                 con.close()
 
-    def search_observations(self):
-        """Search observations using iNaturalist API"""
+    def search_observations(self) -> None:
+        """Search observations using iNaturalist API."""
         if not self.canvas:
             QMessageBox.critical(self, "Error", "Cannot search: Plot initialization failed.")
             return
@@ -2169,8 +2293,8 @@ class INatSeasonalVisualizer(QMainWindow):
             self.show_placeholder(f"API search failed: {str(e)}")
             logging.error(f"API search failed: {str(e)}")
 
-    def export_graph(self):
-        """Export the current graph as an image with metadata"""
+    def export_graph(self) -> None:
+        """Export the current graph as an image with metadata."""
         if not self.canvas:
             QMessageBox.critical(self, "Error", "No graph to export: Plot initialization failed.")
             return
@@ -2236,7 +2360,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 QMessageBox.warning(self, "Error", "No valid dates to export.")
                 return
 
-            df = pd.DataFrame(dates, columns=["date"])
+            df = pd.DataFrame(dates, columns=["date"])  # type: ignore[call-overload]
             
             if view == "daily":
                 df["group"] = df["date"].dt.dayofyear
@@ -2257,7 +2381,7 @@ class INatSeasonalVisualizer(QMainWindow):
             counts = df["group"].value_counts().sort_index()
             data = np.zeros(bins)
             for idx, count in counts.items():
-                index = int(idx) - 1
+                index = int(idx) - 1  # type: ignore[arg-type]
                 if 0 <= index < bins:
                     data[index] = count
 
@@ -2303,7 +2427,7 @@ class INatSeasonalVisualizer(QMainWindow):
             export_fig.text(0.02, 0.02, metadata, fontsize=8, transform=export_fig.transFigure, verticalalignment='bottom')
 
             # Render and save
-            export_fig.tight_layout(rect=[0, 0.1, 1, 0.95])  # Adjust for metadata
+            export_fig.tight_layout(rect=(0, 0.1, 1, 0.95))  # Adjust for metadata
             export_fig.canvas.draw()
             export_fig.savefig(filename, format='jpg', dpi=300)
             plt.close(export_fig)
@@ -2314,8 +2438,8 @@ class INatSeasonalVisualizer(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to export graph: {str(e)}")
             logging.error(f"Export graph failed: {str(e)}")
 
-    def export_data(self):
-        """Export observation data as CSV"""
+    def export_data(self) -> None:
+        """Export observation data as CSV."""
         observations = self.history_list.property("data") or []
         if not observations:
             QMessageBox.warning(self, "Error", "No data to export.")
@@ -2347,25 +2471,17 @@ class INatSeasonalVisualizer(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to export data: {str(e)}")
             logging.error(f"Export data failed: {str(e)}")
 
-    def load_history_item(self):
-        """Load and replot a history item"""
+    def load_history_item(self) -> None:
+        """Load and replot a history item."""
         observations = self.history_list.property("data") or []
         if not observations:
             return
 
         try:
-            location_text = self.location_input.text()
-            lat, lon = None, None
-            if "," in location_text:
-                parts = location_text.split(',')
-                if len(parts) == 2:
-                    try:
-                        lat = float(parts[0].strip())
-                        lon = float(parts[1].strip())
-                    except ValueError:
-                        pass # Handle invalid coordinate format
-            if lat is None or lon is None:
-                QMessageBox.warning(self, "Warning", "Invalid location coordinates. Using default values for history item.")
+            try:
+                lat = float(self.lat_input.text().strip())
+                lon = float(self.lon_input.text().strip())
+            except ValueError:
                 lat = float(self.default_lat)
                 lon = float(self.default_lon)
 
@@ -2374,7 +2490,8 @@ class INatSeasonalVisualizer(QMainWindow):
             date_from = self.date_from.text()
             date_to = self.date_to.text()
             view = self.view_combo.currentText().lower()
-            source = "Local" if self.history_list.currentItem().text().endswith("(Local)") else "API"
+            _item = self.history_list.currentItem()
+            source = "Local" if _item is not None and _item.text().endswith("(Local)") else "API"
 
             self.plot_observations(
                 observations, lat, lon, radius, organism, date_from, date_to, view, source
@@ -2384,8 +2501,8 @@ class INatSeasonalVisualizer(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to load history item: {str(e)}")
             logging.error(f"Load history item failed: {str(e)}")
 
-    def show_placeholder(self, message=None):
-        """Show a placeholder message on the graph"""
+    def show_placeholder(self, message: str | None = None) -> None:
+        """Show a placeholder message on the graph."""
         if self.canvas:
             # Determine text color based on background luminance for visibility
             current_theme = self.settings.value("theme", "light")
@@ -2448,25 +2565,29 @@ class INatSeasonalVisualizer(QMainWindow):
             self.info_bar.setText("")
             self.update_status_bar(0)
 
-    def update_status_bar(self, observation_count=0):
-        """Update the status bar with current info"""
-        self.statusBar.showMessage(f"Ready | Observations: {observation_count} | API Calls: {self.api_call_count}")
+    def update_status_bar(self, observation_count: int = 0) -> None:
+        """Update the status bar with current info."""
+        self.status_bar.showMessage(f"Ready | Observations: {observation_count} | API Calls: {self.api_call_count}")
 
-    def get_contrasting_text_color(self, bg_color_hex, light_fallback='white', dark_fallback='black'):
-        """Determines if black or white text has better contrast against a given hex background color."""
+    def get_contrasting_text_color(
+        self,
+        bg_color_hex: str,
+        light_fallback: str = "white",
+        dark_fallback: str = "black",
+    ) -> str:
+        """Determine whether black or white text has better contrast against a hex background color."""
         try:
             q_color = QColor(bg_color_hex)
-            r, g, b, _ = q_color.getRgb()
             # Using standard luminance formula
-            luminance = (0.299 * r + 0.587 * g + 0.114 * b)
+            luminance = 0.299 * q_color.red() + 0.587 * q_color.green() + 0.114 * q_color.blue()
             return dark_fallback if luminance > 128 else light_fallback
         except Exception:
             # Fallback if the color string is invalid
             current_theme = self.settings.value("theme", "light")
             return dark_fallback if current_theme == "light" else light_fallback
 
-def main():
-    """Main function to run the application"""
+def main() -> None:
+    """Main function to run the application."""
     parser = argparse.ArgumentParser(description="iNaturalist Seasonal Visualizer")
     parser.add_argument("--lat", type=float, help="Latitude (default from settings)")
     parser.add_argument("--lon", type=float, help="Longitude (default from settings)")
@@ -2497,7 +2618,9 @@ def main():
         print("DEBUG: Environment check passed.")
 
     # --- High DPI stability setup (Wayland + Qt6) ---
-    QApplication.setHighDpiScaleFactorRoundingPolicy( Qt.HighDpiScaleFactorRoundingPolicy.RoundPreferFloor)
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.RoundPreferFloor
+    )
 
     # Create QApplication first
     if args.debug:
