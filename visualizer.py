@@ -202,6 +202,7 @@ class TileLoaderWorker(QThread):
     view_ready = pyqtSignal(int, object, tuple)  # job_id, composite_image, extent
     network_error = pyqtSignal(str)
     network_recovered = pyqtSignal()
+    retry_complete = pyqtSignal()
 
     def __init__(self, working_dir: str | Path) -> None:
         super().__init__()
@@ -214,12 +215,14 @@ class TileLoaderWorker(QThread):
         self.last_network_request_time = 0.0
         self._network_suspended_until = 0.0
         self._notified_error = False
+        self._skipped_tiles = set()
 
     def request_view(
         self, job_id: int, zoom: int, x0: float, x1: float, y0: float, y1: float
     ) -> None:
         with QMutexLocker(self.mutex):
             self._pending_job = (job_id, zoom, x0, x1, y0, y1)
+            self._skipped_tiles.clear()
             self.wait_condition.wakeOne()
 
     def stop(self) -> None:
@@ -256,6 +259,8 @@ class TileLoaderWorker(QThread):
         n = 2.0**z
         xtile_min = int((x0 + 180.0) / 360.0 * n)
         xtile_max = int((x1 + 180.0) / 360.0 * n)
+        if xtile_max < xtile_min:
+            xtile_max += int(n)
 
         def lat2y(lat):
             return (
@@ -271,8 +276,8 @@ class TileLoaderWorker(QThread):
         y_a = int(lat2y(y1))
         y_b = int(lat2y(y0))
         return (
-            min(xtile_min, xtile_max),
-            max(xtile_min, xtile_max),
+            xtile_min,
+            xtile_max,
             min(y_a, y_b),
             max(y_a, y_b),
         )
@@ -287,7 +292,6 @@ class TileLoaderWorker(QThread):
         y0: float,
         y1: float,
     ) -> None:
-        # Conservative tile budgeting
         MAX_UNCACHED_TILES = 16
         MAX_TOTAL_TILES = 100
 
@@ -300,11 +304,9 @@ class TileLoaderWorker(QThread):
                 zoom -= 1
                 continue
 
-            # Count uncached tiles
             uncached = 0
             for tx in range(x_min, x_max + 1):
                 for ty in range(y_min, y_max + 1):
-                    # For stale jobs, return early to avoid deep computation
                     with QMutexLocker(self.mutex):
                         if (
                             self._pending_job is not None
@@ -312,15 +314,15 @@ class TileLoaderWorker(QThread):
                         ):
                             return
 
-                    key = (zoom, tx, ty)
+                    wrapped_x = tx % int(2.0**zoom)
+                    key = (zoom, wrapped_x, ty)
                     if key not in self.ram_cache:
-                        path_str = self.disk_cache.get_path(zoom, tx, ty)
-                        if not Path(path_str).exists():
+                        path_obj = self.disk_cache.get_path(zoom, wrapped_x, ty)
+                        if not path_obj.exists():
                             uncached += 1
 
             if uncached <= MAX_UNCACHED_TILES:
                 break
-            # Back off to load less map resolution, saving tile bandwidth
             zoom -= 1
 
         if zoom < 0:
@@ -332,47 +334,44 @@ class TileLoaderWorker(QThread):
 
         tiles = []
         tile_positions = []
+        trigger_retry = False
 
         for x in x_range:
             for y in y_range:
-                # Basic stale check
                 with QMutexLocker(self.mutex):
                     if self._pending_job is not None and self._pending_job[0] > job_id:
-                        return  # Abort this job
+                        return
 
-                tile_key = (zoom, x, y)
+                wrapped_x = x % int(2.0**zoom)
+                tile_key = (zoom, wrapped_x, y)
                 img = None
 
-                # 1. RAM Cache
                 if tile_key in self.ram_cache:
                     img = self.ram_cache[tile_key]
                     self.ram_cache.move_to_end(tile_key)
                     if logging.getLogger().isEnabledFor(logging.DEBUG):
-                        logging.debug(f"RAM cache hit: {zoom}/{x}/{y}")
+                        logging.debug(f"RAM cache hit: {zoom}/{wrapped_x}/{y}")
 
-                # 2. Disk Cache
                 if img is None:
-                    img = self.disk_cache.get_tile(zoom, x, y)
+                    img = self.disk_cache.get_tile(zoom, wrapped_x, y)
                     if img is not None:
                         self.ram_cache[tile_key] = img
                         if len(self.ram_cache) > MAX_CACHE_SIZE:
                             self.ram_cache.popitem(last=False)
                         if logging.getLogger().isEnabledFor(logging.DEBUG):
-                            logging.debug(f"Disk cache hit: {zoom}/{x}/{y}")
+                            logging.debug(f"Disk cache hit: {zoom}/{wrapped_x}/{y}")
 
-                # 3. Network
                 if img is None:
-                    # Skip if we are temporarily suspending network
                     if time.time() < self._network_suspended_until:
+                        with QMutexLocker(self.mutex):
+                            self._skipped_tiles.add(tile_key)
                         continue
 
-                    # Throttling
                     now = time.time()
                     elapsed = now - self.last_network_request_time
-                    throttle_delay = 0.15  # 150ms between tile fetches
+                    throttle_delay = 0.15
                     if elapsed < throttle_delay:
                         time.sleep(throttle_delay - elapsed)
-                        # Re-check stale after sleep
                         with QMutexLocker(self.mutex):
                             if (
                                 self._pending_job is not None
@@ -381,29 +380,30 @@ class TileLoaderWorker(QThread):
                                 return
 
                     self.last_network_request_time = time.time()
-
-                    url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
+                    url = f"https://tile.openstreetmap.org/{zoom}/{wrapped_x}/{y}.png"
+                    
                     try:
                         resp = session.get(url, timeout=3.0)
                         if resp.status_code == 200:
                             if self._notified_error:
                                 self._notified_error = False
                                 self.network_recovered.emit()
+                                trigger_retry = True
 
                             if logging.getLogger().isEnabledFor(logging.DEBUG):
-                                logging.debug(f"Network fetch: {zoom}/{x}/{y}")
+                                logging.debug(f"Network fetch: {zoom}/{wrapped_x}/{y}")
                             img_bytes = resp.content
                             img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
-                            # Update caches
                             self.ram_cache[tile_key] = img
                             if len(self.ram_cache) > MAX_CACHE_SIZE:
                                 self.ram_cache.popitem(last=False)
-                            self.disk_cache.put_tile(zoom, x, y, img_bytes)
+                            self.disk_cache.put_tile(zoom, wrapped_x, y, img_bytes)
+                            
+                            with QMutexLocker(self.mutex):
+                                self._skipped_tiles.discard(tile_key)
                         else:
-                            logging.debug(
-                                f"Tile {zoom}/{x}/{y} HTTP {resp.status_code}"
-                            )
+                            logging.debug(f"Tile {zoom}/{wrapped_x}/{y} HTTP {resp.status_code}")
                             if resp.status_code in (403, 429, 418):
                                 if not self._notified_error:
                                     self._notified_error = True
@@ -411,30 +411,25 @@ class TileLoaderWorker(QThread):
                                         f"Map service refused requests (HTTP {resp.status_code}). Backing off."
                                     )
                                 self._network_suspended_until = time.time() + 15.0
+                                with QMutexLocker(self.mutex):
+                                    self._skipped_tiles.add(tile_key)
                                 continue
                     except RequestException as e:
-                        logging.debug(f"Failed to load tile {zoom}/{x}/{y}: {e}")
+                        logging.debug(f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e}")
+                        with QMutexLocker(self.mutex):
+                            self._skipped_tiles.add(tile_key)
 
                 if img:
                     tiles.append(img)
                     tile_positions.append((x, y))
 
-        if not tiles:
-            return
-
-        # Stitch
-        min_x = min(p[0] for p in tile_positions)
-        min_y = min(p[1] for p in tile_positions)
-
-        tile_w, tile_h = tiles[0].size
-        w = (max(p[0] for p in tile_positions) - min_x + 1) * tile_w
-        h = (max(p[1] for p in tile_positions) - min_y + 1) * tile_h
-
+        w = (x_max - x_min + 1) * 256
+        h = (y_max - y_min + 1) * 256
         composite = Image.new("RGB", (w, h), (230, 230, 230))
-        for img, (x, y) in zip(tiles, tile_positions, strict=True):
-            composite.paste(img, ((x - min_x) * tile_w, (y - min_y) * tile_h))
+        
+        for img, (xpos, ypos) in zip(tiles, tile_positions, strict=True):
+            composite.paste(img, ((xpos - x_min) * 256, (ypos - y_min) * 256))
 
-        # Calculate extent
         def num2deg(xtile, ytile, zoom):
             n = 2.0**zoom
             lon_deg = xtile / n * 360.0 - 180.0
@@ -442,17 +437,52 @@ class TileLoaderWorker(QThread):
             lat_deg = np.degrees(lat_rad)
             return lat_deg, lon_deg
 
-        # Use the actual bounding box of downloaded tiles
-        north, west = num2deg(min_x, min_y, zoom)
-        south, east = num2deg(
-            max(p[0] for p in tile_positions) + 1,
-            max(p[1] for p in tile_positions) + 1,
-            zoom,
-        )
+        north, west = num2deg(x_min, y_min, zoom)
+        south, east = num2deg(x_max + 1, y_max + 1, zoom)
 
-        # Emit result
         self.view_ready.emit(job_id, composite, (west, east, south, north))
+        if trigger_retry:
+            if self._retry_skipped_tiles(session):
+                self.retry_complete.emit()
 
+    def _retry_skipped_tiles(self, session: requests.Session) -> bool:
+        skipped = list(self._skipped_tiles)
+        recovered_any = False
+        for tile_key in skipped:
+            with QMutexLocker(self.mutex):
+                if self._pending_job is not None:
+                    return recovered_any
+            
+            zoom, wrapped_x, y = tile_key
+            if tile_key in self.ram_cache:
+                with QMutexLocker(self.mutex):
+                    self._skipped_tiles.discard(tile_key)
+                continue
+                
+            now = time.time()
+            elapsed = now - self.last_network_request_time
+            if elapsed < 0.15:
+                time.sleep(0.15 - elapsed)
+            self.last_network_request_time = time.time()
+            
+            url = f"https://tile.openstreetmap.org/{zoom}/{wrapped_x}/{y}.png"
+            try:
+                resp = session.get(url, timeout=3.0)
+                if resp.status_code == 200:
+                    img_bytes = resp.content
+                    img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                    self.ram_cache[tile_key] = img
+                    if len(self.ram_cache) > MAX_CACHE_SIZE:
+                        self.ram_cache.popitem(last=False)
+                    self.disk_cache.put_tile(zoom, wrapped_x, y, img_bytes)
+                    with QMutexLocker(self.mutex):
+                        self._skipped_tiles.discard(tile_key)
+                    recovered_any = True
+                else:
+                    break
+            except RequestException:
+                break
+        return recovered_any
 
 class DatabaseProgressTracker:
     """Track database operation progress without impacting performance."""
@@ -606,6 +636,7 @@ class MapDialog(QDialog):
         self.worker.view_ready.connect(self.on_view_ready)
         self.worker.network_error.connect(self.on_network_error)
         self.worker.network_recovered.connect(self.on_network_recovered)
+        self.worker.retry_complete.connect(self.request_tiles_for_current_view)
         self.worker.start()
 
         self.job_counter = 0
