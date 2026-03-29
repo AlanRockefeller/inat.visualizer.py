@@ -381,7 +381,7 @@ class TileLoaderWorker(QThread):
 
                     self.last_network_request_time = time.time()
                     url = f"https://tile.openstreetmap.org/{zoom}/{wrapped_x}/{y}.png"
-                    
+
                     try:
                         resp = session.get(url, timeout=3.0)
                         if resp.status_code == 200:
@@ -399,11 +399,13 @@ class TileLoaderWorker(QThread):
                             if len(self.ram_cache) > MAX_CACHE_SIZE:
                                 self.ram_cache.popitem(last=False)
                             self.disk_cache.put_tile(zoom, wrapped_x, y, img_bytes)
-                            
+
                             with QMutexLocker(self.mutex):
                                 self._skipped_tiles.discard(tile_key)
                         else:
-                            logging.debug(f"Tile {zoom}/{wrapped_x}/{y} HTTP {resp.status_code}")
+                            logging.debug(
+                                f"Tile {zoom}/{wrapped_x}/{y} HTTP {resp.status_code}"
+                            )
                             if resp.status_code in (403, 429, 418):
                                 if not self._notified_error:
                                     self._notified_error = True
@@ -415,7 +417,9 @@ class TileLoaderWorker(QThread):
                                     self._skipped_tiles.add(tile_key)
                                 continue
                     except RequestException as e:
-                        logging.debug(f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e}")
+                        logging.debug(
+                            f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e}"
+                        )
                         with QMutexLocker(self.mutex):
                             self._skipped_tiles.add(tile_key)
 
@@ -426,7 +430,7 @@ class TileLoaderWorker(QThread):
         w = (x_max - x_min + 1) * 256
         h = (y_max - y_min + 1) * 256
         composite = Image.new("RGB", (w, h), (230, 230, 230))
-        
+
         for img, (xpos, ypos) in zip(tiles, tile_positions, strict=True):
             composite.paste(img, ((xpos - x_min) * 256, (ypos - y_min) * 256))
 
@@ -452,19 +456,19 @@ class TileLoaderWorker(QThread):
             with QMutexLocker(self.mutex):
                 if self._pending_job is not None:
                     return recovered_any
-            
+
             zoom, wrapped_x, y = tile_key
             if tile_key in self.ram_cache:
                 with QMutexLocker(self.mutex):
                     self._skipped_tiles.discard(tile_key)
                 continue
-                
+
             now = time.time()
             elapsed = now - self.last_network_request_time
             if elapsed < 0.15:
                 time.sleep(0.15 - elapsed)
             self.last_network_request_time = time.time()
-            
+
             url = f"https://tile.openstreetmap.org/{zoom}/{wrapped_x}/{y}.png"
             try:
                 resp = session.get(url, timeout=3.0)
@@ -483,6 +487,7 @@ class TileLoaderWorker(QThread):
             except RequestException:
                 break
         return recovered_any
+
 
 class DatabaseProgressTracker:
     """Track database operation progress without impacting performance."""
