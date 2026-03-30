@@ -203,6 +203,7 @@ class TileLoaderWorker(QThread):
     network_error = pyqtSignal(str)
     network_recovered = pyqtSignal()
     retry_complete = pyqtSignal()
+    tiles_skipped = pyqtSignal()  # Signal when some tiles were skipped due to network suspension
 
     def __init__(self, working_dir: str | Path) -> None:
         super().__init__()
@@ -257,8 +258,8 @@ class TileLoaderWorker(QThread):
         self, z: int, x0: float, x1: float, y0: float, y1: float
     ) -> tuple[int, int, int, int]:
         n = 2.0**z
-        xtile_min = int((x0 + 180.0) / 360.0 * n)
-        xtile_max = int((x1 + 180.0) / 360.0 * n)
+        xtile_min = math.floor((x0 + 180.0) / 360.0 * n)
+        xtile_max = math.floor((x1 + 180.0) / 360.0 * n)
         if xtile_max < xtile_min:
             xtile_max += int(n)
 
@@ -335,6 +336,7 @@ class TileLoaderWorker(QThread):
         tiles = []
         tile_positions = []
         trigger_retry = False
+        skipped_any = False
 
         for x in x_range:
             for y in y_range:
@@ -365,6 +367,7 @@ class TileLoaderWorker(QThread):
                     if time.time() < self._network_suspended_until:
                         with QMutexLocker(self.mutex):
                             self._skipped_tiles.add(tile_key)
+                        skipped_any = True
                         continue
 
                     now = time.time()
@@ -406,22 +409,33 @@ class TileLoaderWorker(QThread):
                             logging.debug(
                                 f"Tile {zoom}/{wrapped_x}/{y} HTTP {resp.status_code}"
                             )
-                            if resp.status_code in (403, 429, 418):
+                            if resp.status_code in (403, 429, 418, 408, 500, 502, 503, 504):
                                 if not self._notified_error:
                                     self._notified_error = True
-                                    self.network_error.emit(
-                                        f"Map service refused requests (HTTP {resp.status_code}). Backing off."
-                                    )
+                                    if resp.status_code in (403, 429, 418):
+                                        msg = f"Map service throttled requests (HTTP {resp.status_code})."
+                                    elif resp.status_code == 408:
+                                        msg = "Map service request timed out."
+                                    else:
+                                        msg = f"Map service error (HTTP {resp.status_code})."
+                                    self.network_error.emit(f"{msg} Backing off.")
                                 self._network_suspended_until = time.time() + 15.0
                                 with QMutexLocker(self.mutex):
                                     self._skipped_tiles.add(tile_key)
+                                skipped_any = True
                                 continue
                     except RequestException as e:
                         logging.debug(
                             f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e}"
                         )
+                        if not self._notified_error:
+                            self._notified_error = True
+                            self.network_error.emit(f"Network error: {str(e)}. Backing off.")
+                        self._network_suspended_until = time.time() + 15.0
                         with QMutexLocker(self.mutex):
                             self._skipped_tiles.add(tile_key)
+                        skipped_any = True
+                        continue
 
                 if img:
                     tiles.append(img)
@@ -445,6 +459,8 @@ class TileLoaderWorker(QThread):
         south, east = num2deg(x_max + 1, y_max + 1, zoom)
 
         self.view_ready.emit(job_id, composite, (west, east, south, north))
+        if skipped_any:
+            self.tiles_skipped.emit()
         if trigger_retry:
             if self._retry_skipped_tiles(session):
                 self.retry_complete.emit()
@@ -643,6 +659,7 @@ class MapDialog(QDialog):
         self.worker.network_error.connect(self.on_network_error)
         self.worker.network_recovered.connect(self.on_network_recovered)
         self.worker.retry_complete.connect(self.request_tiles_for_current_view)
+        self.worker.tiles_skipped.connect(self.on_tiles_skipped)
         self.worker.start()
 
         self.job_counter = 0
@@ -722,6 +739,11 @@ class MapDialog(QDialog):
         self.update_timer.setSingleShot(True)
         self.update_timer.setInterval(200)  # 200ms debounce
         self.update_timer.timeout.connect(self.request_tiles_for_current_view)
+
+        # Dedicated timer for retries after network suspension
+        self.retry_timer = QTimer()
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self.request_tiles_for_current_view)
 
         # Initialize the map
         self.ax.set_xlim(self.lon - 5, self.lon + 5)
@@ -827,6 +849,12 @@ class MapDialog(QDialog):
 
     def on_network_recovered(self) -> None:
         self.status_label.hide()
+
+    def on_tiles_skipped(self) -> None:
+        """Called when some tiles were skipped due to network suspension. Schedule a retry."""
+        # Schedule a retry after the 15-second suspension period ends.
+        # We use 16 seconds to be safe. We always restart to sync with any back-off extension.
+        self.retry_timer.start(16000)
 
     def on_view_ready(
         self, job_id: int, composite, extent: tuple[float, float, float, float]
@@ -954,14 +982,15 @@ class MapDialog(QDialog):
     def on_scroll(self, event: MouseEvent) -> None:
         if event.inaxes != self.ax:
             return
+        mx, my = event.xdata, event.ydata
+        if mx is None or my is None:
+            return
+
         scale = 1.0 / 1.5 if event.button == "up" else 1.5
 
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
         w, h = x1 - x0, y1 - y0
-
-        mx = event.xdata
-        my = event.ydata
 
         new_w = w * scale
         new_h = h * scale
