@@ -430,7 +430,7 @@ class TileLoaderWorker(QThread):
                         )
                         if not self._notified_error:
                             self._notified_error = True
-                            self.network_error.emit(f"Network error: {str(e)}. Backing off.")
+                            self.network_error.emit(f"Network error: {e!s}. Backing off.")
                         self._network_suspended_until = time.time() + 15.0
                         with QMutexLocker(self.mutex):
                             self._skipped_tiles.add(tile_key)
@@ -480,6 +480,9 @@ class TileLoaderWorker(QThread):
                     self._skipped_tiles.discard(tile_key)
                 continue
 
+            if time.time() < self._network_suspended_until:
+                break
+
             now = time.time()
             elapsed = now - self.last_network_request_time
             if elapsed < 0.15:
@@ -500,9 +503,36 @@ class TileLoaderWorker(QThread):
                         self._skipped_tiles.discard(tile_key)
                     recovered_any = True
                 else:
+                    logging.debug(
+                        f"Tile {zoom}/{wrapped_x}/{y} HTTP {resp.status_code}"
+                    )
+                    if resp.status_code in (403, 429, 418, 408, 500, 502, 503, 504):
+                        if not self._notified_error:
+                            self._notified_error = True
+                            if resp.status_code in (403, 429, 418):
+                                msg = f"Map service throttled requests (HTTP {resp.status_code})."
+                            elif resp.status_code == 408:
+                                msg = "Map service request timed out."
+                            else:
+                                msg = f"Map service error (HTTP {resp.status_code})."
+                            self.network_error.emit(f"{msg} Backing off.")
+                        self._network_suspended_until = time.time() + 15.0
                     break
-            except RequestException:
+            except RequestException as e:
+                logging.debug(
+                    f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e!s}"
+                )
+                if not self._notified_error:
+                    self._notified_error = True
+                    self.network_error.emit(f"Network error: {e!s}. Backing off.")
+                self._network_suspended_until = time.time() + 15.0
                 break
+
+        with QMutexLocker(self.mutex):
+            still_skipped = len(self._skipped_tiles) > 0
+        if still_skipped:
+            self.tiles_skipped.emit()
+
         return recovered_any
 
 
@@ -849,6 +879,7 @@ class MapDialog(QDialog):
 
     def on_network_recovered(self) -> None:
         self.status_label.hide()
+        self.retry_timer.stop()
 
     def on_tiles_skipped(self) -> None:
         """Called when some tiles were skipped due to network suspension. Schedule a retry."""
@@ -1232,7 +1263,7 @@ class INatSeasonalVisualizer(QMainWindow):
             else:
                 return datetime.now().strftime("%Y-%m-%d")
         except Exception as e:
-            logging.error(f"Failed to get most recent date from database: {str(e)}")
+            logging.error(f"Failed to get most recent date from database: {e!s}")
             return datetime.now().strftime("%Y-%m-%d")
         finally:
             if con is not None:
@@ -1354,7 +1385,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 f"Loaded database stats: {self.total_observations} observations, {self.unique_taxa} unique taxa."
             )
         except Exception as e:
-            logging.error(f"Failed to load database stats: {str(e)}")
+            logging.error(f"Failed to load database stats: {e!s}")
             self.total_observations = "Error"
             self.unique_taxa = "Error"
         finally:
@@ -1473,12 +1504,12 @@ class INatSeasonalVisualizer(QMainWindow):
                 QApplication.processEvents()
 
             except Exception as e:
-                logging.error(f"Failed to download {filename}: {str(e)}")
+                logging.error(f"Failed to download {filename}: {e!s}")
                 self.enhanced_progress.hide_progress()
                 QMessageBox.critical(
                     self,
                     "Download Error",
-                    f"Failed to download {filename}: {str(e)}\n\n"
+                    f"Failed to download {filename}: {e!s}\n\n"
                     f"Please manually download it from {url} and place it in {self.working_dir}, "
                     "or ensure your internet connection is stable and try again.",
                 )
@@ -1518,7 +1549,7 @@ class INatSeasonalVisualizer(QMainWindow):
             else:
                 logging.info(f"No taxon cache found at {self.taxon_cache_file}")
         except Exception as e:
-            logging.error(f"Failed to load taxon cache: {str(e)}")
+            logging.error(f"Failed to load taxon cache: {e!s}")
             QMessageBox.warning(
                 self,
                 "Warning",
@@ -1533,7 +1564,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 json.dump(self.taxon_cache, f, indent=2)
             logging.info(f"Saved taxon cache to {self.taxon_cache_file}")
         except Exception as e:
-            logging.error(f"Failed to save taxon cache: {str(e)}")
+            logging.error(f"Failed to save taxon cache: {e!s}")
 
     def load_descendant_taxons_from_file(self, query: str) -> list[int] | None:
         """Load descendant taxon IDs from a user-provided file."""
@@ -1555,7 +1586,7 @@ class INatSeasonalVisualizer(QMainWindow):
             return None
         except Exception as e:
             logging.error(
-                f"Failed to load descendant taxons from {self.descendant_taxons_file}: {str(e)}"
+                f"Failed to load descendant taxons from {self.descendant_taxons_file}: {e!s}"
             )
             return None
 
@@ -1706,9 +1737,9 @@ class INatSeasonalVisualizer(QMainWindow):
             )
             self.canvas.setMinimumSize(0, 0)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to initialize plot: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to initialize plot: {e!s}")
             self.canvas = None
-            error_label = QLabel(f"Plot initialization failed: {str(e)}")
+            error_label = QLabel(f"Plot initialization failed: {e!s}")
             error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.top_layout.addWidget(error_label, 3)
             return
@@ -2040,7 +2071,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.settings.setValue("graph_font_size", self.graph_font_size)
             QMessageBox.information(self, "Settings", "Settings saved successfully.")
         except ValueError as e:
-            QMessageBox.warning(self, "Settings", f"Invalid input: {str(e)}")
+            QMessageBox.warning(self, "Settings", f"Invalid input: {e!s}")
 
     def update_api_call_count(self) -> None:
         """Update the API call count display."""
@@ -2184,7 +2215,7 @@ class INatSeasonalVisualizer(QMainWindow):
             return None
         except Exception as e:
             error_msg = (
-                f"Failed to fetch taxon ID for {query}: {str(e)}. "
+                f"Failed to fetch taxon ID for {query}: {e!s}. "
                 "This may be due to anonymous API access or network issues. "
                 "Consider setting INATURALIST_APP_ID and INATURALIST_APP_SECRET in ~/.bashrc for higher limits."
             )
@@ -2243,12 +2274,12 @@ class INatSeasonalVisualizer(QMainWindow):
 
         except Exception as e:
             logging.error(
-                f"Failed to fetch descendant taxon IDs for {query} from taxonomy.parquet: {str(e)}"
+                f"Failed to fetch descendant taxon IDs for {query} from taxonomy.parquet: {e!s}"
             )
 
             # Fallback dialog
             error_msg = (
-                f"Failed to fetch descendant taxon IDs for {query} from taxonomy.parquet: {str(e)}. "
+                f"Failed to fetch descendant taxon IDs for {query} from taxonomy.parquet: {e!s}. "
                 "You can:\n"
                 f"1. Ensure taxonomy.parquet is in {self.working_dir} and contains valid data.\n"
                 f"2. Create {self.descendant_taxons_file} with:\n"
@@ -2312,7 +2343,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 )
         except Exception as e:
             self.enhanced_progress.hide_progress()
-            QMessageBox.critical(self, "Error", f"Failed to fetch taxon IDs: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to fetch taxon IDs: {e!s}")
         finally:
             self.status_bar.showMessage("Ready")
 
@@ -2358,7 +2389,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 f"Search URL:\n{url}\n\nCopy this URL to verify the search on iNaturalist.",
             )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to generate URL: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to generate URL: {e!s}")
 
     def clamp_to_screen(self) -> None:
         """Clamp the window geometry so it stays within the available screen area."""
@@ -2421,7 +2452,7 @@ class INatSeasonalVisualizer(QMainWindow):
                     dates.append(date)
                 except Exception as e:
                     logging.warning(
-                        f"Skipping invalid date at observation {obs}: {str(e)}"
+                        f"Skipping invalid date at observation {obs}: {e!s}"
                     )
                     continue
             else:
@@ -2761,9 +2792,9 @@ class INatSeasonalVisualizer(QMainWindow):
 
         except Exception as e:
             self.enhanced_progress.hide_progress()
-            QMessageBox.critical(self, "Error", f"Local search failed: {str(e)}")
-            self.show_placeholder(f"Local search failed: {str(e)}")
-            logging.error(f"Local search failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Local search failed: {e!s}")
+            self.show_placeholder(f"Local search failed: {e!s}")
+            logging.error(f"Local search failed: {e!s}")
         finally:
             if con is not None:
                 con.close()
@@ -2861,9 +2892,9 @@ class INatSeasonalVisualizer(QMainWindow):
                 self.update_status_bar(0)
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"API search failed: {str(e)}")
-            self.show_placeholder(f"API search failed: {str(e)}")
-            logging.error(f"API search failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"API search failed: {e!s}")
+            self.show_placeholder(f"API search failed: {e!s}")
+            logging.error(f"API search failed: {e!s}")
 
     def export_graph(self) -> None:
         """Export the current graph as an image with metadata."""
@@ -3052,8 +3083,8 @@ class INatSeasonalVisualizer(QMainWindow):
             QMessageBox.information(self, "Success", f"Graph exported to {filename}")
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to export graph: {str(e)}")
-            logging.error(f"Export graph failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to export graph: {e!s}")
+            logging.error(f"Export graph failed: {e!s}")
 
     def export_data(self) -> None:
         """Export observation data as CSV."""
@@ -3097,8 +3128,8 @@ class INatSeasonalVisualizer(QMainWindow):
             QMessageBox.information(self, "Success", f"Data exported to {filename}")
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to export data: {str(e)}")
-            logging.error(f"Export data failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to export data: {e!s}")
+            logging.error(f"Export data failed: {e!s}")
 
     def load_history_item(self) -> None:
         """Load and replot a history item."""
@@ -3140,9 +3171,9 @@ class INatSeasonalVisualizer(QMainWindow):
 
         except Exception as e:
             QMessageBox.critical(
-                self, "Error", f"Failed to load history item: {str(e)}"
+                self, "Error", f"Failed to load history item: {e!s}"
             )
-            logging.error(f"Load history item failed: {str(e)}")
+            logging.error(f"Load history item failed: {e!s}")
 
     def show_placeholder(self, message: str | None = None) -> None:
         """Show a placeholder message on the graph."""
