@@ -87,8 +87,23 @@ from PyQt6.QtWidgets import (
 )
 from requests.exceptions import HTTPError, RequestException
 
+
 # Configure pyinaturalist with User-Agent
-pyinaturalist.user_agent = "iNaturalist Seasonal Visualizer/1.0 (Contact: your_email@example.com)"  # type: ignore[attr-defined]
+def build_app_user_agent() -> str:
+    """Build a proper User-Agent string for application requests."""
+    # Build email from parts to avoid simple scraping
+    user_part = "alan" + "rockefeller"
+    domain_part = "gmail.com"
+    email = f"{user_part}@{domain_part}"
+
+    app_name = "iNaturalist Seasonal Visualizer"
+    repo_url = "https://github.com/AlanRockefeller/inat.visualizer.py"
+
+    return f"{app_name} ({repo_url}; contact: {email})"
+
+
+pyinaturalist.user_agent = build_app_user_agent()  # type: ignore[attr-defined]
+
 
 # --- Constants for MapDialog ---
 MAX_TILES_PER_REQUEST = 100
@@ -185,6 +200,10 @@ class TileLoaderWorker(QThread):
     """Background worker to fetch map tiles."""
 
     view_ready = pyqtSignal(int, object, tuple)  # job_id, composite_image, extent
+    network_error = pyqtSignal(str)
+    network_recovered = pyqtSignal()
+    retry_complete = pyqtSignal()
+    tiles_skipped = pyqtSignal()  # Signal when some tiles were skipped due to network suspension
 
     def __init__(self, working_dir: str | Path) -> None:
         super().__init__()
@@ -192,14 +211,19 @@ class TileLoaderWorker(QThread):
         self.ram_cache = OrderedDict()
         self.mutex = QMutex()
         self.wait_condition = QWaitCondition()
-        self._pending_job = None  # (job_id, zoom, x_min, x_max, y_min, y_max)
+        self._pending_job = None  # (job_id, zoom, x0, x1, y0, y1)
         self._running = True
+        self.last_network_request_time = 0.0
+        self._network_suspended_until = 0.0
+        self._notified_error = False
+        self._skipped_tiles = set()
 
     def request_view(
-        self, job_id: int, zoom: int, x_min: int, x_max: int, y_min: int, y_max: int
+        self, job_id: int, zoom: int, x0: float, x1: float, y0: float, y1: float
     ) -> None:
         with QMutexLocker(self.mutex):
-            self._pending_job = (job_id, zoom, x_min, x_max, y_min, y_max)
+            self._pending_job = (job_id, zoom, x0, x1, y0, y1)
+            self._skipped_tiles.clear()
             self.wait_condition.wakeOne()
 
     def stop(self) -> None:
@@ -210,7 +234,7 @@ class TileLoaderWorker(QThread):
 
     def run(self) -> None:
         session = requests.Session()
-        session.headers.update({"User-Agent": pyinaturalist.user_agent})  # type: ignore
+        session.headers.update({"User-Agent": build_app_user_agent()})
 
         while True:
             job = None
@@ -227,92 +251,203 @@ class TileLoaderWorker(QThread):
             if not job:
                 continue
 
-            job_id, zoom, x_min, x_max, y_min, y_max = job
-            self._process_job(session, job_id, zoom, x_min, x_max, y_min, y_max)
+            job_id, base_zoom, x0, x1, y0, y1 = job
+            self._process_job(session, job_id, base_zoom, x0, x1, y0, y1)
+
+    def _get_tile_range(
+        self, z: int, x0: float, x1: float, y0: float, y1: float
+    ) -> tuple[int, int, int, int]:
+        n = 2.0**z
+        xtile_min = math.floor((x0 + 180.0) / 360.0 * n)
+        xtile_max = math.floor((x1 + 180.0) / 360.0 * n)
+        if xtile_max < xtile_min:
+            xtile_max += int(n)
+
+        def lat2y(lat):
+            return (
+                (
+                    1.0
+                    - math.asinh(math.tan(math.radians(max(-85.0, min(85.0, lat)))))
+                    / math.pi
+                )
+                / 2.0
+                * n
+            )
+
+        y_a = int(lat2y(y1))
+        y_b = int(lat2y(y0))
+        return (
+            xtile_min,
+            xtile_max,
+            min(y_a, y_b),
+            max(y_a, y_b),
+        )
 
     def _process_job(
         self,
         session: requests.Session,
         job_id: int,
-        zoom: int,
-        x_min: int,
-        x_max: int,
-        y_min: int,
-        y_max: int,
+        base_zoom: int,
+        x0: float,
+        x1: float,
+        y0: float,
+        y1: float,
     ) -> None:
+        MAX_UNCACHED_TILES = 16
+        MAX_TOTAL_TILES = 100
+
+        zoom = base_zoom
+        while zoom >= 0:
+            x_min, x_max, y_min, y_max = self._get_tile_range(zoom, x0, x1, y0, y1)
+            total_tiles = (x_max - x_min + 1) * (y_max - y_min + 1)
+
+            if total_tiles > MAX_TOTAL_TILES:
+                zoom -= 1
+                continue
+
+            uncached = 0
+            for tx in range(x_min, x_max + 1):
+                for ty in range(y_min, y_max + 1):
+                    with QMutexLocker(self.mutex):
+                        if (
+                            self._pending_job is not None
+                            and self._pending_job[0] > job_id
+                        ):
+                            return
+
+                    wrapped_x = tx % int(2.0**zoom)
+                    key = (zoom, wrapped_x, ty)
+                    if key not in self.ram_cache:
+                        path_obj = self.disk_cache.get_path(zoom, wrapped_x, ty)
+                        if not path_obj.exists():
+                            uncached += 1
+
+            if uncached <= MAX_UNCACHED_TILES:
+                break
+            zoom -= 1
+
+        if zoom < 0:
+            zoom = 0
+
+        x_min, x_max, y_min, y_max = self._get_tile_range(zoom, x0, x1, y0, y1)
         x_range = range(x_min, x_max + 1)
         y_range = range(y_min, y_max + 1)
-        # Store for extent calculation
-        self._job_x_max = x_max
-        self._job_y_max = y_max
 
         tiles = []
         tile_positions = []
+        trigger_retry = False
+        skipped_any = False
 
         for x in x_range:
             for y in y_range:
-                # Basic stale check
                 with QMutexLocker(self.mutex):
                     if self._pending_job is not None and self._pending_job[0] > job_id:
-                        return  # Abort this job
+                        return
 
-                tile_key = (zoom, x, y)
+                wrapped_x = x % int(2.0**zoom)
+                tile_key = (zoom, wrapped_x, y)
                 img = None
 
-                # 1. RAM Cache
                 if tile_key in self.ram_cache:
                     img = self.ram_cache[tile_key]
                     self.ram_cache.move_to_end(tile_key)
+                    if logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.debug(f"RAM cache hit: {zoom}/{wrapped_x}/{y}")
 
-                # 2. Disk Cache
                 if img is None:
-                    img = self.disk_cache.get_tile(zoom, x, y)
+                    img = self.disk_cache.get_tile(zoom, wrapped_x, y)
                     if img is not None:
                         self.ram_cache[tile_key] = img
                         if len(self.ram_cache) > MAX_CACHE_SIZE:
                             self.ram_cache.popitem(last=False)
+                        if logging.getLogger().isEnabledFor(logging.DEBUG):
+                            logging.debug(f"Disk cache hit: {zoom}/{wrapped_x}/{y}")
 
-                # 3. Network
                 if img is None:
-                    url = f"https://tile.openstreetmap.org/{zoom}/{x}/{y}.png"
+                    if time.time() < self._network_suspended_until:
+                        with QMutexLocker(self.mutex):
+                            self._skipped_tiles.add(tile_key)
+                        skipped_any = True
+                        continue
+
+                    now = time.time()
+                    elapsed = now - self.last_network_request_time
+                    throttle_delay = 0.15
+                    if elapsed < throttle_delay:
+                        time.sleep(throttle_delay - elapsed)
+                        with QMutexLocker(self.mutex):
+                            if (
+                                self._pending_job is not None
+                                and self._pending_job[0] > job_id
+                            ):
+                                return
+
+                    self.last_network_request_time = time.time()
+                    url = f"https://tile.openstreetmap.org/{zoom}/{wrapped_x}/{y}.png"
+
                     try:
-                        resp = session.get(url, timeout=2.0)
+                        resp = session.get(url, timeout=3.0)
                         if resp.status_code == 200:
+                            if self._notified_error:
+                                self._notified_error = False
+                                self.network_recovered.emit()
+                                trigger_retry = True
+
+                            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                                logging.debug(f"Network fetch: {zoom}/{wrapped_x}/{y}")
                             img_bytes = resp.content
                             img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
-                            # Update caches
                             self.ram_cache[tile_key] = img
                             if len(self.ram_cache) > MAX_CACHE_SIZE:
                                 self.ram_cache.popitem(last=False)
-                            self.disk_cache.put_tile(zoom, x, y, img_bytes)
+                            self.disk_cache.put_tile(zoom, wrapped_x, y, img_bytes)
+
+                            with QMutexLocker(self.mutex):
+                                self._skipped_tiles.discard(tile_key)
                         else:
                             logging.debug(
-                                f"Tile {zoom}/{x}/{y} HTTP {resp.status_code}"
+                                f"Tile {zoom}/{wrapped_x}/{y} HTTP {resp.status_code}"
                             )
+                            if resp.status_code in (403, 429, 418, 408, 500, 502, 503, 504):
+                                if not self._notified_error:
+                                    self._notified_error = True
+                                    if resp.status_code in (403, 429, 418):
+                                        msg = f"Map service throttled requests (HTTP {resp.status_code})."
+                                    elif resp.status_code == 408:
+                                        msg = "Map service request timed out."
+                                    else:
+                                        msg = f"Map service error (HTTP {resp.status_code})."
+                                    self.network_error.emit(f"{msg} Backing off.")
+                                self._network_suspended_until = time.time() + 15.0
+                                with QMutexLocker(self.mutex):
+                                    self._skipped_tiles.add(tile_key)
+                                skipped_any = True
+                                continue
                     except RequestException as e:
-                        logging.debug(f"Failed to load tile {zoom}/{x}/{y}: {e}")
+                        logging.debug(
+                            f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e}"
+                        )
+                        if not self._notified_error:
+                            self._notified_error = True
+                            self.network_error.emit(f"Network error: {e!s}. Backing off.")
+                        self._network_suspended_until = time.time() + 15.0
+                        with QMutexLocker(self.mutex):
+                            self._skipped_tiles.add(tile_key)
+                        skipped_any = True
+                        continue
 
                 if img:
                     tiles.append(img)
                     tile_positions.append((x, y))
 
-        if not tiles:
-            return
-
-        # Stitch
-        min_x = min(p[0] for p in tile_positions)
-        min_y = min(p[1] for p in tile_positions)
-
-        tile_w, tile_h = tiles[0].size
-        w = (max(p[0] for p in tile_positions) - min_x + 1) * tile_w
-        h = (max(p[1] for p in tile_positions) - min_y + 1) * tile_h
-
+        w = (x_max - x_min + 1) * 256
+        h = (y_max - y_min + 1) * 256
         composite = Image.new("RGB", (w, h), (230, 230, 230))
-        for img, (x, y) in zip(tiles, tile_positions, strict=True):
-            composite.paste(img, ((x - min_x) * tile_w, (y - min_y) * tile_h))
 
-        # Calculate extent
+        for img, (xpos, ypos) in zip(tiles, tile_positions, strict=True):
+            composite.paste(img, ((xpos - x_min) * 256, (ypos - y_min) * 256))
+
         def num2deg(xtile, ytile, zoom):
             n = 2.0**zoom
             lon_deg = xtile / n * 360.0 - 180.0
@@ -320,11 +455,85 @@ class TileLoaderWorker(QThread):
             lat_deg = np.degrees(lat_rad)
             return lat_deg, lon_deg
 
-        north, west = num2deg(min_x, min_y, zoom)
+        north, west = num2deg(x_min, y_min, zoom)
         south, east = num2deg(x_max + 1, y_max + 1, zoom)
 
-        # Emit result
         self.view_ready.emit(job_id, composite, (west, east, south, north))
+        if skipped_any:
+            self.tiles_skipped.emit()
+        if trigger_retry:
+            if self._retry_skipped_tiles(session):
+                self.retry_complete.emit()
+
+    def _retry_skipped_tiles(self, session: requests.Session) -> bool:
+        with QMutexLocker(self.mutex):
+            skipped = sorted(self._skipped_tiles)
+        recovered_any = False
+        for tile_key in skipped:
+            with QMutexLocker(self.mutex):
+                if self._pending_job is not None:
+                    return recovered_any
+
+            zoom, wrapped_x, y = tile_key
+            if tile_key in self.ram_cache:
+                with QMutexLocker(self.mutex):
+                    self._skipped_tiles.discard(tile_key)
+                continue
+
+            if time.time() < self._network_suspended_until:
+                break
+
+            now = time.time()
+            elapsed = now - self.last_network_request_time
+            if elapsed < 0.15:
+                time.sleep(0.15 - elapsed)
+            self.last_network_request_time = time.time()
+
+            url = f"https://tile.openstreetmap.org/{zoom}/{wrapped_x}/{y}.png"
+            try:
+                resp = session.get(url, timeout=3.0)
+                if resp.status_code == 200:
+                    img_bytes = resp.content
+                    img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                    self.ram_cache[tile_key] = img
+                    if len(self.ram_cache) > MAX_CACHE_SIZE:
+                        self.ram_cache.popitem(last=False)
+                    self.disk_cache.put_tile(zoom, wrapped_x, y, img_bytes)
+                    with QMutexLocker(self.mutex):
+                        self._skipped_tiles.discard(tile_key)
+                    recovered_any = True
+                else:
+                    logging.debug(
+                        f"Tile {zoom}/{wrapped_x}/{y} HTTP {resp.status_code}"
+                    )
+                    if resp.status_code in (403, 429, 418, 408, 500, 502, 503, 504):
+                        if not self._notified_error:
+                            self._notified_error = True
+                            if resp.status_code in (403, 429, 418):
+                                msg = f"Map service throttled requests (HTTP {resp.status_code})."
+                            elif resp.status_code == 408:
+                                msg = "Map service request timed out."
+                            else:
+                                msg = f"Map service error (HTTP {resp.status_code})."
+                            self.network_error.emit(f"{msg} Backing off.")
+                        self._network_suspended_until = time.time() + 15.0
+                    break
+            except RequestException as e:
+                logging.debug(
+                    f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e!s}"
+                )
+                if not self._notified_error:
+                    self._notified_error = True
+                    self.network_error.emit(f"Network error: {e!s}. Backing off.")
+                self._network_suspended_until = time.time() + 15.0
+                break
+
+        with QMutexLocker(self.mutex):
+            still_skipped = len(self._skipped_tiles) > 0
+        if still_skipped:
+            self.tiles_skipped.emit()
+
+        return recovered_any
 
 
 class DatabaseProgressTracker:
@@ -477,6 +686,10 @@ class MapDialog(QDialog):
         working_dir = parent.working_dir if parent else os.getcwd()
         self.worker = TileLoaderWorker(working_dir)
         self.worker.view_ready.connect(self.on_view_ready)
+        self.worker.network_error.connect(self.on_network_error)
+        self.worker.network_recovered.connect(self.on_network_recovered)
+        self.worker.retry_complete.connect(self.request_tiles_for_current_view)
+        self.worker.tiles_skipped.connect(self.on_tiles_skipped)
         self.worker.start()
 
         self.job_counter = 0
@@ -520,11 +733,18 @@ class MapDialog(QDialog):
 
         self.coord_label = QLabel(f"Lat: {lat:.4f}, Lon: {lon:.4f}")
 
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet(
+            "color: red; font-weight: bold; margin-left: 10px;"
+        )
+        self.status_label.hide()
+
         controls_layout.addWidget(radius_label)
         controls_layout.addWidget(self.radius_spinbox)
         controls_layout.addWidget(zoom_in_btn)
         controls_layout.addWidget(zoom_out_btn)
         controls_layout.addWidget(self.coord_label)
+        controls_layout.addWidget(self.status_label)
         controls_layout.addStretch()
 
         layout.addLayout(controls_layout)
@@ -549,6 +769,11 @@ class MapDialog(QDialog):
         self.update_timer.setSingleShot(True)
         self.update_timer.setInterval(200)  # 200ms debounce
         self.update_timer.timeout.connect(self.request_tiles_for_current_view)
+
+        # Dedicated timer for retries after network suspension
+        self.retry_timer = QTimer()
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self.request_tiles_for_current_view)
 
         # Initialize the map
         self.ax.set_xlim(self.lon - 5, self.lon + 5)
@@ -578,6 +803,26 @@ class MapDialog(QDialog):
         )
         (self.circle,) = self.ax.plot([], [], "r-", linewidth=3, alpha=0.8, zorder=5)
         self.update_overlays()
+
+        # OpenStreetMap attribution overlay
+        self.ax.text(
+            0.99,
+            0.01,
+            "© OpenStreetMap contributors",
+            verticalalignment="bottom",
+            horizontalalignment="right",
+            transform=self.ax.transAxes,
+            color="#333333",
+            fontsize=9,
+            fontweight="bold",
+            bbox=dict(
+                facecolor="white",
+                alpha=0.85,
+                edgecolor="gray",
+                boxstyle="round,pad=0.3",
+            ),
+            zorder=20,
+        )
 
         # Connect mouse events
         self.canvas.mpl_connect("button_press_event", self.on_click)  # type: ignore[arg-type]
@@ -620,39 +865,27 @@ class MapDialog(QDialog):
         zoom = int(math.log2(needed_2z)) if needed_2z > 0 else 0
         zoom = max(0, min(zoom, 15))  # Changed max zoom to 15
 
-        # Check tile budget
-        def get_tile_range(z):
-            n = 2.0**z
-            xtile_min = int((x0 + 180.0) / 360.0 * n)
-            xtile_max = int((x1 + 180.0) / 360.0 * n)
-
-            def lat2y(lat):
-                return (
-                    (
-                        1.0
-                        - math.asinh(math.tan(math.radians(max(-85, min(85, lat)))))
-                        / math.pi
-                    )
-                    / 2.0
-                    * n
-                )
-
-            y_a = int(lat2y(y1))  # y1 is max lat (top)
-            y_b = int(lat2y(y0))  # y0 is min lat (bottom)
-            return z, xtile_min, xtile_max, min(y_a, y_b), max(y_a, y_b)
-
-        x_min = x_max = y_min = y_max = 0
-        while zoom >= 0:
-            _z, x_min, x_max, y_min, y_max = get_tile_range(zoom)
-            num_tiles = (x_max - x_min + 1) * (y_max - y_min + 1)
-            if num_tiles <= MAX_TILES_PER_REQUEST:
-                break
-            zoom -= 1
-
-        # Submit job
+        # Check tile budget (now pushed down to Worker for uncached tile budgeting)
+        # We just send the target zoom and boundary.
         self.job_counter += 1
         self.current_job_id = self.job_counter
-        self.worker.request_view(self.current_job_id, zoom, x_min, x_max, y_min, y_max)
+        self.worker.request_view(
+            self.current_job_id, zoom, float(x0), float(x1), float(y0), float(y1)
+        )
+
+    def on_network_error(self, message: str) -> None:
+        self.status_label.setText(message)
+        self.status_label.show()
+
+    def on_network_recovered(self) -> None:
+        self.status_label.hide()
+        self.retry_timer.stop()
+
+    def on_tiles_skipped(self) -> None:
+        """Called when some tiles were skipped due to network suspension. Schedule a retry."""
+        # Schedule a retry after the 15-second suspension period ends.
+        # We use 16 seconds to be safe. We always restart to sync with any back-off extension.
+        self.retry_timer.start(16000)
 
     def on_view_ready(
         self, job_id: int, composite, extent: tuple[float, float, float, float]
@@ -780,14 +1013,15 @@ class MapDialog(QDialog):
     def on_scroll(self, event: MouseEvent) -> None:
         if event.inaxes != self.ax:
             return
+        mx, my = event.xdata, event.ydata
+        if mx is None or my is None:
+            return
+
         scale = 1.0 / 1.5 if event.button == "up" else 1.5
 
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
         w, h = x1 - x0, y1 - y0
-
-        mx = event.xdata
-        my = event.ydata
 
         new_w = w * scale
         new_h = h * scale
@@ -1029,7 +1263,7 @@ class INatSeasonalVisualizer(QMainWindow):
             else:
                 return datetime.now().strftime("%Y-%m-%d")
         except Exception as e:
-            logging.error(f"Failed to get most recent date from database: {str(e)}")
+            logging.error(f"Failed to get most recent date from database: {e!s}")
             return datetime.now().strftime("%Y-%m-%d")
         finally:
             if con is not None:
@@ -1151,7 +1385,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 f"Loaded database stats: {self.total_observations} observations, {self.unique_taxa} unique taxa."
             )
         except Exception as e:
-            logging.error(f"Failed to load database stats: {str(e)}")
+            logging.error(f"Failed to load database stats: {e!s}")
             self.total_observations = "Error"
             self.unique_taxa = "Error"
         finally:
@@ -1270,12 +1504,12 @@ class INatSeasonalVisualizer(QMainWindow):
                 QApplication.processEvents()
 
             except Exception as e:
-                logging.error(f"Failed to download {filename}: {str(e)}")
+                logging.error(f"Failed to download {filename}: {e!s}")
                 self.enhanced_progress.hide_progress()
                 QMessageBox.critical(
                     self,
                     "Download Error",
-                    f"Failed to download {filename}: {str(e)}\n\n"
+                    f"Failed to download {filename}: {e!s}\n\n"
                     f"Please manually download it from {url} and place it in {self.working_dir}, "
                     "or ensure your internet connection is stable and try again.",
                 )
@@ -1315,7 +1549,7 @@ class INatSeasonalVisualizer(QMainWindow):
             else:
                 logging.info(f"No taxon cache found at {self.taxon_cache_file}")
         except Exception as e:
-            logging.error(f"Failed to load taxon cache: {str(e)}")
+            logging.error(f"Failed to load taxon cache: {e!s}")
             QMessageBox.warning(
                 self,
                 "Warning",
@@ -1330,7 +1564,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 json.dump(self.taxon_cache, f, indent=2)
             logging.info(f"Saved taxon cache to {self.taxon_cache_file}")
         except Exception as e:
-            logging.error(f"Failed to save taxon cache: {str(e)}")
+            logging.error(f"Failed to save taxon cache: {e!s}")
 
     def load_descendant_taxons_from_file(self, query: str) -> list[int] | None:
         """Load descendant taxon IDs from a user-provided file."""
@@ -1352,7 +1586,7 @@ class INatSeasonalVisualizer(QMainWindow):
             return None
         except Exception as e:
             logging.error(
-                f"Failed to load descendant taxons from {self.descendant_taxons_file}: {str(e)}"
+                f"Failed to load descendant taxons from {self.descendant_taxons_file}: {e!s}"
             )
             return None
 
@@ -1503,9 +1737,9 @@ class INatSeasonalVisualizer(QMainWindow):
             )
             self.canvas.setMinimumSize(0, 0)
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to initialize plot: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to initialize plot: {e!s}")
             self.canvas = None
-            error_label = QLabel(f"Plot initialization failed: {str(e)}")
+            error_label = QLabel(f"Plot initialization failed: {e!s}")
             error_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.top_layout.addWidget(error_label, 3)
             return
@@ -1837,7 +2071,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.settings.setValue("graph_font_size", self.graph_font_size)
             QMessageBox.information(self, "Settings", "Settings saved successfully.")
         except ValueError as e:
-            QMessageBox.warning(self, "Settings", f"Invalid input: {str(e)}")
+            QMessageBox.warning(self, "Settings", f"Invalid input: {e!s}")
 
     def update_api_call_count(self) -> None:
         """Update the API call count display."""
@@ -1981,7 +2215,7 @@ class INatSeasonalVisualizer(QMainWindow):
             return None
         except Exception as e:
             error_msg = (
-                f"Failed to fetch taxon ID for {query}: {str(e)}. "
+                f"Failed to fetch taxon ID for {query}: {e!s}. "
                 "This may be due to anonymous API access or network issues. "
                 "Consider setting INATURALIST_APP_ID and INATURALIST_APP_SECRET in ~/.bashrc for higher limits."
             )
@@ -2040,12 +2274,12 @@ class INatSeasonalVisualizer(QMainWindow):
 
         except Exception as e:
             logging.error(
-                f"Failed to fetch descendant taxon IDs for {query} from taxonomy.parquet: {str(e)}"
+                f"Failed to fetch descendant taxon IDs for {query} from taxonomy.parquet: {e!s}"
             )
 
             # Fallback dialog
             error_msg = (
-                f"Failed to fetch descendant taxon IDs for {query} from taxonomy.parquet: {str(e)}. "
+                f"Failed to fetch descendant taxon IDs for {query} from taxonomy.parquet: {e!s}. "
                 "You can:\n"
                 f"1. Ensure taxonomy.parquet is in {self.working_dir} and contains valid data.\n"
                 f"2. Create {self.descendant_taxons_file} with:\n"
@@ -2109,7 +2343,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 )
         except Exception as e:
             self.enhanced_progress.hide_progress()
-            QMessageBox.critical(self, "Error", f"Failed to fetch taxon IDs: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to fetch taxon IDs: {e!s}")
         finally:
             self.status_bar.showMessage("Ready")
 
@@ -2155,7 +2389,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 f"Search URL:\n{url}\n\nCopy this URL to verify the search on iNaturalist.",
             )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to generate URL: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to generate URL: {e!s}")
 
     def clamp_to_screen(self) -> None:
         """Clamp the window geometry so it stays within the available screen area."""
@@ -2218,7 +2452,7 @@ class INatSeasonalVisualizer(QMainWindow):
                     dates.append(date)
                 except Exception as e:
                     logging.warning(
-                        f"Skipping invalid date at observation {obs}: {str(e)}"
+                        f"Skipping invalid date at observation {obs}: {e!s}"
                     )
                     continue
             else:
@@ -2558,9 +2792,9 @@ class INatSeasonalVisualizer(QMainWindow):
 
         except Exception as e:
             self.enhanced_progress.hide_progress()
-            QMessageBox.critical(self, "Error", f"Local search failed: {str(e)}")
-            self.show_placeholder(f"Local search failed: {str(e)}")
-            logging.error(f"Local search failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Local search failed: {e!s}")
+            self.show_placeholder(f"Local search failed: {e!s}")
+            logging.error(f"Local search failed: {e!s}")
         finally:
             if con is not None:
                 con.close()
@@ -2658,9 +2892,9 @@ class INatSeasonalVisualizer(QMainWindow):
                 self.update_status_bar(0)
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"API search failed: {str(e)}")
-            self.show_placeholder(f"API search failed: {str(e)}")
-            logging.error(f"API search failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"API search failed: {e!s}")
+            self.show_placeholder(f"API search failed: {e!s}")
+            logging.error(f"API search failed: {e!s}")
 
     def export_graph(self) -> None:
         """Export the current graph as an image with metadata."""
@@ -2849,8 +3083,8 @@ class INatSeasonalVisualizer(QMainWindow):
             QMessageBox.information(self, "Success", f"Graph exported to {filename}")
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to export graph: {str(e)}")
-            logging.error(f"Export graph failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to export graph: {e!s}")
+            logging.error(f"Export graph failed: {e!s}")
 
     def export_data(self) -> None:
         """Export observation data as CSV."""
@@ -2894,8 +3128,8 @@ class INatSeasonalVisualizer(QMainWindow):
             QMessageBox.information(self, "Success", f"Data exported to {filename}")
 
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to export data: {str(e)}")
-            logging.error(f"Export data failed: {str(e)}")
+            QMessageBox.critical(self, "Error", f"Failed to export data: {e!s}")
+            logging.error(f"Export data failed: {e!s}")
 
     def load_history_item(self) -> None:
         """Load and replot a history item."""
@@ -2937,9 +3171,9 @@ class INatSeasonalVisualizer(QMainWindow):
 
         except Exception as e:
             QMessageBox.critical(
-                self, "Error", f"Failed to load history item: {str(e)}"
+                self, "Error", f"Failed to load history item: {e!s}"
             )
-            logging.error(f"Load history item failed: {str(e)}")
+            logging.error(f"Load history item failed: {e!s}")
 
     def show_placeholder(self, message: str | None = None) -> None:
         """Show a placeholder message on the graph."""
