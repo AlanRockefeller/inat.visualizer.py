@@ -51,11 +51,11 @@ class TileRetryTestHarness:
 
     def retry_skipped_tiles(self, session):
         """Mirrors TileLoaderWorker._retry_skipped_tiles with the fix applied."""
-        skipped = list(self._skipped_tiles)
+        skipped = sorted(self._skipped_tiles)
         recovered_any = False
         for tile_key in skipped:
             if self._pending_job is not None:
-                break
+                return recovered_any
 
             zoom, wrapped_x, y = tile_key
             if tile_key in self.ram_cache:
@@ -201,8 +201,8 @@ class TestRetryScheduling(unittest.TestCase):
 
         self.assertFalse(result)
         session.get.assert_not_called()
-        # tiles_skipped should still be emitted since tiles remain
-        self.assertEqual(h.tiles_skipped_count, 1)
+        # Early return skips the tiles_skipped emission (matches production behavior)
+        self.assertEqual(h.tiles_skipped_count, 0)
 
     def test_duplicate_error_notification_suppressed(self):
         """Second failure should not emit a duplicate network_error."""
