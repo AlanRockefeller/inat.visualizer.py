@@ -458,7 +458,8 @@ class TileLoaderWorker(QThread):
         north, west = num2deg(x_min, y_min, zoom)
         south, east = num2deg(x_max + 1, y_max + 1, zoom)
 
-        self.view_ready.emit(job_id, composite, (west, east, south, north))
+        if tiles:
+            self.view_ready.emit(job_id, composite, (west, east, south, north))
         if skipped_any:
             self.tiles_skipped.emit()
         if trigger_retry:
@@ -2103,18 +2104,6 @@ class INatSeasonalVisualizer(QMainWindow):
         # Start enhanced progress tracking
         self.enhanced_progress.start_progress(0, "Starting API search...")
 
-        # Use POST for requests with many taxon IDs to avoid 414 Request-URI Too Large
-        method = "get"
-        if (
-            "taxon_id" in params
-            and isinstance(params["taxon_id"], list)
-            and len(params["taxon_id"]) > 50
-        ):
-            method = "post"
-            logging.info(
-                f"Using POST request for {len(params['taxon_id'])} taxon IDs to avoid overly long URI."
-            )
-
         last_http_status: int | None = None
         while True:
             params["page"] = page
@@ -2127,7 +2116,7 @@ class INatSeasonalVisualizer(QMainWindow):
                     self.enhanced_progress.update_progress(
                         message=f"Fetching page {page}..."
                     )
-                    response = pyinaturalist.get_observations(**params, method=method)
+                    response = pyinaturalist.get_observations(**params)
                     self.api_call_count += 1  # Increment API call counter
                     self.update_api_call_count()
                     results = response.get("results", [])
