@@ -106,10 +106,62 @@ pyinaturalist.user_agent = build_app_user_agent()  # type: ignore[attr-defined]
 
 
 # --- Constants for MapDialog ---
+INATURALIST_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
+INATURALIST_GET_QUERY_LIMIT = 1800
+OBSERVATION_TAXON_FILTER_KEYS = ("taxon_id", "not_in_taxon_id")
 MAX_TILES_PER_REQUEST = 100
 MAX_CACHE_SIZE = 500  # Max number of tiles to keep in memory (RAM)
 TILE_CACHE_DIR_NAME = "tile_cache"
 MAX_DISK_CACHE_SIZE_MB = 200
+
+
+def should_post_observation_search(params: dict[str, Any]) -> bool:
+    """Use POST when taxon filters would likely overflow the GET query string."""
+    if not any(
+        isinstance(params.get(key), list) and params[key]
+        for key in OBSERVATION_TAXON_FILTER_KEYS
+    ):
+        return False
+
+    encoded_params = {
+        key: value for key, value in params.items() if value is not None and value != ""
+    }
+    query_string = urlencode(encoded_params, doseq=True)
+    return len(query_string) > INATURALIST_GET_QUERY_LIMIT
+
+
+def fetch_observations_page(
+    params: dict[str, Any], force_post: bool = False
+) -> dict[str, Any]:
+    """Fetch one page of observations, switching to POST for oversized taxon filters."""
+    if force_post or should_post_observation_search(params):
+        query_string = urlencode(
+            {key: value for key, value in params.items() if value is not None and value != ""},
+            doseq=True,
+        )
+        taxon_filter_sizes = {
+            key: len(value)
+            for key in OBSERVATION_TAXON_FILTER_KEYS
+            if isinstance(params.get(key), list)
+        }
+        logging.info(
+            "Using POST for observation search (query_length=%s, taxon_filters=%s)",
+            len(query_string),
+            taxon_filter_sizes,
+        )
+        response = requests.post(
+            INATURALIST_OBSERVATIONS_URL,
+            data=params,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": build_app_user_agent(),
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    return pyinaturalist.get_observations(**params)
 
 
 class DiskTileCache:
@@ -458,7 +510,8 @@ class TileLoaderWorker(QThread):
         north, west = num2deg(x_min, y_min, zoom)
         south, east = num2deg(x_max + 1, y_max + 1, zoom)
 
-        self.view_ready.emit(job_id, composite, (west, east, south, north))
+        if tiles:
+            self.view_ready.emit(job_id, composite, (west, east, south, north))
         if skipped_any:
             self.tiles_skipped.emit()
         if trigger_retry:
@@ -2096,6 +2149,7 @@ class INatSeasonalVisualizer(QMainWindow):
         """Fetch all observations with pagination, rate limiting, and error handling."""
         all_results = []
         page = 1
+        base_params = params.copy()
         per_page = 500  # Maximum per page for observations endpoint
         max_retries = 3
         rate_limit_delay = 3.0  # Increased for anonymous access
@@ -2103,22 +2157,10 @@ class INatSeasonalVisualizer(QMainWindow):
         # Start enhanced progress tracking
         self.enhanced_progress.start_progress(0, "Starting API search...")
 
-        # Use POST for requests with many taxon IDs to avoid 414 Request-URI Too Large
-        method = "get"
-        if (
-            "taxon_id" in params
-            and isinstance(params["taxon_id"], list)
-            and len(params["taxon_id"]) > 50
-        ):
-            method = "post"
-            logging.info(
-                f"Using POST request for {len(params['taxon_id'])} taxon IDs to avoid overly long URI."
-            )
-
         last_http_status: int | None = None
+        force_post = False
         while True:
-            params["page"] = page
-            params["per_page"] = per_page
+            page_params = {**base_params, "page": page, "per_page": per_page}
             retries = 0
 
             while retries <= max_retries:
@@ -2127,7 +2169,9 @@ class INatSeasonalVisualizer(QMainWindow):
                     self.enhanced_progress.update_progress(
                         message=f"Fetching page {page}..."
                     )
-                    response = pyinaturalist.get_observations(**params, method=method)
+                    response = fetch_observations_page(
+                        page_params, force_post=force_post
+                    )
                     self.api_call_count += 1  # Increment API call counter
                     self.update_api_call_count()
                     results = response.get("results", [])
@@ -2156,13 +2200,19 @@ class INatSeasonalVisualizer(QMainWindow):
                     break  # Exit retry loop on success
 
                 except HTTPError as e:
-                    if e.response.status_code in (
+                    status_code = e.response.status_code if e.response else None
+                    if status_code == 414 and not force_post:
+                        force_post = True
+                        logging.warning(
+                            "Observation search exceeded GET URL limits on page %s; retrying with POST.",
+                            page,
+                        )
+                        continue
+                    if status_code in (
                         429,
                         403,
                     ):  # Too Many Requests or Forbidden
-                        last_http_status = (
-                            e.response.status_code
-                        )  # save before `e` is cleared by Python
+                        last_http_status = status_code  # save before `e` is cleared
                         retries += 1
                         wait_time = 2**retries  # Exponential backoff: 1s, 2s, 4s
                         self.status_bar.showMessage(
