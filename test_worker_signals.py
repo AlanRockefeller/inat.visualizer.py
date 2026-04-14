@@ -2,7 +2,6 @@
 import unittest
 import time
 import os
-import sys
 
 # Must be set before PyQt6 initializes
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
@@ -11,16 +10,18 @@ from io import BytesIO
 from PIL import Image
 from unittest.mock import MagicMock, patch
 from PyQt6.QtCore import QCoreApplication, QEventLoop, QTimer
+from PyQt6.QtWidgets import QApplication
 from visualizer import TileLoaderWorker, DiskTileCache
 
 print("Starting script...")
 try:
     # We need a QCoreApplication for signals to work between threads correctly
-    app = QCoreApplication([])
+    app = QApplication.instance() or QCoreApplication.instance()
+    if app is None:
+        app = QCoreApplication([])
     print("QCoreApplication created.")
 except Exception as e:
-    print(f"Failed to create QCoreApplication: {e}")
-    sys.exit(1)
+    raise RuntimeError(f"Failed to create QCoreApplication: {e}") from e
 
 class MockResponse:
     def __init__(self, status_code, content=b""):
