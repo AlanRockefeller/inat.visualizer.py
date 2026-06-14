@@ -1,0 +1,15 @@
+# iNaturalist Seasonal Visualizer -- Python dependencies (Windows, macOS, Linux).
+# Tested with Python 3.12. Install with: pip install -r requirements.txt
+#
+# These pinned versions match what the app was developed and tested against.
+# Newer versions usually work too; the app warns (but does not refuse to run)
+# if an installed version differs.
+numpy==1.26.4
+pandas==2.2.2
+pyarrow==17.0.0
+matplotlib==3.9.2
+pyinaturalist==0.19.0
+PyQt6==6.8.1
+duckdb>=1.0.0
+requests>=2.31.0
+Pillow>=10.0.0

@@ -43,40 +43,60 @@ It also includes an **interactive map dialog** (OpenStreetMap tiles) to set coor
 
 ---
 
-## Requirements
+## Download (prebuilt apps for Windows & macOS)
 
-### OS packages (Linux)
-This app uses Qt via X11/XWayland and needs a couple system libs:
+The easiest way to get started — no Python required. Grab the latest build from the
+[**Releases**](https://github.com/AlanRockefeller/inat.visualizer.py/releases) page:
+
+- **Windows:** download `iNat-Seasonal-Visualizer.exe` and double-click it.
+- **macOS:** download and unzip `iNat-Seasonal-Visualizer-macOS.zip`, then open the app.
+  The first time, right-click the app and choose **Open** (it is unsigned).
+- **Linux:** download and extract `iNat-Seasonal-Visualizer-Linux.tar.gz`, then run the binary.
+
+On first launch the app offers to download the required data files
+(`observations.parquet` ~1 GB and `taxonomy.parquet`) into its working directory.
+
+---
+
+## Requirements (running from source)
+
+The app is cross-platform (Windows, macOS, Linux) and targets **Python 3.12**.
+
+- Qt backend: PyQt6
+- Matplotlib backend: `QtAgg`
+
+On **Linux** only, Qt runs under XWayland to avoid a Wayland protocol crash
+(the app sets `QT_QPA_PLATFORM=xcb` automatically) and needs a couple of system libs:
 
 ```bash
 sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0
 ```
 
-### Python environment
-The script is designed for a conda environment named `inat_env` and expects Python 3.12.
-
-The program also forces Qt to run under XWayland to avoid a Wayland protocol crash:
-
-- `QT_QPA_PLATFORM=xcb`
-- Matplotlib backend: `QtAgg`
+Windows and macOS need no extra system packages.
 
 ---
 
-## Installation
+## Installation (from source)
 
-### 1) Create the conda environment
+### Option A — pip (any OS)
 
 ```bash
-conda deactivate
-conda env remove -n inat_env
-conda create -n inat_env python=3.12
-conda activate inat_env
-
-conda install numpy=1.26.4 pandas=2.2.2 pyarrow=17.0.0 matplotlib=3.9.2 pyinaturalist=0.19.0
-pip install PyQt6==6.8.1 duckdb
+python -m venv .venv
+# Windows:  .venv\Scripts\activate
+# macOS/Linux:  source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-> The program includes an environment self-check and will warn if versions don’t match its expectations.
+### Option B — conda
+
+```bash
+conda create -n inat_env python=3.12
+conda activate inat_env
+pip install -r requirements.txt
+```
+
+> The program includes an environment self-check. Missing packages stop startup;
+> version differences are logged as warnings but do not prevent the app from running.
 
 ---
 
@@ -107,24 +127,16 @@ If these columns are missing, Local Search will fail with an explanatory error.
 
 ## Running
 
-Activate the environment first:
+With your environment activated, run:
 
 ```bash
-conda activate inat_env
+python visualizer.py
 ```
-
-Run the script:
-
-```bash
-python inat_seasonal_visualizer.py
-```
-
-(Replace the filename with whatever you saved it as.)
 
 ### Command-line options
 
 ```bash
-python inat_seasonal_visualizer.py   --lat 37.7749   --lon -122.4194   --radius 25   --scale-factor 1.5   --debug
+python visualizer.py --lat 37.7749 --lon -122.4194 --radius 25 --scale-factor 1.5 --debug
 ```
 
 Flags:
@@ -214,26 +226,23 @@ If you plan to do lots of API queries, you can increase limits by configuring cr
 
 ## Troubleshooting
 
-### Wayland / Qt crashes
-This app forces Qt onto XWayland:
-
-```bash
-export QT_QPA_PLATFORM=xcb
-```
-
-If you still have rendering issues, ensure required libs are installed:
+### Wayland / Qt crashes (Linux)
+On Linux the app forces Qt onto XWayland (`QT_QPA_PLATFORM=xcb`) automatically.
+If you still have rendering issues, ensure the required libs are installed:
 
 ```bash
 sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0
 ```
 
-### Environment check fails
-The script checks:
-- correct interpreter path
-- matplotlib backend is `QtAgg`
-- required package versions
+You can override the platform plugin by setting `QT_QPA_PLATFORM` yourself before
+launching. (This forcing does not apply on Windows or macOS, which use their
+native Qt platform plugins.)
 
-If it prints an environment fix recipe, follow it exactly and restart.
+### Environment check fails
+At startup the app verifies that the required Python packages are importable.
+A missing package stops startup with an install hint
+(`pip install -r requirements.txt`). Version differences from the tested set are
+logged as warnings only and do not block the app.
 
 
 ---

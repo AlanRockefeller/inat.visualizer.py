@@ -1,12 +1,17 @@
-#!/home/alan/anaconda3/envs/inat_env/bin/python
-# Run `conda activate inat_env` before executing this script to ensure the correct environment is used.
-
-# Requires:  libxcb-cursor0 libxkbcommon-x11-0
+#!/usr/bin/env python3
+# iNaturalist Seasonal Visualizer -- cross-platform (Windows, macOS, Linux).
+# Install dependencies with: pip install -r requirements.txt
+# On Linux, Qt also needs the system libraries: libxcb-cursor0 libxkbcommon-x11-0
 
 import os
+import sys
 
-# Must be set before PyQt6 initializes to route Qt through XWayland.
-os.environ["QT_QPA_PLATFORM"] = "xcb"
+# On Linux, route Qt through XWayland to avoid Wayland protocol crashes.
+# This must be done before PyQt6 initializes. On Windows ("windows" plugin)
+# and macOS ("cocoa" plugin) there is no "xcb" platform plugin, so forcing it
+# would prevent the app from starting -- leave Qt's default in place there.
+if sys.platform.startswith("linux") and "QT_QPA_PLATFORM" not in os.environ:
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 # --- stdlib ---
 import argparse
@@ -16,7 +21,6 @@ import json
 import logging
 import math
 import platform
-import sys
 import time
 from collections import OrderedDict
 from datetime import datetime
@@ -103,6 +107,25 @@ def build_app_user_agent() -> str:
 
 
 pyinaturalist.user_agent = build_app_user_agent()  # type: ignore[attr-defined]
+
+
+def resource_path(filename: str) -> str:
+    """Locate a bundled resource, working both from source and from a frozen build.
+
+    PyInstaller unpacks bundled data files into a temporary directory exposed as
+    ``sys._MEIPASS``. When running from source that attribute is absent, so we
+    fall back to the current working directory and then the script's directory.
+    """
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, filename))
+    candidates.append(os.path.join(os.getcwd(), filename))
+    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), filename))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
 
 
 # --- Constants for MapDialog ---
@@ -1217,20 +1240,18 @@ class EnhancedProgressWidget(QWidget):
 
 
 def check_environment() -> str | None:
-    """Check if the environment is correctly set up, return error message if not."""
+    """Check if the environment is correctly set up, return error message if not.
+
+    Only conditions that genuinely prevent the app from running are treated as
+    fatal (a missing required package, or a conflicting PyQt5 install). Version
+    mismatches are logged as warnings rather than blocking startup, so the app
+    runs on Windows, macOS, and Linux regardless of how the dependencies were
+    installed (conda, pip, or system packages).
+    """
     errors = []
+    warnings: list[str] = []
 
-    # Check Python interpreter
-    expected_python = "/home/alan/anaconda3/envs/inat_env/bin/python"
-    current_python = sys.executable
-    if current_python != expected_python:
-        errors.append(
-            f"Wrong Python interpreter: {current_python}\n"
-            f"Expected: {expected_python}\n"
-            "Ensure you activate the 'inat_env' environment with 'conda activate inat_env'."
-        )
-
-    # Check for PyQt5 conflict
+    # Check for PyQt5 conflict (PyQt5 and PyQt6 cannot coexist in one process).
     if "PyQt5" in sys.modules:
         errors.append(
             "PyQt5 detected in sys.modules. Uninstall PyQt5 to avoid conflicts with PyQt6."
@@ -1238,13 +1259,12 @@ def check_environment() -> str | None:
 
     # Check matplotlib backend
     if matplotlib.get_backend() != "QtAgg":
-        errors.append(
-            f"Unexpected matplotlib backend: {matplotlib.get_backend()}\n"
-            "Expected: QtAgg\n"
-            "Ensure matplotlib is configured to use the QtAgg backend."
+        warnings.append(
+            f"Unexpected matplotlib backend: {matplotlib.get_backend()} (expected QtAgg)."
         )
 
-    # Check required packages
+    # Required packages. Versions are the ones the app was developed against;
+    # mismatches are warnings, not hard failures.
     required_packages = {
         "numpy": "1.26.4",
         "pandas": "2.2.2",
@@ -1252,7 +1272,7 @@ def check_environment() -> str | None:
         "matplotlib": "3.9.2",
         "pyinaturalist": "0.19.0",
         "PyQt6": "6.8.1",
-        "duckdb": None,  # Version not strictly enforced
+        "duckdb": None,  # Version not enforced
     }
 
     for pkg, expected_version in required_packages.items():
@@ -1260,26 +1280,22 @@ def check_environment() -> str | None:
             module = importlib.import_module(pkg)
             if expected_version and hasattr(module, "__version__"):
                 if module.__version__ != expected_version:
-                    errors.append(
-                        f"{pkg} version mismatch: {module.__version__}\n"
-                        f"Expected: {expected_version}"
+                    warnings.append(
+                        f"{pkg} version {module.__version__} differs from the "
+                        f"tested version {expected_version}."
                     )
         except ImportError:
-            errors.append(f"Missing package: {pkg}")
+            errors.append(f"Missing required package: {pkg}")
+
+    for warning in warnings:
+        logging.warning("Environment check: %s", warning)
 
     if errors:
         error_message = (
             "Environment setup issues detected:\n\n"
             + "\n\n".join(errors)
-            + "\n\nTo set up the environment correctly, run:\n"
-            "```bash\n"
-            "conda deactivate\n"
-            "conda env remove -n inat_env\n"
-            "conda create -n inat_env python=3.12\n"
-            "conda activate inat_env\n"
-            "conda install numpy=1.26.4 pandas=2.2.2 pyarrow=17.0.0 matplotlib=3.9.2 pyinaturalist=0.19.0\n"
-            "pip install PyQt6==6.8.1 duckdb\n"
-            "```\n\n"
+            + "\n\nInstall the required dependencies, e.g.:\n"
+            "    pip install -r requirements.txt\n\n"
             "After fixing the environment, restart the program."
         )
         return error_message
@@ -1527,14 +1543,18 @@ class INatSeasonalVisualizer(QMainWindow):
             )
             QApplication.processEvents()  # Ensure UI updates
 
+            # Download to a temporary file and rename only on success, so an
+            # interrupted download never leaves a partial file that later looks
+            # complete. os.replace is atomic on the same filesystem on every OS.
+            temp_path = file_path + ".part"
             try:
-                response = requests.get(url, stream=True)
+                response = requests.get(url, stream=True, timeout=30)
                 response.raise_for_status()
                 total_size = int(response.headers.get("content-length", info["size"]))
                 block_size = 8192
                 downloaded = 0
 
-                with open(file_path, "wb") as f:
+                with open(temp_path, "wb") as f:
                     for chunk in response.iter_content(chunk_size=block_size):
                         if chunk:
                             f.write(chunk)
@@ -1549,6 +1569,7 @@ class INatSeasonalVisualizer(QMainWindow):
                                 )
                                 QApplication.processEvents()  # Update progress bar in real-time
 
+                os.replace(temp_path, file_path)
                 logging.info(f"Successfully downloaded {filename} to {file_path}")
                 self.status_bar.showMessage(f"Downloaded {filename} ({human_size})")
                 self.enhanced_progress.finish_progress(
@@ -1558,6 +1579,12 @@ class INatSeasonalVisualizer(QMainWindow):
 
             except Exception as e:
                 logging.error(f"Failed to download {filename}: {e!s}")
+                # Clean up any partial download so the next run retries cleanly.
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except OSError:
+                    pass
                 self.enhanced_progress.hide_progress()
                 QMessageBox.critical(
                     self,
@@ -3380,7 +3407,7 @@ def main() -> None:
         print("DEBUG: QApplication created.")
 
     # Show splash screen
-    splash_image_path = os.path.join(os.getcwd(), "splash_screen.jpg")
+    splash_image_path = resource_path("splash_screen.jpg")
     if os.path.exists(splash_image_path):
         if args.debug:
             print(f"DEBUG: Splash screen found at {splash_image_path}. Initializing...")
