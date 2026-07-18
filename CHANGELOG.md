@@ -2,6 +2,12 @@
 
 All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
+## [1.0.4] - 2026-07-17
+
+### Changed
+
+- Make the splash screen not always on top
+
 ## [1.0.3] - 2026-07-17
 
 ### Added

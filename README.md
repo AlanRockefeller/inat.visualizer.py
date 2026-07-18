@@ -2,7 +2,7 @@
 
 # By Alan Rockefeller - July 17, 2026
 
-Current source version: **1.0.3**. See [CHANGELOG.md](CHANGELOG.md) for release
+Current source version: **1.0.4**. See [CHANGELOG.md](CHANGELOG.md) for release
 details.
 
 A desktop GUI app for exploring **seasonal patterns in iNaturalist observations** within a geographic radius. Search by organism (anything from a genus/species to higher taxa like _Agaricales_), choose a date range, and plot observation frequency by **day**, **week**, or **month** of the year.
