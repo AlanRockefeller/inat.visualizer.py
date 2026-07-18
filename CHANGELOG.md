@@ -14,6 +14,8 @@ All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
 ### Fixed
 
+- Keep Windows startup dialogs in front of the splash screen so the optional
+  database download choice cannot be hidden behind an uncloseable topmost window.
 - Prevent false update prompts after a locally generated database is copied to
   the web server by comparing file sizes instead of `Last-Modified` timestamps
   and using the observation database as the coordinated release marker.

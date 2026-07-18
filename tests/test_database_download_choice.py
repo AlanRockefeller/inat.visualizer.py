@@ -8,10 +8,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from requests.exceptions import RequestException
+from PyQt6.QtCore import Qt
 
 from visualizer import (
     DATABASE_FILE_INFO,
     INatSeasonalVisualizer,
+    SPLASH_WINDOW_FLAGS,
     available_database_updates,
     database_download_choice_message,
     missing_database_files,
@@ -19,6 +21,43 @@ from visualizer import (
 
 
 class DatabaseDownloadChoiceTests(unittest.TestCase):
+    def test_splash_is_not_a_globally_topmost_window(self) -> None:
+        self.assertFalse(SPLASH_WINDOW_FLAGS & Qt.WindowType.WindowStaysOnTopHint)
+
+    def test_startup_dialog_hides_and_then_restores_visible_splash(self) -> None:
+        splash = MagicMock()
+        splash.isVisible.return_value = True
+        window = SimpleNamespace(splash_screen=splash)
+        dialog = MagicMock()
+        dialog.exec.return_value = 42
+
+        with patch("visualizer.QApplication.processEvents") as process_events:
+            result = INatSeasonalVisualizer._exec_startup_dialog(window, dialog)
+
+        self.assertEqual(result, 42)
+        dialog.setWindowModality.assert_called_once_with(
+            Qt.WindowModality.ApplicationModal
+        )
+        splash.hide.assert_called_once_with()
+        splash.show.assert_called_once_with()
+        self.assertEqual(process_events.call_count, 2)
+
+    def test_startup_dialog_restores_splash_if_dialog_raises(self) -> None:
+        splash = MagicMock()
+        splash.isVisible.return_value = True
+        window = SimpleNamespace(splash_screen=splash)
+        dialog = MagicMock()
+        dialog.exec.side_effect = RuntimeError("dialog failed")
+
+        with (
+            patch("visualizer.QApplication.processEvents"),
+            self.assertRaisesRegex(RuntimeError, "dialog failed"),
+        ):
+            INatSeasonalVisualizer._exec_startup_dialog(window, dialog)
+
+        splash.hide.assert_called_once_with()
+        splash.show.assert_called_once_with()
+
     def test_prompt_explains_download_and_api_tradeoffs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             missing_files = missing_database_files(temp_dir)

@@ -136,6 +136,7 @@ PLACEHOLDER_DETAILS_FONT_SCALE = 0.5
 PLACEHOLDER_DETAILS_MIN_FONT_SIZE = 6.0
 LOCAL_GRAPH_ACTION_TEXT = "Graph with local data"
 LIVE_GRAPH_ACTION_TEXT = "Graph with live iNat data"
+SPLASH_WINDOW_FLAGS = Qt.WindowType.SplashScreen | Qt.WindowType.FramelessWindowHint
 DATABASE_FILE_INFO: dict[str, dict[str, Any]] = {
     "observations.parquet": {
         "url": "https://images.mushroomobserver.org/observations.parquet",
@@ -1136,12 +1137,10 @@ class CustomSplashScreen(QSplashScreen):
 
         super().__init__(scaled_pixmap)
 
-        # Window flags
-        self.setWindowFlags(
-            Qt.WindowType.SplashScreen
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.FramelessWindowHint
-        )
+        # Do not make the splash globally topmost. On Windows that can place
+        # native startup dialogs behind it and prevent the user from answering
+        # them or reaching other applications.
+        self.setWindowFlags(SPLASH_WINDOW_FLAGS)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
 
         # Center on screen
@@ -1959,8 +1958,26 @@ class INatSeasonalVisualizer(QMainWindow):
         # starting when the user presses Enter or closes the dialog.
         dialog.setDefaultButton(api_button)
         dialog.setEscapeButton(api_button)
-        dialog.exec()
+        self._exec_startup_dialog(dialog)
         return dialog.clickedButton() is download_button
+
+    def _exec_startup_dialog(self, dialog: QDialog) -> int:
+        """Run a startup dialog without allowing the splash to cover it."""
+        splash = getattr(self, "splash_screen", None)
+        restore_splash = bool(splash is not None and splash.isVisible())
+        if restore_splash:
+            splash.hide()
+            QApplication.processEvents()
+
+        try:
+            # The main window is not visible while its constructor is running,
+            # so make the choice explicitly application-modal.
+            dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+            return dialog.exec()
+        finally:
+            if restore_splash:
+                splash.show()
+                QApplication.processEvents()
 
     def prompt_for_database_update(
         self, files_to_update: list[tuple[str, dict[str, Any]]]
@@ -1986,7 +2003,7 @@ class INatSeasonalVisualizer(QMainWindow):
         )
         dialog.setDefaultButton(later_button)
         dialog.setEscapeButton(later_button)
-        dialog.exec()
+        self._exec_startup_dialog(dialog)
         return dialog.clickedButton() is update_button
 
     def check_for_database_updates(self) -> None:
