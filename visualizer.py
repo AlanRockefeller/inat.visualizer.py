@@ -126,6 +126,33 @@ def resource_path(filename: str) -> str:
 
 
 APP_DATA_DIRECTORY_NAME = "iNat Seasonal Visualizer"
+DEFAULT_THEME = "dark"
+DARK_WINDOW_BACKGROUND = "#2e2e2e"
+DARK_GRAPH_BACKGROUND = "#3e3e3e"
+LIGHT_BACKGROUND = "#ffffff"
+DATABASE_FILE_INFO: dict[str, dict[str, Any]] = {
+    "observations.parquet": {
+        "url": "http://images.mushroomobserver.org/observations.parquet",
+        "size": 1025327222,
+        "description": (
+            "iNaturalist observation dates, locations, and taxon IDs for fast "
+            "local searches"
+        ),
+    },
+    "taxonomy.parquet": {
+        "url": "http://images.mushroomobserver.org/taxonomy.parquet",
+        "size": 8697166,
+        "description": (
+            "the iNaturalist taxonomy hierarchy used to include descendants of "
+            "higher taxa"
+        ),
+    },
+}
+
+
+def normalize_theme(value: Any) -> str:
+    """Return a supported theme, defaulting clean installations to dark mode."""
+    return value if value in {"dark", "light"} else DEFAULT_THEME
 
 
 def application_data_dir(
@@ -174,6 +201,69 @@ def ensure_application_data_dir(**kwargs: Any) -> Path:
     data_dir = application_data_dir(**kwargs)
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir
+
+
+def missing_database_files(
+    working_dir: str | Path,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return database files that are not present in the runtime data directory."""
+    data_dir = Path(working_dir)
+    return [
+        (filename, info)
+        for filename, info in DATABASE_FILE_INFO.items()
+        if not (data_dir / filename).exists()
+    ]
+
+
+def database_download_choice_message(
+    files_to_download: list[tuple[str, dict[str, Any]]],
+) -> str:
+    """Explain the storage and search tradeoffs for missing database files."""
+    missing_names = {filename for filename, _info in files_to_download}
+    observations_missing = "observations.parquet" in missing_names
+    taxonomy_missing = "taxonomy.parquet" in missing_names
+
+    if observations_missing:
+        download_size = "approximately 1 GB"
+    else:
+        total_bytes = sum(int(info["size"]) for _filename, info in files_to_download)
+        download_size = f"approximately {total_bytes / (1024 * 1024):.1f} MB"
+
+    download_benefits = []
+    if observations_missing:
+        download_benefits.append(
+            "Enables fast Local Search without requesting every search from the "
+            "iNaturalist API"
+        )
+    if taxonomy_missing:
+        download_benefits.append(
+            "Includes descendant species when searching higher taxa such as "
+            "Agaricales"
+        )
+
+    if observations_missing:
+        alternative_heading = "Use iNaturalist API Only"
+        without_download = (
+            "The app will start immediately in API-only mode. Search with API "
+            "requires an internet connection and may be slower or rate-limited. "
+            "Local Search will be unavailable."
+        )
+    else:
+        alternative_heading = "Continue Without Taxonomy Download"
+        without_download = (
+            "The existing observation database will still support Local Search, "
+            "but searches for higher taxa may include only the selected parent "
+            "taxon unless descendants are already cached."
+        )
+
+    benefits_text = "\n".join(f"• {benefit}." for benefit in download_benefits)
+    return (
+        f"Download Local Database ({download_size}):\n"
+        f"{benefits_text}\n"
+        "• Uses disk space and may take several minutes to download.\n\n"
+        f"{alternative_heading}:\n"
+        f"• {without_download}"
+    )
 
 
 # --- Constants for MapDialog ---
@@ -1012,7 +1102,7 @@ class MapDialog(QDialog):
         controls_layout = QHBoxLayout()
 
         instructions = QLabel("Interactive map")
-        instructions.setStyleSheet("font-weight: bold; color: #333;")
+        instructions.setStyleSheet("font-weight: bold;")
         controls_layout.addWidget(instructions)
 
         radius_label = QLabel("Radius (km):")
@@ -1598,6 +1688,7 @@ class INatSeasonalVisualizer(QMainWindow):
         )
         self.taxonomy_file = os.path.join(self.working_dir, "taxonomy.parquet")
         self.observations_file = os.path.join(self.working_dir, "observations.parquet")
+        self.local_database_available = os.path.exists(self.observations_file)
 
         # Initialize statusBar and enhanced progress widget early for download_missing_files
         self.status_bar = QStatusBar()
@@ -1618,7 +1709,7 @@ class INatSeasonalVisualizer(QMainWindow):
         if self.splash_screen:
             self.splash_screen.update_status("Checking for missing data files...")
             QApplication.processEvents()
-        self.download_missing_files()  # Check and download missing files
+        self.download_missing_files()  # Offer local database or API-only mode.
 
         if self.splash_screen:
             self.splash_screen.update_status("Initializing application settings...")
@@ -1704,61 +1795,55 @@ class INatSeasonalVisualizer(QMainWindow):
             i += 1
         return f"{size:.2f} {units[i]}"
 
-    def download_missing_files(self) -> None:
-        """Check for missing parquet files and prompt user to download them."""
-        files_to_download = []
-        file_info = {
-            "observations.parquet": {
-                "url": "http://images.mushroomobserver.org/observations.parquet",
-                "size": 1025327222,  # 1.02 GB
-                "description": (
-                    "observations.parquet (1.02 GB): Contains iNaturalist observation data, including dates, "
-                    "locations, and taxon IDs. It enables fast, offline searches to visualize seasonal patterns "
-                    "(e.g., Agaricales observations in a region). Without it, searches rely on slower, rate-limited API calls."
-                ),
-            },
-            "taxonomy.parquet": {
-                "url": "http://images.mushroomobserver.org/taxonomy.parquet",
-                "size": 8697166,  # 8.70 MB
-                "description": (
-                    "taxonomy.parquet (8.70 MB): Contains the iNaturalist taxonomy hierarchy, mapping taxon IDs to their parents. "
-                    "It’s essential for resolving hierarchical relationships (e.g., finding all species under Agaricales). "
-                    "Without it, searches for higher-level taxa are limited to single taxon IDs."
-                ),
-            },
-        }
-
-        # Check which files are missing
-        for filename, info in file_info.items():
-            file_path = os.path.join(self.working_dir, filename)
-            if not os.path.exists(file_path):
-                files_to_download.append((filename, info))
-
-        if not files_to_download:
-            return  # All files present, no action needed
-
-        # Build message for user
-        message = "The following required files are missing and will be downloaded:\n\n"
-        for filename, info in files_to_download:
-            message += f"- {info['description']}\n\n"
-        message += "Do you want to download these files now? Select 'Cancel' to exit the application."
-
-        # Show dialog with Download and Cancel options
-        dialog = QMessageBox()
-        dialog.setWindowTitle("Missing Files")
-        dialog.setText(message)
-        dialog.setStandardButtons(
-            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel
+    def prompt_for_database_download(
+        self, files_to_download: list[tuple[str, dict[str, Any]]]
+    ) -> bool:
+        """Return whether the user chose to download the optional local database."""
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setWindowTitle("Choose How to Search")
+        dialog.setText("The local iNaturalist database is optional.")
+        dialog.setInformativeText(database_download_choice_message(files_to_download))
+        file_details = "\n".join(
+            f"{filename}: {info['description']}"
+            for filename, info in files_to_download
         )
-        dialog.setDefaultButton(QMessageBox.StandardButton.Ok)
-        _ok_btn = dialog.button(QMessageBox.StandardButton.Ok)
-        if _ok_btn is not None:
-            _ok_btn.setText("Download")
-        result = dialog.exec()
+        dialog.setDetailedText(f"Missing files:\n{file_details}")
 
-        if result == QMessageBox.StandardButton.Cancel:
-            logging.info("User canceled file download. Exiting application.")
-            sys.exit(0)
+        download_button = dialog.addButton(
+            "Download Local Database", QMessageBox.ButtonRole.AcceptRole
+        )
+        observations_missing = any(
+            filename == "observations.parquet"
+            for filename, _info in files_to_download
+        )
+        alternative_label = (
+            "Use iNaturalist API Only"
+            if observations_missing
+            else "Continue Without Taxonomy Download"
+        )
+        api_button = dialog.addButton(
+            alternative_label, QMessageBox.ButtonRole.ActionRole
+        )
+        # A large download should require an intentional choice rather than
+        # starting when the user presses Enter or closes the dialog.
+        dialog.setDefaultButton(api_button)
+        dialog.setEscapeButton(api_button)
+        dialog.exec()
+        return dialog.clickedButton() is download_button
+
+    def download_missing_files(self) -> None:
+        """Offer to download missing local data without making it mandatory."""
+        files_to_download = missing_database_files(self.working_dir)
+        self.local_database_available = os.path.exists(self.observations_file)
+        if not files_to_download:
+            return
+
+        if not self.prompt_for_database_download(files_to_download):
+            logging.info(
+                "User chose to continue without downloading missing local database files."
+            )
+            return
 
         # Download each missing file
         for filename, info in files_to_download:
@@ -1817,17 +1902,23 @@ class INatSeasonalVisualizer(QMainWindow):
                 except OSError:
                     pass
                 self.enhanced_progress.hide_progress()
-                QMessageBox.critical(
+                QMessageBox.warning(
                     self,
                     "Download Error",
                     f"Failed to download {filename}: {e!s}\n\n"
-                    f"Please manually download it from {url} and place it in {self.working_dir}, "
-                    "or ensure your internet connection is stable and try again.",
+                    "The app will continue without this file. You can use Search "
+                    "with API, or restart later to try the download again.\n\n"
+                    f"You can also manually download it from {url} and place it "
+                    f"in {self.working_dir}.",
                 )
-                sys.exit(1)
+                # A network failure is likely to affect the remaining file too;
+                # avoid showing the user the same error twice.
+                break
 
             finally:
                 QApplication.processEvents()
+
+        self.local_database_available = os.path.exists(self.observations_file)
 
     def init_args(
         self, lat: float | None, lon: float | None, radius: float | None
@@ -1953,7 +2044,7 @@ class INatSeasonalVisualizer(QMainWindow):
         self.radius_input = QLineEdit(str(self.default_radius))
         self.organism_input = QLineEdit()
         self.organism_input.setPlaceholderText("e.g., Boletus")
-        self.organism_input.returnPressed.connect(self.local_search)
+        self.organism_input.returnPressed.connect(self.run_preferred_search)
         self.exclude_input = QLineEdit()
         self.exclude_input.setPlaceholderText("e.g., Boletus regineus")
         self.date_from = QLineEdit("2000-01-01")
@@ -1988,14 +2079,33 @@ class INatSeasonalVisualizer(QMainWindow):
         self.sidebar_layout.addRow("Graph Color:", self.color_input)
         self.sidebar_layout.addRow("Graph BG Color:", self.bg_color_input)
 
+        search_mode_text = (
+            "Local database and iNaturalist API"
+            if self.local_database_available
+            else "iNaturalist API only (local database not installed)"
+        )
+        self.search_mode_label = QLabel(search_mode_text)
+        self.search_mode_label.setWordWrap(True)
+        self.sidebar_layout.addRow("Search Mode:", self.search_mode_label)
+
         # Local Search button
         self.local_search_button = QPushButton("Local Search")
         self.local_search_button.clicked.connect(self.local_search)
+        if not self.local_database_available:
+            self.local_search_button.setText("Local Search (Database Not Installed)")
+            self.local_search_button.setEnabled(False)
+            self.local_search_button.setToolTip(
+                "Download observations.parquet to enable fast local searches. "
+                "Use Search with API in the meantime."
+            )
         self.sidebar_layout.addWidget(self.local_search_button)
 
         # Search with API button
         self.search_button = QPushButton("Search with API")
         self.search_button.clicked.connect(self.search_observations)
+        self.search_button.setToolTip(
+            "Search online using the iNaturalist API; an internet connection is required."
+        )
         self.sidebar_layout.addWidget(self.search_button)
 
         # Fetch Taxon IDs button
@@ -2070,6 +2180,13 @@ class INatSeasonalVisualizer(QMainWindow):
         # Apply initial theme
         self.apply_stylesheet()
 
+    def run_preferred_search(self) -> None:
+        """Run a local search when available, otherwise use the online API."""
+        if self.local_database_available:
+            self.local_search()
+        else:
+            self.search_observations()
+
     def parse_coordinate_input(self, text: str) -> None:
         """Parse coordinate string (e.g. 'lat, lon') and update inputs."""
         if "," in text:
@@ -2127,7 +2244,9 @@ class INatSeasonalVisualizer(QMainWindow):
         theme_action = QAction("Toggle Dark/Light Mode", self)
         theme_action.triggered.connect(
             lambda: self.toggle_theme(
-                "dark" if self.settings.value("theme", "light") == "light" else "light"
+                "light"
+                if normalize_theme(self.settings.value("theme", DEFAULT_THEME)) == "dark"
+                else "dark"
             )
         )
         edit_menu.addAction(theme_action)
@@ -2226,73 +2345,67 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def apply_stylesheet(self) -> None:
         """Apply the application stylesheet based on current theme and font settings."""
-        mode = self.settings.value("theme", "light")
+        mode = normalize_theme(self.settings.value("theme", DEFAULT_THEME))
         font_size_pt = int(self.app_font_size * self.scale_factor)
         font_stylesheet = f"font-size: {font_size_pt}pt;"
 
         custom_bg_color = self.settings.value("graph_bg_color")
         custom_window_bg = self.settings.value("window_bg_color")
-        effective_bg_hex = (
-            custom_window_bg
-            if custom_window_bg
-            else ("#ffffff" if mode == "light" else "#2e2e2e")
+        window_bg_color = custom_window_bg or (
+            DARK_WINDOW_BACKGROUND if mode == "dark" else LIGHT_BACKGROUND
         )
-        contrasting_color = self.get_contrasting_text_color(effective_bg_hex)
+        graph_bg_color = custom_bg_color or (
+            DARK_GRAPH_BACKGROUND if mode == "dark" else LIGHT_BACKGROUND
+        )
+        window_text_color = self.get_contrasting_text_color(window_bg_color)
+        graph_text_color = self.get_contrasting_text_color(graph_bg_color)
 
         if mode == "dark":
             # UI dark mode
-            bg_color = custom_window_bg if custom_window_bg else "#2e2e2e"
             self.setStyleSheet(
                 font_stylesheet
-                + f"background-color: {bg_color}; color: {contrasting_color};"
+                + f"background-color: {window_bg_color}; color: {window_text_color};"
             )
             self.central_widget.setStyleSheet(
-                "QLineEdit, QComboBox, QPushButton, QListWidget, QProgressBar, QLabel { background-color: #3e3e3e; color: #ffffff; }"
+                "QLineEdit, QComboBox, QPushButton, QListWidget, QProgressBar, "
+                "QLabel { background-color: #3e3e3e; color: #ffffff; }"
             )
-            # Graph dark mode
-            if (
-                getattr(self, "canvas", None)
-                and getattr(self, "figure", None)
-                and getattr(self, "ax", None)
-            ):
-                graph_contrasting_color = self.get_contrasting_text_color(
-                    effective_bg_hex
-                )
-                self.figure.set_facecolor(bg_color)
-                self.ax.set_facecolor(custom_bg_color if custom_bg_color else "#3e3e3e")
-                self.ax.tick_params(colors=graph_contrasting_color)
-                self.ax.xaxis.label.set_color(graph_contrasting_color)
-                self.ax.yaxis.label.set_color(graph_contrasting_color)
-                self.ax.title.set_color(graph_contrasting_color)
-                for spine in self.ax.spines.values():
-                    spine.set_color(graph_contrasting_color)
         else:
             # UI light mode
-            bg_color = custom_window_bg if custom_window_bg else "#ffffff"
             self.setStyleSheet(
                 font_stylesheet
-                + f"background-color: {bg_color}; color: {contrasting_color};"
+                + f"background-color: {window_bg_color}; color: {window_text_color};"
             )
             self.central_widget.setStyleSheet(
-                "QLineEdit, QComboBox, QPushButton, QListWidget, QProgressBar, QLabel { background-color: #ffffff; color: #000000; }"
+                "QLineEdit, QComboBox, QPushButton, QListWidget, QProgressBar, "
+                "QLabel { background-color: #ffffff; color: #000000; }"
             )
-            # Graph light mode
-            if (
-                getattr(self, "canvas", None)
-                and getattr(self, "figure", None)
-                and getattr(self, "ax", None)
-            ):
-                graph_contrasting_color = self.get_contrasting_text_color(
-                    effective_bg_hex
-                )
-                self.figure.set_facecolor(bg_color)
-                self.ax.set_facecolor(custom_bg_color if custom_bg_color else "white")
-                self.ax.tick_params(colors=graph_contrasting_color)
-                self.ax.xaxis.label.set_color(graph_contrasting_color)
-                self.ax.yaxis.label.set_color(graph_contrasting_color)
-                self.ax.title.set_color(graph_contrasting_color)
-                for spine in self.ax.spines.values():
-                    spine.set_color(graph_contrasting_color)
+
+        if (
+            getattr(self, "canvas", None)
+            and getattr(self, "figure", None)
+            and getattr(self, "ax", None)
+        ):
+            self.figure.set_facecolor(window_bg_color)
+            self.ax.set_facecolor(graph_bg_color)
+            self.ax.tick_params(colors=graph_text_color)
+            self.ax.xaxis.label.set_color(graph_text_color)
+            self.ax.yaxis.label.set_color(graph_text_color)
+            self.ax.title.set_color(graph_text_color)
+            for spine in self.ax.spines.values():
+                spine.set_color(graph_text_color)
+
+            # Placeholder and annotation text is not covered by axis label
+            # properties. Recolor existing artists when the user changes theme.
+            for text_artist in self.ax.texts:
+                text_artist.set_color(graph_text_color)
+
+            legend = self.ax.get_legend()
+            if legend is not None:
+                legend.get_frame().set_facecolor(graph_bg_color)
+                legend.get_frame().set_edgecolor(graph_text_color)
+                for legend_text in legend.get_texts():
+                    legend_text.set_color(graph_text_color)
 
         _canvas = getattr(self, "canvas", None)
         if _canvas is not None and getattr(self, "figure", None):
@@ -2317,7 +2430,10 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def choose_bg_color(self) -> None:
         """Open a color dialog to choose the graph background color."""
-        current_color_hex = self.settings.value("graph_bg_color", "#ffffff")
+        mode = normalize_theme(self.settings.value("theme", DEFAULT_THEME))
+        current_color_hex = self.settings.value("graph_bg_color") or (
+            DARK_GRAPH_BACKGROUND if mode == "dark" else LIGHT_BACKGROUND
+        )
         color = QColorDialog.getColor(
             QColor(current_color_hex), self, "Choose Graph Background Color"
         )
@@ -2331,7 +2447,10 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def choose_window_bg_color(self) -> None:
         """Open a color dialog to choose the main window background color."""
-        current_color_hex = self.settings.value("window_bg_color", "#ffffff")
+        mode = normalize_theme(self.settings.value("theme", DEFAULT_THEME))
+        current_color_hex = self.settings.value("window_bg_color") or (
+            DARK_WINDOW_BACKGROUND if mode == "dark" else LIGHT_BACKGROUND
+        )
         color = QColorDialog.getColor(
             QColor(current_color_hex), self, "Choose Window Background Color"
         )
@@ -3101,9 +3220,11 @@ class INatSeasonalVisualizer(QMainWindow):
                 taxon_id = self.get_taxon_id(organism)
                 if taxon_id:
                     params["taxon_id"] = taxon_id
-                    # Resolve descendants too, for the info-bar count and parity
-                    # with local search (cached, so this is cheap after the first).
-                    self.get_descendant_taxon_ids(organism, taxon_id)
+                    # The API expands ancestor IDs server-side, so an optional
+                    # local taxonomy file must never be required for API mode.
+                    # When present, resolve it only to enrich the info-bar count.
+                    if os.path.exists(self.taxonomy_file):
+                        self.get_descendant_taxon_ids(organism, taxon_id)
                 else:
                     QMessageBox.warning(
                         self,
@@ -3283,10 +3404,12 @@ class INatSeasonalVisualizer(QMainWindow):
             export_ax.set_title(f"Seasonal Observations for {organism} ({source})")
 
             # Apply theme to export graph
-            current_theme = self.settings.value("theme", "light")
+            current_theme = normalize_theme(
+                self.settings.value("theme", DEFAULT_THEME)
+            )
             if current_theme == "dark":
-                export_fig.set_facecolor("#2e2e2e")
-                export_ax.set_facecolor("#3e3e3e")
+                export_fig.set_facecolor(DARK_WINDOW_BACKGROUND)
+                export_ax.set_facecolor(DARK_GRAPH_BACKGROUND)
                 export_ax.tick_params(colors="white")
                 export_ax.xaxis.label.set_color("white")
                 export_ax.yaxis.label.set_color("white")
@@ -3429,14 +3552,16 @@ class INatSeasonalVisualizer(QMainWindow):
         """Show a placeholder message on the graph."""
         if self.canvas:
             # Determine text color based on background luminance for visibility
-            current_theme = self.settings.value("theme", "light")
-            custom_window_bg = self.settings.value("window_bg_color")
-            effective_bg_hex = (
-                custom_window_bg
-                if custom_window_bg
-                else ("#ffffff" if current_theme == "light" else "#2e2e2e")
+            current_theme = normalize_theme(
+                self.settings.value("theme", DEFAULT_THEME)
             )
-            text_color = self.get_contrasting_text_color(effective_bg_hex)
+            custom_graph_bg = self.settings.value("graph_bg_color")
+            graph_bg_color = custom_graph_bg or (
+                DARK_GRAPH_BACKGROUND
+                if current_theme == "dark"
+                else LIGHT_BACKGROUND
+            )
+            text_color = self.get_contrasting_text_color(graph_bg_color)
 
             self.ax.clear()
             if message:
@@ -3466,11 +3591,23 @@ class INatSeasonalVisualizer(QMainWindow):
                     f"  - Window Background Color: {window_bg_color}\n\n"
                 )
 
+                if self.local_database_available:
+                    search_instructions = (
+                        "2. Click 'Local Search' to use local data or "
+                        "'Search with API' for online data.\n\n"
+                    )
+                else:
+                    search_instructions = (
+                        "2. Click 'Search with API'. The optional local database "
+                        "is not installed, so Local Search is unavailable.\n\n"
+                    )
+
                 display_message = (
                     "Welcome to iNaturalist Seasonal Visualizer!\n\n"
-                    + "To get started:\n"
-                    "1. Enter an organism name (e.g., Russula brevipes, Agaricales, etc).\n"
-                    "2. Click 'Local Search' to use local data or 'Search with API' for online data.\n\n"
+                    "To get started:\n"
+                    "1. Enter an organism name (e.g., Russula brevipes, "
+                    "Agaricales, etc).\n"
+                    + search_instructions
                     + "The graph will display seasonal observation patterns.\n\n"
                     + settings_text
                 )
@@ -3505,8 +3642,12 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def update_status_bar(self, observation_count: int = 0) -> None:
         """Update the status bar with current info."""
+        search_mode = (
+            "Local DB available" if self.local_database_available else "API-only mode"
+        )
         self.status_bar.showMessage(
-            f"Ready | Observations: {observation_count} | API Calls: {self.api_call_count}"
+            f"Ready | {search_mode} | Observations: {observation_count} | "
+            f"API Calls: {self.api_call_count}"
         )
 
     def get_contrasting_text_color(
@@ -3525,7 +3666,9 @@ class INatSeasonalVisualizer(QMainWindow):
             return dark_fallback if luminance > 128 else light_fallback
         except Exception:
             # Fallback if the color string is invalid
-            current_theme = self.settings.value("theme", "light")
+            current_theme = normalize_theme(
+                self.settings.value("theme", DEFAULT_THEME)
+            )
             return dark_fallback if current_theme == "light" else light_fallback
 
 

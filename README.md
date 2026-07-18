@@ -31,7 +31,7 @@ It also includes an **interactive map dialog** (OpenStreetMap tiles) to set coor
   - API pagination and rate limiting feedback
   - Local query “estimate” + completion messaging
 - **Theme and appearance controls**
-  - Light/dark mode toggle
+  - Dark mode by default, with a persistent light/dark mode toggle
   - Graph color, graph background color, window background color
   - Adjustable app font and graph font sizes (saved via QSettings)
 - **Export**
@@ -62,6 +62,21 @@ The easiest way to get started — no Python required. Grab the latest build fro
 On first launch the app offers to download the required data files
 (`observations.parquet` ~1 GB and `taxonomy.parquet`) into its per-user application
 data directory.
+
+### Creating a release
+
+After updating `inat_visualizer_version.py` and `CHANGELOG.md`, commit and push
+`main`, then run:
+
+```bash
+./build-release.sh
+```
+
+The script reads the version from the codebase, validates that local `main`
+matches `origin/main`, and pushes the matching version tag. That tag triggers
+the GitHub workflow that builds, smoke-tests, and publishes every platform
+artifact. Use `./build-release.sh --dry-run` to perform the checks without
+creating a tag.
 
 ---
 
@@ -107,14 +122,26 @@ pip install -r requirements.txt
 
 ---
 
-## Data files (required for Local Search and taxonomy expansion)
+## Data files (optional; enables Local Search and taxonomy expansion)
 
 The application uses two Parquet files in its runtime data directory:
 
 - `observations.parquet` (~1.02 GB)
 - `taxonomy.parquet` (~8.7 MB)
 
-If either is missing at startup, the app will prompt to download it automatically.
+If either is missing at startup, the app offers two choices:
+
+- **Download Local Database:** uses approximately 1 GB of disk space and enables
+  faster local observation searches. The taxonomy file also expands higher taxa
+  such as orders and families to their descendant species.
+- **Use iNaturalist API Only:** starts immediately without the large download.
+  Searches require an internet connection and may be slower or rate-limited.
+  Local Search remains disabled until `observations.parquet` is installed.
+
+If `observations.parquet` is already installed and only the much smaller taxonomy
+file is missing, Local Search remains available; higher-taxon expansion may be
+limited until the taxonomy file is downloaded.
+
 Packaged apps store mutable files in these writable per-user locations:
 
 - **macOS:** `~/Library/Application Support/iNat Seasonal Visualizer/`
@@ -192,8 +219,8 @@ Logs go to:
 5. Choose view: **Daily / Weekly / Monthly**
 
 6. Click:
-   - **Local Search** (fast, recommended)
-   - **Search with API** (online, rate-limited)
+   - **Local Search** (fast, when the optional database is installed)
+   - **Search with API** (online, rate-limited, and available without local data)
 
 ---
 
