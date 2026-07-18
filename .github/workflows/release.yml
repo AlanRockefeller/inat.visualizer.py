@@ -23,7 +23,7 @@ jobs:
         include:
           - os: windows-latest
             artifact_name: iNat-Seasonal-Visualizer-Windows
-            asset_glob: dist/iNat-Seasonal-Visualizer.exe
+            asset_glob: dist/iNat-Seasonal-Visualizer-Windows.zip
           - os: macos-14
             artifact_name: iNat-Seasonal-Visualizer-macOS-Apple-Silicon
             asset_glob: dist/iNat-Seasonal-Visualizer-macOS-Apple-Silicon.zip
@@ -88,7 +88,7 @@ jobs:
           fi
           pyinstaller --noconfirm --clean \
             --name "iNat-Seasonal-Visualizer" \
-            --onefile --windowed \
+            --onedir --windowed \
             --add-data "splash_screen.jpg${{ runner.os == 'Windows' && ';' || ':' }}." \
             --collect-all pyinaturalist \
             --collect-submodules duckdb \
@@ -123,10 +123,17 @@ jobs:
             echo "$file_output" | grep -q "${{ matrix.expected_arch }}"
             "$executable" --smoke-test
           elif [ "$RUNNER_OS" = "Windows" ]; then
-            ./dist/iNat-Seasonal-Visualizer.exe --smoke-test
+            ./dist/iNat-Seasonal-Visualizer/iNat-Seasonal-Visualizer.exe --smoke-test
           else
-            ./dist/iNat-Seasonal-Visualizer --smoke-test
+            ./dist/iNat-Seasonal-Visualizer/iNat-Seasonal-Visualizer --smoke-test
           fi
+
+      - name: Package Windows app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >-
+          Compress-Archive -Path "dist/iNat-Seasonal-Visualizer"
+          -DestinationPath "dist/iNat-Seasonal-Visualizer-Windows.zip"
 
       - name: Package macOS app
         if: runner.os == 'macOS'
@@ -134,11 +141,7 @@ jobs:
           cd dist
           archive_name="${{ matrix.archive_name }}"
           # ditto preserves the app bundle metadata and executable permissions.
-          if [ -d "iNat-Seasonal-Visualizer.app" ]; then
-            ditto -c -k --keepParent "iNat-Seasonal-Visualizer.app" "$archive_name"
-          else
-            zip -j "$archive_name" "iNat-Seasonal-Visualizer"
-          fi
+          ditto -c -k --keepParent "iNat-Seasonal-Visualizer.app" "$archive_name"
 
       - name: Package Linux binary
         if: runner.os == 'Linux'

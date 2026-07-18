@@ -64,6 +64,7 @@ class MainScreenLayoutTests(unittest.TestCase):
             local_database_available=True,
             total_observations=100,
             unique_taxa=20,
+            most_recent_date="2025-12-31",
             info_bar=MagicMock(),
             update_status_bar=MagicMock(),
             get_contrasting_text_color=MagicMock(return_value="white"),
@@ -78,6 +79,7 @@ class MainScreenLayoutTests(unittest.TestCase):
         self.assertIn("Graph with live iNat data", welcome_text.get_text())
         self.assertTrue(detail_text.get_text().startswith("Current Settings:"))
         self.assertIn("Local Database Stats:", detail_text.get_text())
+        self.assertIn("  - Most Recent Observation: 2025-12-31", detail_text.get_text())
         self.assertEqual(welcome_text.get_fontsize(), 12)
         self.assertEqual(detail_text.get_fontsize(), 6)
 

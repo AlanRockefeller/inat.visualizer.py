@@ -2,7 +2,7 @@
 
 # By Alan Rockefeller - July 17, 2026
 
-Current source version: **1.0.5**. See [CHANGELOG.md](CHANGELOG.md) for release
+Current source version: **1.0.6**. See [CHANGELOG.md](CHANGELOG.md) for release
 details.
 
 A desktop GUI app for exploring **seasonal patterns in iNaturalist observations** within a geographic radius. Search by organism (anything from a genus/species to higher taxa like _Agaricales_), choose a date range, and plot observation frequency by **day**, **week**, or **month** of the year.
@@ -218,7 +218,12 @@ Flags:
 - `--lon` Longitude (default comes from saved settings)
 - `--radius` Radius in km (default comes from saved settings)
 - `--scale-factor` Manual UI scale multiplier (useful for 4K/HiDPI)
+- `--http-cache-max-mb` API response cache budget in MB (default: `128`)
 - `--debug` Enable debug logging + extra console prints
+
+The cache budget can also be set with the
+`INAT_VISUALIZER_HTTP_CACHE_MAX_MB` environment variable. The command-line
+option takes precedence.
 
 Logs go to:
 
@@ -243,7 +248,8 @@ Logs go to:
 
 4. **Pick a date range**
    - Default `Date From`: `2000-01-01`
-   - Default `Date To`: auto-filled from the most recent date in `observations.parquet` (if available)
+   - Default `Date To`: today's date. Local searches naturally stop at the end
+     of the installed snapshot, while live searches can include newer data.
 
 5. Choose view: **Daily / Weekly / Monthly**
 
@@ -275,6 +281,19 @@ Agaricales: 117159, 48723, 12345
 ```
 
 If present, it can be used as a fallback when descendant expansion via `taxonomy.parquet` fails.
+
+---
+
+## API response caching
+
+Live iNaturalist responses are cached in `inat_api_cache.db` inside the runtime
+data directory. Expired responses are removed automatically. The cache has a
+default `128 MB` disk budget; if valid responses alone exceed that budget, the
+app clears the response cache and continues normally.
+
+Older versions used pyinaturalist's shared default cache. If that legacy cache
+is oversized, the app removes its expired responses and reclaims the unused
+SQLite space without deleting valid entries.
 
 ---
 
@@ -332,6 +351,8 @@ directory:
 
 - `inat_visualizer.log` (log file)
 - `taxon_cache.json` (API/taxon cache)
+- `inat_api_cache.db` (bounded live API response cache)
+- `database_stats.json` (cached counts for the installed observation snapshot)
 - `descendant_taxons.txt` (optional manual descendant list)
 - `tile_cache/` (map tile disk cache)
 - `observations.parquet` + `taxonomy.parquet` (large; size varies by snapshot)

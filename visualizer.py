@@ -4,6 +4,7 @@
 # On Linux, Qt also needs the system libraries: libxcb-cursor0 libxkbcommon-x11-0
 
 import os
+import sqlite3
 import sys
 
 # On Linux, route Qt through XWayland to avoid Wayland protocol crashes.
@@ -31,6 +32,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from inat_visualizer_version import __version__
+from startup_config import APP_DATA_DIRECTORY_NAME
 
 # --- third-party ---
 import duckdb
@@ -89,6 +91,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from requests.exceptions import HTTPError, RequestException
+from pyinaturalist.session import CACHE_FILE as PYINATURALIST_DEFAULT_CACHE_FILE
 
 
 # Configure pyinaturalist with User-Agent
@@ -120,14 +123,15 @@ def resource_path(filename: str) -> str:
     if meipass:
         candidates.append(os.path.join(meipass, filename))
     candidates.append(os.path.join(os.getcwd(), filename))
-    candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), filename))
+    candidates.append(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    )
     for path in candidates:
         if os.path.exists(path):
             return path
     return candidates[0]
 
 
-APP_DATA_DIRECTORY_NAME = "iNat Seasonal Visualizer"
 DEFAULT_THEME = "dark"
 DARK_WINDOW_BACKGROUND = "#2e2e2e"
 DARK_GRAPH_BACKGROUND = "#3e3e3e"
@@ -157,6 +161,162 @@ DATABASE_FILE_INFO: dict[str, dict[str, Any]] = {
 }
 LOG_MAX_BYTES = 2 * 1024 * 1024
 LOG_BACKUP_COUNT = 2
+HTTP_CACHE_FILE_NAME = "inat_api_cache.db"
+DATABASE_STATS_CACHE_FILE_NAME = "database_stats.json"
+DATABASE_STATS_CACHE_VERSION = 1
+DEFAULT_HTTP_CACHE_MAX_MB = 128
+MIN_HTTP_CACHE_MAX_MB = 16
+HTTP_CACHE_MAX_MB_ENV = "INAT_VISUALIZER_HTTP_CACHE_MAX_MB"
+
+
+def configured_http_cache_max_bytes(
+    max_size_mb: int | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    """Resolve the HTTP cache budget from an argument or environment variable."""
+    environment = os.environ if environ is None else environ
+    raw_value: Any = (
+        max_size_mb
+        if max_size_mb is not None
+        else environment.get(HTTP_CACHE_MAX_MB_ENV, DEFAULT_HTTP_CACHE_MAX_MB)
+    )
+    try:
+        resolved_mb = int(raw_value)
+    except (TypeError, ValueError):
+        logging.warning(
+            "Invalid %s=%r; using the %d MB default.",
+            HTTP_CACHE_MAX_MB_ENV,
+            raw_value,
+            DEFAULT_HTTP_CACHE_MAX_MB,
+        )
+        resolved_mb = DEFAULT_HTTP_CACHE_MAX_MB
+    if resolved_mb < MIN_HTTP_CACHE_MAX_MB:
+        logging.warning(
+            "HTTP cache limit %d MB is too small; using the %d MB minimum.",
+            resolved_mb,
+            MIN_HTTP_CACHE_MAX_MB,
+        )
+        resolved_mb = MIN_HTTP_CACHE_MAX_MB
+    return resolved_mb * 1024 * 1024
+
+
+def sqlite_cache_disk_usage(cache_path: str | Path) -> int:
+    """Return SQLite database usage including WAL and shared-memory sidecars."""
+    path = Path(cache_path)
+    total = 0
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            total += candidate.stat().st_size
+        except FileNotFoundError:
+            pass
+    return total
+
+
+def vacuum_http_cache(cache, cache_path: str | Path) -> None:
+    """Close pooled cache connections, checkpoint WAL, and reclaim free pages."""
+    path = Path(cache_path)
+    cache.responses.close()
+    cache.redirects.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        connection.execute("VACUUM")
+
+
+def maintain_http_cache(
+    request_session,
+    cache_path: str | Path,
+    max_size_bytes: int,
+    *,
+    clear_valid_if_oversize: bool = True,
+) -> None:
+    """Remove expired responses and keep a requests-cache SQLite file bounded.
+
+    Expired rows are deleted on every maintenance pass. SQLite is vacuumed only
+    when the physical file exceeds the budget. If valid responses alone still
+    exceed the budget, an app-owned cache is cleared; legacy shared caches keep
+    their valid entries.
+    """
+    path = Path(cache_path)
+    if str(cache_path) == ":memory:" or not path.exists():
+        return
+
+    try:
+        cache = request_session.cache
+        entries_before = len(cache.responses)
+        size_before = sqlite_cache_disk_usage(path)
+        cache.delete(expired=True, vacuum=False)
+        entries_after = len(cache.responses)
+        expired_removed = max(0, entries_before - entries_after)
+        vacuumed = False
+        cleared = False
+
+        if sqlite_cache_disk_usage(path) > max_size_bytes:
+            # requests-cache keeps separate pooled connections for its tables.
+            # Close both before VACUUM so SQLite can actually truncate the file.
+            vacuum_http_cache(cache, path)
+            vacuumed = True
+
+        if sqlite_cache_disk_usage(path) > max_size_bytes and clear_valid_if_oversize:
+            cache.clear()
+            vacuum_http_cache(cache, path)
+            cleared = True
+
+        size_after = sqlite_cache_disk_usage(path)
+        if expired_removed or vacuumed or cleared:
+            logging.info(
+                "HTTP cache maintenance: expired=%d, cleared=%s, size=%.1f->%.1f MB, path=%s",
+                expired_removed,
+                cleared,
+                size_before / (1024 * 1024),
+                size_after / (1024 * 1024),
+                path,
+            )
+        if size_after > max_size_bytes:
+            logging.warning(
+                "HTTP cache remains above its %.1f MB budget (size=%.1f MB, path=%s).",
+                max_size_bytes / (1024 * 1024),
+                size_after / (1024 * 1024),
+                path,
+            )
+    except Exception as error:
+        logging.warning("Could not maintain HTTP cache %s: %s", path, error)
+
+
+def maintain_legacy_pyinaturalist_cache(
+    app_cache_path: str | Path, max_size_bytes: int
+) -> None:
+    """Reclaim expired data from pyinaturalist's former shared default cache."""
+    legacy_path = Path(PYINATURALIST_DEFAULT_CACHE_FILE)
+    app_path = Path(app_cache_path)
+    try:
+        if (
+            legacy_path.resolve() == app_path.resolve()
+            or not legacy_path.exists()
+            or sqlite_cache_disk_usage(legacy_path) <= max_size_bytes
+        ):
+            return
+    except OSError as error:
+        logging.warning(
+            "Could not inspect legacy HTTP cache %s: %s", legacy_path, error
+        )
+        return
+
+    session = None
+    try:
+        session = pyinaturalist.ClientSession(
+            cache_file=str(legacy_path), max_retries=0, timeout=10
+        )
+        maintain_http_cache(
+            session,
+            legacy_path,
+            max_size_bytes,
+            clear_valid_if_oversize=False,
+        )
+    except Exception as error:
+        logging.warning("Could not open legacy HTTP cache %s: %s", legacy_path, error)
+    finally:
+        if session is not None:
+            session.close()
 
 
 def normalize_theme(value: Any) -> str:
@@ -179,9 +339,7 @@ def application_data_dir(
     location. Source runs retain the historical current-directory behavior.
     Optional arguments make the platform selection deterministic in tests.
     """
-    is_frozen = (
-        bool(getattr(sys, "frozen", False)) if frozen is None else bool(frozen)
-    )
+    is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else bool(frozen)
     if not is_frozen:
         return Path.cwd() if current_dir is None else Path(current_dir)
 
@@ -194,9 +352,7 @@ def application_data_dir(
     elif target_platform.startswith("win"):
         configured_dir = environment.get("LOCALAPPDATA") or environment.get("APPDATA")
         base_dir = (
-            Path(configured_dir)
-            if configured_dir
-            else home / "AppData" / "Local"
+            Path(configured_dir) if configured_dir else home / "AppData" / "Local"
         )
     else:
         configured_dir = environment.get("XDG_DATA_HOME")
@@ -210,6 +366,71 @@ def ensure_application_data_dir(**kwargs: Any) -> Path:
     data_dir = application_data_dir(**kwargs)
     data_dir.mkdir(parents=True, exist_ok=True)
     return data_dir
+
+
+def database_file_signature(database_path: str | Path) -> dict[str, int]:
+    """Return inexpensive fields that change whenever the database changes."""
+    stat = Path(database_path).stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def read_database_stats_cache(
+    cache_path: str | Path,
+    database_path: str | Path,
+) -> tuple[int, int | str] | None:
+    """Return cached database counts when they match the installed snapshot."""
+    try:
+        with open(cache_path, encoding="utf-8") as cache_file:
+            cached = json.load(cache_file)
+        if not isinstance(cached, dict):
+            return None
+        if cached.get("version") != DATABASE_STATS_CACHE_VERSION:
+            return None
+        if cached.get("database") != database_file_signature(database_path):
+            return None
+        total_observations = cached.get("total_observations")
+        unique_taxa = cached.get("unique_taxa")
+        if not isinstance(total_observations, int) or isinstance(
+            total_observations, bool
+        ):
+            return None
+        if not (
+            isinstance(unique_taxa, int)
+            and not isinstance(unique_taxa, bool)
+            or unique_taxa == "N/A"
+        ):
+            return None
+        return total_observations, unique_taxa
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def write_database_stats_cache(
+    cache_path: str | Path,
+    database_path: str | Path,
+    total_observations: int,
+    unique_taxa: int | str,
+) -> None:
+    """Atomically persist database counts for reuse on subsequent launches."""
+    path = Path(cache_path)
+    temp_path = path.with_name(f"{path.name}.part")
+    try:
+        payload = {
+            "version": DATABASE_STATS_CACHE_VERSION,
+            "database": database_file_signature(database_path),
+            "total_observations": total_observations,
+            "unique_taxa": unique_taxa,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(temp_path, "w", encoding="utf-8") as cache_file:
+            json.dump(payload, cache_file, indent=2)
+        os.replace(temp_path, path)
+    except OSError as error:
+        logging.warning("Could not save database statistics cache %s: %s", path, error)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def missing_database_files(
@@ -226,6 +447,7 @@ def missing_database_files(
 
 def available_database_updates(
     working_dir: str | Path,
+    cancel_callback=None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Return changed files from a differently sized hosted database release.
 
@@ -234,14 +456,18 @@ def available_database_updates(
     asked about the optional database.
     """
     data_dir = Path(working_dir)
-    if not (data_dir / "observations.parquet").exists():
+    if not (data_dir / "observations.parquet").exists() or (
+        cancel_callback is not None and cancel_callback()
+    ):
         return []
 
     def differently_sized_remote_file(
         filename: str, configured_info: dict[str, Any]
     ) -> tuple[str, dict[str, Any]] | None:
         local_path = data_dir / filename
-        if not local_path.exists():
+        if not local_path.exists() or (
+            cancel_callback is not None and cancel_callback()
+        ):
             return None
 
         local_stat = local_path.stat()
@@ -252,6 +478,8 @@ def available_database_updates(
                 allow_redirects=True,
                 timeout=5,
             )
+            if cancel_callback is not None and cancel_callback():
+                return None
             if response.status_code == 304:
                 return None
             response.raise_for_status()
@@ -319,8 +547,7 @@ def database_download_choice_message(
         )
     if taxonomy_missing:
         download_benefits.append(
-            "Includes descendant species when searching higher taxa such as "
-            "Agaricales"
+            "Includes descendant species when searching higher taxa such as Agaricales"
         )
 
     if observations_missing:
@@ -440,12 +667,16 @@ def should_post_observation_search(params: dict[str, Any]) -> bool:
 
 
 def fetch_observations_page(
-    params: dict[str, Any], force_post: bool = False
+    params: dict[str, Any], force_post: bool = False, request_session=None
 ) -> dict[str, Any]:
     """Fetch one page of observations, switching to POST for oversized taxon filters."""
     if force_post or should_post_observation_search(params):
         query_string = urlencode(
-            {key: value for key, value in params.items() if value is not None and value != ""},
+            {
+                key: value
+                for key, value in params.items()
+                if value is not None and value != ""
+            },
             doseq=True,
         )
         taxon_filter_sizes = {
@@ -465,12 +696,156 @@ def fetch_observations_page(
                 "Accept": "application/json",
                 "User-Agent": build_app_user_agent(),
             },
-            timeout=60,
+            timeout=10,
         )
         response.raise_for_status()
         return response.json()
 
-    return pyinaturalist.get_observations(**params)
+    if request_session is None:
+        return pyinaturalist.get_observations(**params)
+    return pyinaturalist.get_observations(session=request_session, **params)
+
+
+class SearchCancelled(Exception):
+    """Raised inside a worker when the user cancels a search."""
+
+
+def raise_if_search_cancelled(cancel_callback=None) -> None:
+    if cancel_callback and cancel_callback():
+        raise SearchCancelled
+
+
+def wait_for_search_delay(seconds: float, cancel_callback=None) -> None:
+    """Wait for a retry or rate-limit delay while checking for cancellation."""
+    deadline = time.monotonic() + seconds
+    while True:
+        raise_if_search_cancelled(cancel_callback)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
+
+
+def fetch_all_observation_pages(
+    params: dict[str, Any],
+    progress_callback=None,
+    api_call_callback=None,
+    cancel_callback=None,
+    request_session=None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch every observation page without interacting with Qt widgets.
+
+    Keeping the network and retry loop UI-independent allows live searches to
+    run in a worker thread while the main Qt event loop continues repainting
+    the window and responding to Windows messages.
+    """
+    all_results = []
+    page = 1
+    base_params = params.copy()
+    per_page = 500
+    max_retries = 3
+    post_rate_limit_delay = 1.0
+    last_http_status: int | None = None
+    force_post = False
+
+    while True:
+        raise_if_search_cancelled(cancel_callback)
+        page_params = {**base_params, "page": page, "per_page": per_page}
+        retries = 0
+
+        while retries <= max_retries:
+            try:
+                raise_if_search_cancelled(cancel_callback)
+                if progress_callback:
+                    progress_callback(f"Fetching page {page}...", None)
+                response = fetch_observations_page(
+                    page_params,
+                    force_post=force_post,
+                    request_session=request_session,
+                )
+                if api_call_callback:
+                    api_call_callback()
+                raise_if_search_cancelled(cancel_callback)
+
+                results = response.get("results", [])
+                all_results.extend(results)
+                total_results = response.get("total_results", 0)
+                progress = None
+                if total_results > 0:
+                    progress = min(100, int((len(all_results) / total_results) * 100))
+                if progress_callback:
+                    progress_callback(
+                        f"Fetched {len(all_results)} / {total_results} observations",
+                        progress,
+                    )
+
+                if len(all_results) >= total_results or not results:
+                    return all_results, None
+
+                page += 1
+                # ClientSession already enforces GET rate limits. The direct
+                # POST fallback bypasses that session, so retain a short,
+                # cancellation-aware delay only for those oversized filters.
+                if force_post or should_post_observation_search(page_params):
+                    if progress_callback:
+                        progress_callback(
+                            "Waiting briefly to respect iNaturalist rate limits...",
+                            progress,
+                        )
+                    wait_for_search_delay(post_rate_limit_delay, cancel_callback)
+                break
+
+            except SearchCancelled:
+                raise
+            except HTTPError as e:
+                raise_if_search_cancelled(cancel_callback)
+                status_code, response_body = http_error_details(e)
+                if status_code == 414 and not force_post:
+                    force_post = True
+                    logging.warning(
+                        "Observation search exceeded GET URL limits on page %s; retrying with POST.",
+                        page,
+                    )
+                    continue
+                if status_code in (429, 403):
+                    last_http_status = status_code
+                    retries += 1
+                    wait_time = 2**retries
+                    if progress_callback:
+                        progress_callback(
+                            f"Rate limited, retrying in {wait_time}s "
+                            f"(attempt {retries}/{max_retries})...",
+                            None,
+                        )
+                    wait_for_search_delay(wait_time, cancel_callback)
+                else:
+                    if response_body:
+                        logging.error(
+                            "API search HTTP %s on page %s: %s",
+                            status_code,
+                            page,
+                            response_body,
+                        )
+                    else:
+                        logging.error(
+                            "API search HTTP %s on page %s", status_code, page
+                        )
+                    return all_results, str(e)
+            except Exception as e:
+                raise_if_search_cancelled(cancel_callback)
+                logging.exception(
+                    "API search failed on page %s (%s)", page, type(e).__name__
+                )
+                return all_results, str(e)
+
+        if retries > max_retries:
+            error_msg = (
+                f"Max retries exceeded for error {last_http_status}. "
+                "You may be using anonymous API access, which has stricter rate "
+                "limits. To increase limits, set INATURALIST_APP_ID and "
+                "INATURALIST_APP_SECRET in your environment."
+            )
+            return all_results, error_msg
 
 
 class DiskTileCache:
@@ -564,7 +939,9 @@ class TileLoaderWorker(QThread):
     network_error = pyqtSignal(str)
     network_recovered = pyqtSignal()
     retry_complete = pyqtSignal()
-    tiles_skipped = pyqtSignal()  # Signal when some tiles were skipped due to network suspension
+    tiles_skipped = (
+        pyqtSignal()
+    )  # Signal when some tiles were skipped due to network suspension
 
     def __init__(self, working_dir: str | Path) -> None:
         super().__init__()
@@ -770,7 +1147,16 @@ class TileLoaderWorker(QThread):
                             logging.debug(
                                 f"Tile {zoom}/{wrapped_x}/{y} HTTP {resp.status_code}"
                             )
-                            if resp.status_code in (403, 429, 418, 408, 500, 502, 503, 504):
+                            if resp.status_code in (
+                                403,
+                                429,
+                                418,
+                                408,
+                                500,
+                                502,
+                                503,
+                                504,
+                            ):
                                 if not self._notified_error:
                                     self._notified_error = True
                                     if resp.status_code in (403, 429, 418):
@@ -791,7 +1177,9 @@ class TileLoaderWorker(QThread):
                         )
                         if not self._notified_error:
                             self._notified_error = True
-                            self.network_error.emit(f"Network error: {e!s}. Backing off.")
+                            self.network_error.emit(
+                                f"Network error: {e!s}. Backing off."
+                            )
                         self._network_suspended_until = time.time() + 15.0
                         with QMutexLocker(self.mutex):
                             self._skipped_tiles.add(tile_key)
@@ -881,9 +1269,7 @@ class TileLoaderWorker(QThread):
                         self._network_suspended_until = time.time() + 15.0
                     break
             except RequestException as e:
-                logging.debug(
-                    f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e!s}"
-                )
+                logging.debug(f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e!s}")
                 if not self._notified_error:
                     self._notified_error = True
                     self.network_error.emit(f"Network error: {e!s}. Backing off.")
@@ -898,12 +1284,219 @@ class TileLoaderWorker(QThread):
         return recovered_any
 
 
+class DatabaseUpdateCheckWorker(QThread):
+    """Check for database updates without delaying or blocking the main window."""
+
+    updates_ready = pyqtSignal(object)
+
+    def __init__(self, working_dir: str | Path) -> None:
+        super().__init__()
+        self.working_dir = str(working_dir)
+
+    def cancel(self) -> None:
+        self.requestInterruption()
+
+    def run(self) -> None:
+        try:
+            updates = available_database_updates(
+                self.working_dir,
+                cancel_callback=self.isInterruptionRequested,
+            )
+        except Exception:
+            logging.exception("Database update check failed")
+            updates = []
+        if not self.isInterruptionRequested():
+            self.updates_ready.emit(updates)
+
+
+class ApiSearchWorker(QThread):
+    """Background worker for taxon lookup and live iNaturalist searches."""
+
+    progress = pyqtSignal(str, object)
+    api_call_completed = pyqtSignal()
+    taxon_resolved = pyqtSignal(str, object)
+    search_finished = pyqtSignal(object, object)
+    search_failed = pyqtSignal(str)
+    search_cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        params: dict[str, Any],
+        organism: str,
+        exclude: str,
+        taxon_cache: Mapping[str, Any],
+        http_cache_file: str | Path | None = None,
+        http_cache_max_bytes: int = DEFAULT_HTTP_CACHE_MAX_MB * 1024 * 1024,
+    ) -> None:
+        super().__init__()
+        self.params = params.copy()
+        self.organism = organism
+        self.exclude = exclude
+        self.taxon_cache = dict(taxon_cache)
+        self.http_cache_file = (
+            str(http_cache_file) if http_cache_file is not None else ":memory:"
+        )
+        self.http_cache_max_bytes = http_cache_max_bytes
+        self._cancel_requested = False
+        self.request_session = None
+        self._started_at = 0.0
+        self._api_call_count = 0
+        self._page_count = 0
+        self._cache_hit_count = 0
+        self._observation_count = 0
+
+    def cancel(self) -> None:
+        """Ask the worker to stop at the next safe cancellation point."""
+        self._cancel_requested = True
+        self.requestInterruption()
+
+    def is_cancelled(self) -> bool:
+        return self._cancel_requested or self.isInterruptionRequested()
+
+    def _record_http_response(self, response, *_args, **_kwargs):
+        if getattr(response, "from_cache", False):
+            self._cache_hit_count += 1
+        return response
+
+    def _record_api_call(self) -> None:
+        self._api_call_count += 1
+        self.api_call_completed.emit()
+
+    def _record_observation_page(self) -> None:
+        self._page_count += 1
+        self._record_api_call()
+
+    def _log_search_summary(self, status: str) -> None:
+        logging.info(
+            "Live search %s: observations=%d, pages=%d, api_calls=%d, cache_hits=%d, duration=%.1fs",
+            status,
+            self._observation_count,
+            self._page_count,
+            self._api_call_count,
+            self._cache_hit_count,
+            max(0.0, time.monotonic() - self._started_at),
+        )
+
+    def _get_taxon_id(self, query: str) -> int | None:
+        raise_if_search_cancelled(self.is_cancelled)
+        cached_taxon_id = self.taxon_cache.get(query)
+        if isinstance(cached_taxon_id, int):
+            logging.info(
+                "Retrieved taxon ID for %s from cache: %s",
+                query,
+                cached_taxon_id,
+            )
+            return cached_taxon_id
+
+        self.progress.emit(f"Looking up taxon ID for {query}...", None)
+        try:
+            taxa = pyinaturalist.get_taxa(
+                q=query, limit=1, session=self.request_session
+            )
+            self._record_api_call()
+        except Exception as e:
+            raise_if_search_cancelled(self.is_cancelled)
+            logging.error("Failed to fetch taxon ID for %s: %s", query, e)
+            return None
+        raise_if_search_cancelled(self.is_cancelled)
+
+        results = taxa.get("results", [])
+        if not results:
+            logging.warning("No taxon ID found for %s", query)
+            return None
+
+        taxon_id = results[0]["id"]
+        self.taxon_cache[query] = taxon_id
+        self.taxon_resolved.emit(query, taxon_id)
+        logging.info("Fetched taxon ID for %s: %s", query, taxon_id)
+        return taxon_id
+
+    def run(self) -> None:
+        warnings = []
+        self._started_at = time.monotonic()
+        logging.info(
+            "Live search started: organism=%r, exclude=%r, radius=%s km, dates=%s..%s",
+            self.organism or None,
+            self.exclude or None,
+            self.params.get("radius"),
+            self.params.get("d1"),
+            self.params.get("d2"),
+        )
+        try:
+            self.request_session = pyinaturalist.ClientSession(
+                cache_file=self.http_cache_file,
+                max_retries=0,
+                timeout=10,
+            )
+            self.request_session.hooks.setdefault("response", []).append(
+                self._record_http_response
+            )
+            maintain_http_cache(
+                self.request_session,
+                self.http_cache_file,
+                self.http_cache_max_bytes,
+            )
+            raise_if_search_cancelled(self.is_cancelled)
+            if self.organism:
+                taxon_id = self._get_taxon_id(self.organism)
+                if taxon_id:
+                    self.params["taxon_id"] = taxon_id
+                else:
+                    warnings.append(
+                        f"Could not find taxon ID for {self.organism}. "
+                        "The search was run without that organism filter."
+                    )
+
+            if self.exclude:
+                exclude_taxon_id = self._get_taxon_id(self.exclude)
+                if exclude_taxon_id:
+                    self.params["not_in_taxon_id"] = exclude_taxon_id
+                else:
+                    warnings.append(
+                        f"Could not find taxon ID for {self.exclude}. "
+                        "The search was run without that exclusion filter."
+                    )
+
+            observations, error = fetch_all_observation_pages(
+                self.params,
+                progress_callback=self.progress.emit,
+                api_call_callback=self._record_observation_page,
+                cancel_callback=self.is_cancelled,
+                request_session=self.request_session,
+            )
+            self._observation_count = len(observations)
+            raise_if_search_cancelled(self.is_cancelled)
+            if error:
+                self._log_search_summary("failed")
+                self.search_failed.emit(error)
+                return
+            self._log_search_summary("completed")
+            self.search_finished.emit(observations, warnings)
+        except SearchCancelled:
+            self._log_search_summary("cancelled")
+            self.search_cancelled.emit()
+        except Exception as e:
+            logging.exception("Live iNaturalist search worker failed")
+            self._log_search_summary("failed")
+            self.search_failed.emit(str(e))
+        finally:
+            if self.request_session is not None:
+                maintain_http_cache(
+                    self.request_session,
+                    self.http_cache_file,
+                    self.http_cache_max_bytes,
+                )
+                self.request_session.close()
+                self.request_session = None
+
+
 class LocalSearchWorker(QThread):
     """Background worker for local DuckDB searches."""
 
     progress = pyqtSignal(str)
     search_finished = pyqtSignal(object, int)
     search_failed = pyqtSignal(str)
+    search_cancelled = pyqtSignal()
 
     def __init__(
         self,
@@ -925,6 +1518,27 @@ class LocalSearchWorker(QThread):
         self.radius = radius
         self.taxon_ids = taxon_ids or []
         self.exclude_taxon_ids = exclude_taxon_ids or []
+        self._cancel_requested = False
+        self._connection = None
+        self._connection_mutex = QMutex()
+
+    def _set_connection(self, connection) -> None:
+        with QMutexLocker(self._connection_mutex):
+            self._connection = connection
+
+    def cancel(self) -> None:
+        """Cancel the search and interrupt an active DuckDB query."""
+        self._cancel_requested = True
+        self.requestInterruption()
+        with QMutexLocker(self._connection_mutex):
+            if self._connection is not None:
+                try:
+                    self._connection.interrupt()
+                except Exception as e:
+                    logging.debug("Could not interrupt DuckDB query: %s", e)
+
+    def is_cancelled(self) -> bool:
+        return self._cancel_requested or self.isInterruptionRequested()
 
     def run(self) -> None:
         try:
@@ -937,12 +1551,20 @@ class LocalSearchWorker(QThread):
                 self.radius,
                 self.taxon_ids,
                 self.exclude_taxon_ids,
-                self.progress.emit,
+                progress_callback=self.progress.emit,
+                cancel_callback=self.is_cancelled,
+                connection_callback=self._set_connection,
             )
+            raise_if_search_cancelled(self.is_cancelled)
             self.search_finished.emit(observations, estimated_count)
+        except SearchCancelled:
+            self.search_cancelled.emit()
         except Exception as e:
-            logging.error("Local search worker failed: %s", e)
-            self.search_failed.emit(str(e))
+            if self.is_cancelled():
+                self.search_cancelled.emit()
+            else:
+                logging.error("Local search worker failed: %s", e)
+                self.search_failed.emit(str(e))
 
 
 def run_local_observation_query(
@@ -955,20 +1577,25 @@ def run_local_observation_query(
     taxon_ids: list[int] | None = None,
     exclude_taxon_ids: list[int] | None = None,
     progress_callback=None,
+    cancel_callback=None,
+    connection_callback=None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Query observations.parquet for local observations."""
     taxon_ids = taxon_ids or []
     exclude_taxon_ids = exclude_taxon_ids or []
     escaped_path = parquet_path.replace("'", "''")
-    lat_min, lat_max, lon_min, lon_max = calculate_local_search_bounds(
-        lat, lon, radius
-    )
+    lat_min, lat_max, lon_min, lon_max = calculate_local_search_bounds(lat, lon, radius)
     con = None
     try:
+        raise_if_search_cancelled(cancel_callback)
         con = duckdb.connect()
+        if connection_callback:
+            connection_callback(con)
+        raise_if_search_cancelled(cancel_callback)
         if progress_callback:
             progress_callback("Checking observations.parquet schema...")
         schema = con.execute(f"DESCRIBE SELECT * FROM '{escaped_path}'").fetchall()
+        raise_if_search_cancelled(cancel_callback)
         column_names = [row[0].lower() for row in schema]
         required_columns = [
             "eventdate",
@@ -1007,6 +1634,7 @@ def run_local_observation_query(
             progress_callback("Estimating result count...")
         count_query = f"SELECT COUNT(*) FROM '{escaped_path}' {base_where} {filter_sql}"
         _count_row = con.execute(count_query, bbox_params).fetchone()
+        raise_if_search_cancelled(cancel_callback)
         estimated_count = _count_row[0] if _count_row else 0
 
         if progress_callback:
@@ -1031,21 +1659,28 @@ def run_local_observation_query(
         """
         query_params = bbox_params + [lat, lat, lon, radius]
         results = con.execute(query, query_params).fetchall()
+        raise_if_search_cancelled(cancel_callback)
 
         if progress_callback:
             progress_callback("Processing results...")
-        observations = [
-            {
-                "id": row[0],
-                "decimalLatitude": row[1],
-                "decimalLongitude": row[2],
-                "eventDate": row[3],
-                "taxonID": row[4],
-            }
-            for row in results
-        ]
+        observations = []
+        for index, row in enumerate(results):
+            if index % 1000 == 0:
+                raise_if_search_cancelled(cancel_callback)
+            observations.append(
+                {
+                    "id": row[0],
+                    "decimalLatitude": row[1],
+                    "decimalLongitude": row[2],
+                    "eventDate": row[3],
+                    "taxonID": row[4],
+                }
+            )
+        raise_if_search_cancelled(cancel_callback)
         return observations, estimated_count
     finally:
+        if connection_callback:
+            connection_callback(None)
         if con is not None:
             con.close()
 
@@ -1630,6 +2265,13 @@ class EnhancedProgressWidget(QWidget):
         self.last_update = current_time
         self._update_display()
 
+    def update_percentage(self, percentage: int, message: str) -> None:
+        """Switch an indeterminate operation to percentage-based progress."""
+        if self.total_steps != 100:
+            self.total_steps = 100
+            self.progress_bar.setRange(0, 100)
+        self.update_progress(max(0, min(100, percentage)), message)
+
     def finish_progress(self, message: str = "Operation completed") -> None:
         """Finish progress tracking."""
         self.timer.stop()
@@ -1782,6 +2424,7 @@ class INatSeasonalVisualizer(QMainWindow):
         scale_factor: float = 1.0,
         splash_screen=None,
         working_dir: str | Path | None = None,
+        http_cache_max_mb: int | None = None,
     ) -> None:
         super().__init__()
         self.splash_screen = splash_screen
@@ -1794,17 +2437,22 @@ class INatSeasonalVisualizer(QMainWindow):
 
         self.api_call_count = 0  # Initialize API call counter
         self.last_plot_args = None  # Initialize plot arguments cache
+        self.api_search_worker = None
         self.local_search_worker = None
+        self.database_update_worker = None
         # In-memory cache for taxon IDs and descendants
         # Persisted to taxon_cache.json to minimize API calls and avoid recomputing descendants
         self.taxon_cache = {}
         resolved_working_dir = (
-            ensure_application_data_dir()
-            if working_dir is None
-            else Path(working_dir)
+            ensure_application_data_dir() if working_dir is None else Path(working_dir)
         )
         resolved_working_dir.mkdir(parents=True, exist_ok=True)
         self.working_dir = str(resolved_working_dir)
+        self.http_cache_file = os.path.join(self.working_dir, HTTP_CACHE_FILE_NAME)
+        self.database_stats_cache_file = os.path.join(
+            self.working_dir, DATABASE_STATS_CACHE_FILE_NAME
+        )
+        self.http_cache_max_bytes = configured_http_cache_max_bytes(http_cache_max_mb)
         self.taxon_cache_file = os.path.join(self.working_dir, "taxon_cache.json")
         self.descendant_taxons_file = os.path.join(
             self.working_dir, "descendant_taxons.txt"
@@ -1812,6 +2460,13 @@ class INatSeasonalVisualizer(QMainWindow):
         self.taxonomy_file = os.path.join(self.working_dir, "taxonomy.parquet")
         self.observations_file = os.path.join(self.working_dir, "observations.parquet")
         self.local_database_available = os.path.exists(self.observations_file)
+
+        if self.splash_screen:
+            self.splash_screen.update_status("Maintaining API response cache...")
+            QApplication.processEvents()
+        maintain_legacy_pyinaturalist_cache(
+            self.http_cache_file, self.http_cache_max_bytes
+        )
 
         # Initialize statusBar and enhanced progress widget early for download_missing_files
         self.status_bar = QStatusBar()
@@ -1832,13 +2487,7 @@ class INatSeasonalVisualizer(QMainWindow):
         if self.splash_screen:
             self.splash_screen.update_status("Checking for missing data files...")
             QApplication.processEvents()
-        check_for_updates = self.local_database_available
         self.download_missing_files()  # Offer local database or API-only mode.
-        if check_for_updates:
-            if self.splash_screen:
-                self.splash_screen.update_status("Checking for database updates...")
-                QApplication.processEvents()
-            self.check_for_database_updates()
 
         if self.splash_screen:
             self.splash_screen.update_status("Initializing application settings...")
@@ -1853,6 +2502,9 @@ class INatSeasonalVisualizer(QMainWindow):
             QApplication.processEvents()
         self.load_database_stats()
         self.most_recent_date = self.get_most_recent_date()
+        # The local snapshot may be months behind live iNaturalist data. Using
+        # today is harmless for local queries and keeps live searches current.
+        self.default_search_end_date = datetime.now().strftime("%Y-%m-%d")
 
         if self.splash_screen:
             self.splash_screen.update_status("Building user interface...")
@@ -1876,6 +2528,19 @@ class INatSeasonalVisualizer(QMainWindow):
         if not os.path.exists(self.observations_file):
             return
 
+        cached_stats = read_database_stats_cache(
+            self.database_stats_cache_file,
+            self.observations_file,
+        )
+        if cached_stats is not None:
+            self.total_observations, self.unique_taxa = cached_stats
+            logging.info(
+                "Loaded cached database stats: %s observations, %s unique taxa.",
+                self.total_observations,
+                self.unique_taxa,
+            )
+            return
+
         con = None
         try:
             con = duckdb.connect()
@@ -1893,6 +2558,12 @@ class INatSeasonalVisualizer(QMainWindow):
                 ).fetchone()
                 self.total_observations = _row[0] if _row else 0
                 self.unique_taxa = "N/A"
+                write_database_stats_cache(
+                    self.database_stats_cache_file,
+                    self.observations_file,
+                    self.total_observations,
+                    self.unique_taxa,
+                )
                 return
 
             result = con.execute(
@@ -1901,6 +2572,12 @@ class INatSeasonalVisualizer(QMainWindow):
             if result:
                 self.total_observations = result[0]
                 self.unique_taxa = result[1]
+                write_database_stats_cache(
+                    self.database_stats_cache_file,
+                    self.observations_file,
+                    self.total_observations,
+                    self.unique_taxa,
+                )
             logging.info(
                 f"Loaded database stats: {self.total_observations} observations, {self.unique_taxa} unique taxa."
             )
@@ -1934,8 +2611,7 @@ class INatSeasonalVisualizer(QMainWindow):
         dialog.setText("The local iNaturalist database is optional.")
         dialog.setInformativeText(database_download_choice_message(files_to_download))
         file_details = "\n".join(
-            f"{filename}: {info['description']}"
-            for filename, info in files_to_download
+            f"{filename}: {info['description']}" for filename, info in files_to_download
         )
         dialog.setDetailedText(f"Missing files:\n{file_details}")
 
@@ -1943,8 +2619,7 @@ class INatSeasonalVisualizer(QMainWindow):
             "Download Local Database", QMessageBox.ButtonRole.AcceptRole
         )
         observations_missing = any(
-            filename == "observations.parquet"
-            for filename, _info in files_to_download
+            filename == "observations.parquet" for filename, _info in files_to_download
         )
         alternative_label = (
             "Use iNaturalist API Only"
@@ -1998,23 +2673,41 @@ class INatSeasonalVisualizer(QMainWindow):
         update_button = dialog.addButton(
             "Download Update", QMessageBox.ButtonRole.AcceptRole
         )
-        later_button = dialog.addButton(
-            "Not Now", QMessageBox.ButtonRole.RejectRole
-        )
+        later_button = dialog.addButton("Not Now", QMessageBox.ButtonRole.RejectRole)
         dialog.setDefaultButton(later_button)
         dialog.setEscapeButton(later_button)
         self._exec_startup_dialog(dialog)
         return dialog.clickedButton() is update_button
 
     def check_for_database_updates(self) -> None:
-        """Offer newer remote files only to users with a local database."""
-        files_to_update = available_database_updates(self.working_dir)
+        """Synchronously check for updates, primarily for manual/test callers."""
+        INatSeasonalVisualizer._offer_database_updates(
+            self, available_database_updates(self.working_dir)
+        )
+
+    def start_database_update_check(self) -> None:
+        """Start the routine update check after the main window is visible."""
+        if not self.local_database_available or self.database_update_worker is not None:
+            return
+        worker = DatabaseUpdateCheckWorker(self.working_dir)
+        self.database_update_worker = worker
+        worker.updates_ready.connect(self._offer_database_updates)
+        worker.finished.connect(self._on_database_update_worker_done)
+        worker.start()
+
+    def _offer_database_updates(
+        self, files_to_update: list[tuple[str, dict[str, Any]]]
+    ) -> None:
+        """Offer a completed background update check on the GUI thread."""
         if not files_to_update:
             return
         if not self.prompt_for_database_update(files_to_update):
             logging.info("User deferred the available local database update.")
             return
         self.download_database_files(files_to_update, replacing_existing=True)
+
+    def _on_database_update_worker_done(self) -> None:
+        self.database_update_worker = None
 
     def download_missing_files(self) -> None:
         """Offer to download missing local data without making it mandatory."""
@@ -2140,9 +2833,7 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def invalidate_descendant_taxon_cache(self) -> None:
         """Remove taxonomy-derived cache entries after installing new taxonomy."""
-        stale_keys = [
-            key for key in self.taxon_cache if key.endswith("_descendants")
-        ]
+        stale_keys = [key for key in self.taxon_cache if key.endswith("_descendants")]
         if not stale_keys:
             return
         for key in stale_keys:
@@ -2288,7 +2979,7 @@ class INatSeasonalVisualizer(QMainWindow):
         self.exclude_input = QLineEdit()
         self.exclude_input.setPlaceholderText("e.g., Boletus regineus")
         self.date_from = QLineEdit("2000-01-01")
-        self.date_to = QLineEdit(self.most_recent_date)
+        self.date_to = QLineEdit(self.default_search_end_date)
         self.view_combo = QComboBox()
         self.view_combo.addItems(["Daily", "Weekly", "Monthly"])
         self.view_combo.setCurrentIndex(1)  # Set default to Weekly
@@ -2319,15 +3010,6 @@ class INatSeasonalVisualizer(QMainWindow):
         self.sidebar_layout.addRow("Graph Color:", self.color_input)
         self.sidebar_layout.addRow("Graph BG Color:", self.bg_color_input)
 
-        search_mode_text = (
-            "Local database and iNaturalist API"
-            if self.local_database_available
-            else "iNaturalist API only (local database not installed)"
-        )
-        self.search_mode_label = QLabel(search_mode_text)
-        self.search_mode_label.setWordWrap(True)
-        self.sidebar_layout.addRow("Search Mode:", self.search_mode_label)
-
         # Graph with local data button
         self.local_search_button = QPushButton(LOCAL_GRAPH_ACTION_TEXT)
         self.local_search_button.clicked.connect(self.local_search)
@@ -2349,6 +3031,14 @@ class INatSeasonalVisualizer(QMainWindow):
             "Search online using the iNaturalist API; an internet connection is required."
         )
         self.sidebar_layout.addWidget(self.search_button)
+
+        self.cancel_search_button = QPushButton("Cancel Search")
+        self.cancel_search_button.clicked.connect(self.cancel_search)
+        self.cancel_search_button.setEnabled(False)
+        self.cancel_search_button.setToolTip(
+            "Stop the current local or live iNaturalist search."
+        )
+        self.sidebar_layout.addWidget(self.cancel_search_button)
 
         # Show URL button
         self.show_url_button = QPushButton("Show URL")
@@ -2486,7 +3176,8 @@ class INatSeasonalVisualizer(QMainWindow):
         theme_action.triggered.connect(
             lambda: self.toggle_theme(
                 "light"
-                if normalize_theme(self.settings.value("theme", DEFAULT_THEME)) == "dark"
+                if normalize_theme(self.settings.value("theme", DEFAULT_THEME))
+                == "dark"
                 else "dark"
             )
         )
@@ -2764,114 +3455,51 @@ class INatSeasonalVisualizer(QMainWindow):
     def fetch_all_observations(
         self, params: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], str | None]:
-        """Fetch all observations with pagination, rate limiting, and error handling."""
-        all_results = []
-        page = 1
-        base_params = params.copy()
-        per_page = 500  # Maximum per page for observations endpoint
-        max_retries = 3
-        rate_limit_delay = 3.0  # Increased for anonymous access
-
-        # Start enhanced progress tracking
+        """Synchronously fetch observations for non-interactive callers."""
         self.enhanced_progress.start_progress(0, "Starting API search...")
 
-        last_http_status: int | None = None
-        force_post = False
-        while True:
-            page_params = {**base_params, "page": page, "per_page": per_page}
-            retries = 0
+        def report_progress(message: str, percentage: int | None) -> None:
+            self.status_bar.showMessage(message)
+            if percentage is None:
+                self.enhanced_progress.update_progress(message=message)
+            else:
+                self.enhanced_progress.update_percentage(percentage, message)
 
-            while retries <= max_retries:
-                try:
-                    self.status_bar.showMessage(f"Fetching page {page}...")
-                    self.enhanced_progress.update_progress(
-                        message=f"Fetching page {page}..."
-                    )
-                    response = fetch_observations_page(
-                        page_params, force_post=force_post
-                    )
-                    self.api_call_count += 1  # Increment API call counter
-                    self.update_api_call_count()
-                    results = response.get("results", [])
-                    all_results.extend(results)
+        def count_api_call() -> None:
+            self.api_call_count += 1
+            self.update_api_call_count()
 
-                    # Update progress bar
-                    total_results = response.get("total_results", 0)
-                    if total_results > 0:
-                        progress = min(
-                            100, int((len(all_results) / total_results) * 100)
-                        )
-                        self.enhanced_progress.update_progress(
-                            progress,
-                            f"Fetched {len(all_results)} / {total_results} observations",
-                        )
-
-                    # Check if there are more pages
-                    if len(all_results) >= total_results or not results:
-                        self.enhanced_progress.finish_progress(
-                            f"API search completed: {len(all_results)} observations"
-                        )
-                        return all_results, None
-
-                    page += 1
-                    time.sleep(rate_limit_delay)  # Rate limiting
-                    break  # Exit retry loop on success
-
-                except HTTPError as e:
-                    status_code, response_body = http_error_details(e)
-                    if status_code == 414 and not force_post:
-                        force_post = True
-                        logging.warning(
-                            "Observation search exceeded GET URL limits on page %s; retrying with POST.",
-                            page,
-                        )
-                        continue
-                    if status_code in (
-                        429,
-                        403,
-                    ):  # Too Many Requests or Forbidden
-                        last_http_status = status_code  # save before `e` is cleared
-                        retries += 1
-                        wait_time = 2**retries  # Exponential backoff: 1s, 2s, 4s
-                        self.status_bar.showMessage(
-                            f"Error {last_http_status}, retrying in {wait_time}s (attempt {retries}/{max_retries})..."
-                        )
-                        self.enhanced_progress.update_progress(
-                            message=f"Rate limited, retrying in {wait_time}s (attempt {retries}/{max_retries})"
-                        )
-                        time.sleep(wait_time)
-                    else:
-                        self.enhanced_progress.hide_progress()
-                        if response_body:
-                            logging.error(
-                                "API search HTTP %s on page %s: %s",
-                                status_code,
-                                page,
-                                response_body,
-                            )
-                        else:
-                            logging.error(
-                                "API search HTTP %s on page %s", status_code, page
-                            )
-                        return all_results, str(e)  # Return partial data with error
-                except Exception as e:
-                    self.enhanced_progress.hide_progress()
-                    logging.exception(
-                        "API search failed on page %s (%s)", page, type(e).__name__
-                    )
-                    return all_results, str(e)  # Return partial data with error
-
-            if retries > max_retries:
-                self.enhanced_progress.hide_progress()
-                error_msg = (
-                    f"Max retries exceeded for error {last_http_status}. "
-                    "You may be using anonymous API access, which has stricter rate limits. "
-                    "To increase limits, set INATURALIST_APP_ID and INATURALIST_APP_SECRET in ~/.bashrc."
-                )
-                return all_results, error_msg  # Return partial data with error
-
-        self.enhanced_progress.hide_progress()
-        return all_results, None
+        request_session = pyinaturalist.ClientSession(
+            cache_file=self.http_cache_file,
+            max_retries=0,
+            timeout=10,
+        )
+        maintain_http_cache(
+            request_session,
+            self.http_cache_file,
+            self.http_cache_max_bytes,
+        )
+        try:
+            observations, error = fetch_all_observation_pages(
+                params,
+                progress_callback=report_progress,
+                api_call_callback=count_api_call,
+                request_session=request_session,
+            )
+        finally:
+            maintain_http_cache(
+                request_session,
+                self.http_cache_file,
+                self.http_cache_max_bytes,
+            )
+            request_session.close()
+        if error:
+            self.enhanced_progress.hide_progress()
+        else:
+            self.enhanced_progress.finish_progress(
+                f"API search completed: {len(observations)} observations"
+            )
+        return observations, error
 
     def get_taxon_id(self, query: str) -> int | None:
         """Get taxon ID from query, using cache to minimize API calls."""
@@ -2883,8 +3511,23 @@ class INatSeasonalVisualizer(QMainWindow):
                 f"Retrieved taxon ID for {query} from cache: {self.taxon_cache[query]}"
             )
             return self.taxon_cache[query]
+        request_session = None
         try:
-            taxa = pyinaturalist.get_taxa(q=query, limit=1)
+            request_session = pyinaturalist.ClientSession(
+                cache_file=self.http_cache_file,
+                max_retries=0,
+                timeout=10,
+            )
+            maintain_http_cache(
+                request_session,
+                self.http_cache_file,
+                self.http_cache_max_bytes,
+            )
+            taxa = pyinaturalist.get_taxa(
+                q=query,
+                limit=1,
+                session=request_session,
+            )
             self.api_call_count += 1  # Increment API call counter
             self.update_api_call_count()
             if taxa["results"]:
@@ -2903,6 +3546,14 @@ class INatSeasonalVisualizer(QMainWindow):
             )
             logging.error(error_msg)
             return None
+        finally:
+            if request_session is not None:
+                maintain_http_cache(
+                    request_session,
+                    self.http_cache_file,
+                    self.http_cache_max_bytes,
+                )
+                request_session.close()
 
     def get_descendant_taxon_ids(self, query: str, taxon_id: int) -> list[int]:
         """Get all descendant taxon IDs for a given taxon using taxonomy.parquet."""
@@ -3264,7 +3915,10 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def local_search(self) -> None:
         """Query the local observations.parquet file and plot results."""
-        if self.local_search_worker is not None and self.local_search_worker.isRunning():
+        if (
+            self.local_search_worker is not None
+            and self.local_search_worker.isRunning()
+        ):
             self.status_bar.showMessage("Local search is already running...")
             return
 
@@ -3322,6 +3976,9 @@ class INatSeasonalVisualizer(QMainWindow):
             self.status_bar.showMessage("Performing local search...")
             self.local_search_button.setEnabled(False)
             self.search_button.setEnabled(False)
+            self.show_url_button.setEnabled(False)
+            self.cancel_search_button.setText("Cancel Search")
+            self.cancel_search_button.setEnabled(True)
 
             worker = LocalSearchWorker(
                 parquet_path,
@@ -3345,11 +4002,14 @@ class INatSeasonalVisualizer(QMainWindow):
             }
             worker.progress.connect(self._on_local_search_progress)
             worker.search_finished.connect(
-                lambda observations, estimated_count, context=search_context: self._on_local_search_finished(
-                    observations, estimated_count, context
+                lambda observations, estimated_count, context=search_context: (
+                    self._on_local_search_finished(
+                        observations, estimated_count, context
+                    )
                 )
             )
             worker.search_failed.connect(self._on_local_search_failed)
+            worker.search_cancelled.connect(self._on_local_search_cancelled)
             worker.finished.connect(self._on_local_search_worker_done)
             worker.start()
 
@@ -3364,6 +4024,9 @@ class INatSeasonalVisualizer(QMainWindow):
             ):
                 self.local_search_button.setEnabled(True)
                 self.search_button.setEnabled(True)
+                self.show_url_button.setEnabled(True)
+                self.cancel_search_button.setEnabled(False)
+                self.cancel_search_button.setText("Cancel Search")
                 self.local_search_worker = None
             QMessageBox.critical(self, "Error", f"Local search failed: {e!s}")
             self.show_placeholder(f"Local search failed: {e!s}")
@@ -3380,6 +4043,12 @@ class INatSeasonalVisualizer(QMainWindow):
         estimated_count: int,
         context: dict[str, Any],
     ) -> None:
+        if (
+            self.local_search_worker is not None
+            and self.local_search_worker.is_cancelled()
+        ):
+            self._on_local_search_cancelled()
+            return
         self.enhanced_progress.db_tracker.estimated_total = estimated_count
         self.enhanced_progress.db_tracker.finish_operation(
             len(observations), "Local search completed"
@@ -3408,28 +4077,71 @@ class INatSeasonalVisualizer(QMainWindow):
         self.show_placeholder(f"Local search failed: {error}")
         logging.error("Local search failed: %s", error)
 
+    def _on_local_search_cancelled(self) -> None:
+        self.enhanced_progress.finish_progress("Local search cancelled")
+        self.status_bar.showMessage("Local search cancelled.")
+
     def _on_local_search_worker_done(self) -> None:
-        self.local_search_button.setEnabled(True)
+        self.local_search_button.setEnabled(self.local_database_available)
         self.search_button.setEnabled(True)
+        self.show_url_button.setEnabled(True)
+        self.cancel_search_button.setEnabled(False)
+        self.cancel_search_button.setText("Cancel Search")
         self.local_search_worker = None
 
+    def cancel_search(self) -> None:
+        """Cancel whichever local or live search is currently running."""
+        # Treat a worker as cancellable until its queued completion signal has
+        # been handled. This closes the small gap between the thread finishing
+        # and a large result being plotted on the main thread.
+        cancelling_api = self.api_search_worker is not None
+        cancelling_local = self.local_search_worker is not None
+        if not cancelling_api and not cancelling_local:
+            self.cancel_search_button.setEnabled(False)
+            self.status_bar.showMessage("No search is currently running.")
+            return
+
+        self.cancel_search_button.setText("Cancelling...")
+        self.cancel_search_button.setEnabled(False)
+        if cancelling_local:
+            self.local_search_worker.cancel()
+            message = "Cancelling local search..."
+        else:
+            self.api_search_worker.cancel()
+            message = (
+                "Cancelling live search... The current network request may take "
+                "a few seconds to stop."
+            )
+        self.status_bar.showMessage(message)
+        self.enhanced_progress.update_progress(message=message)
+
     def closeEvent(self, a0: QCloseEvent | None) -> None:
-        """Stop the local search worker before the window is destroyed."""
-        worker = self.local_search_worker
-        if worker is not None and worker.isRunning():
-            # run() does a blocking DuckDB query with no event loop, so quit()
-            # can't interrupt it. Wait for it to finish, and terminate as a last
-            # resort, so the QThread is never destroyed while still running.
-            if not worker.wait(5000):
-                worker.terminate()
-                worker.wait()
+        """Stop background workers before the window is destroyed."""
+        for worker in (
+            self.local_search_worker,
+            self.api_search_worker,
+            self.database_update_worker,
+        ):
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                # Workers perform blocking calls without a thread event
+                # loop, so quit() cannot interrupt them. Wait briefly and use
+                # terminate only as a last resort during application shutdown.
+                if not worker.wait(5000):
+                    worker.terminate()
+                    worker.wait()
         super().closeEvent(a0)
 
     def search_observations(self) -> None:
-        """Search observations using iNaturalist API."""
+        """Start a non-blocking search using the iNaturalist API."""
         if not self.canvas:
             QMessageBox.critical(
                 self, "Error", "Cannot search: Plot initialization failed."
+            )
+            return
+        if self.api_search_worker is not None and self.api_search_worker.isRunning():
+            self.status_bar.showMessage(
+                "A live iNaturalist search is already running..."
             )
             return
 
@@ -3462,61 +4174,126 @@ class INatSeasonalVisualizer(QMainWindow):
                 "per_page": 500,
             }
 
-            # Add taxon filter if organism is specified. iNaturalist's taxon_id
-            # filter already matches the taxon and all of its descendants
-            # server-side, so we pass the single ancestor ID rather than the full
-            # descendant list (which overflows the GET URL; the endpoint is
-            # GET-only and rejects POST with a 400).
-            if organism:
-                taxon_id = self.get_taxon_id(organism)
-                if taxon_id:
-                    params["taxon_id"] = taxon_id
-                    # The API expands ancestor IDs server-side, so an optional
-                    # local taxonomy file must never be required for API mode.
-                    # When present, resolve it only to enrich the info-bar count.
-                    if os.path.exists(self.taxonomy_file):
-                        self.get_descendant_taxon_ids(organism, taxon_id)
-                else:
-                    QMessageBox.warning(
-                        self,
-                        "Warning",
-                        f"Could not find taxon ID for {organism}. Search may yield no results.",
-                    )
-
-            # Add exclude filter (iNat expands not_in_taxon_id to descendants too)
-            if exclude:
-                exclude_taxon_id = self.get_taxon_id(exclude)
-                if exclude_taxon_id:
-                    params["not_in_taxon_id"] = exclude_taxon_id
-
-            # Fetch observations
-            observations, error = self.fetch_all_observations(params)
-            if error:
-                QMessageBox.critical(self, "Error", f"API search failed: {error}")
-                self.show_placeholder(f"API search failed: {error}")
-                return
-
-            # Plot results
-            if observations:
-                self.plot_observations(
-                    observations,
-                    lat,
-                    lon,
-                    radius,
-                    organism,
-                    date_from,
-                    date_to,
-                    view,
-                    source="API",
+            search_context = {
+                "lat": lat,
+                "lon": lon,
+                "radius": radius,
+                "organism": organism,
+                "date_from": date_from,
+                "date_to": date_to,
+                "view": view,
+            }
+            worker = ApiSearchWorker(
+                params,
+                organism,
+                exclude,
+                self.taxon_cache,
+                self.http_cache_file,
+                self.http_cache_max_bytes,
+            )
+            self.api_search_worker = worker
+            worker.progress.connect(self._on_api_search_progress)
+            worker.api_call_completed.connect(self._on_api_call_completed)
+            worker.taxon_resolved.connect(self._on_api_taxon_resolved)
+            worker.search_finished.connect(
+                lambda observations, warnings, context=search_context: (
+                    self._on_api_search_finished(observations, warnings, context)
                 )
-            else:
-                self.show_placeholder("No API observations found.")
-                self.update_status_bar(0)
+            )
+            worker.search_failed.connect(self._on_api_search_failed)
+            worker.search_cancelled.connect(self._on_api_search_cancelled)
+            worker.finished.connect(self._on_api_search_worker_done)
+
+            self.enhanced_progress.start_progress(
+                0, "Starting live iNaturalist search..."
+            )
+            self.status_bar.showMessage("Starting live iNaturalist search...")
+            self.local_search_button.setEnabled(False)
+            self.search_button.setEnabled(False)
+            self.search_button.setText("Searching live iNat data...")
+            self.show_url_button.setEnabled(False)
+            self.cancel_search_button.setText("Cancel Search")
+            self.cancel_search_button.setEnabled(True)
+            worker.start()
 
         except Exception as e:
+            self.enhanced_progress.hide_progress()
+            self.local_search_button.setEnabled(self.local_database_available)
+            self.search_button.setEnabled(True)
+            self.search_button.setText(LIVE_GRAPH_ACTION_TEXT)
+            self.show_url_button.setEnabled(True)
+            self.cancel_search_button.setEnabled(False)
+            self.cancel_search_button.setText("Cancel Search")
+            self.api_search_worker = None
             QMessageBox.critical(self, "Error", f"API search failed: {e!s}")
             self.show_placeholder(f"API search failed: {e!s}")
             logging.error(f"API search failed: {e!s}")
+
+    def _on_api_search_progress(self, message: str, percentage: int | None) -> None:
+        self.status_bar.showMessage(message)
+        if percentage is None:
+            self.enhanced_progress.update_progress(message=message)
+        else:
+            self.enhanced_progress.update_percentage(percentage, message)
+
+    def _on_api_call_completed(self) -> None:
+        self.api_call_count += 1
+        self.update_api_call_count()
+
+    def _on_api_taxon_resolved(self, query: str, taxon_id: int) -> None:
+        self.taxon_cache[query] = taxon_id
+        self.save_taxon_cache()
+
+    def _on_api_search_finished(
+        self,
+        observations: list[dict[str, Any]],
+        warnings: list[str],
+        context: dict[str, Any],
+    ) -> None:
+        if self.api_search_worker is not None and self.api_search_worker.is_cancelled():
+            self._on_api_search_cancelled()
+            return
+        self.enhanced_progress.finish_progress(
+            f"Live search completed: {len(observations)} observations"
+        )
+        self.status_bar.showMessage("Live iNaturalist search completed.")
+        if observations:
+            self.plot_observations(
+                observations,
+                context["lat"],
+                context["lon"],
+                context["radius"],
+                context["organism"],
+                context["date_from"],
+                context["date_to"],
+                context["view"],
+                source="API",
+            )
+        else:
+            self.show_placeholder("No API observations found.")
+            self.update_status_bar(0)
+        if warnings:
+            QMessageBox.warning(self, "Search Warning", "\n\n".join(warnings))
+
+    def _on_api_search_failed(self, error: str) -> None:
+        self.enhanced_progress.finish_progress("Live iNaturalist search failed")
+        self.status_bar.showMessage("Live iNaturalist search failed.")
+        QMessageBox.critical(self, "Error", f"API search failed: {error}")
+        self.show_placeholder(f"API search failed: {error}")
+        logging.error("API search failed: %s", error)
+
+    def _on_api_search_cancelled(self) -> None:
+        self.enhanced_progress.finish_progress("Live iNaturalist search cancelled")
+        self.status_bar.showMessage("Live iNaturalist search cancelled.")
+
+    def _on_api_search_worker_done(self) -> None:
+        self.local_search_button.setEnabled(self.local_database_available)
+        self.search_button.setEnabled(True)
+        self.search_button.setText(LIVE_GRAPH_ACTION_TEXT)
+        self.show_url_button.setEnabled(True)
+        self.cancel_search_button.setEnabled(False)
+        self.cancel_search_button.setText("Cancel Search")
+        self.api_search_worker = None
 
     def export_graph(self) -> None:
         """Export the current graph as an image with metadata."""
@@ -3655,9 +4432,7 @@ class INatSeasonalVisualizer(QMainWindow):
             export_ax.set_title(f"Seasonal Observations for {organism} ({source})")
 
             # Apply theme to export graph
-            current_theme = normalize_theme(
-                self.settings.value("theme", DEFAULT_THEME)
-            )
+            current_theme = normalize_theme(self.settings.value("theme", DEFAULT_THEME))
             if current_theme == "dark":
                 export_fig.set_facecolor(DARK_WINDOW_BACKGROUND)
                 export_ax.set_facecolor(DARK_GRAPH_BACKGROUND)
@@ -3794,23 +4569,17 @@ class INatSeasonalVisualizer(QMainWindow):
             )
 
         except Exception as e:
-            QMessageBox.critical(
-                self, "Error", f"Failed to load history item: {e!s}"
-            )
+            QMessageBox.critical(self, "Error", f"Failed to load history item: {e!s}")
             logging.error(f"Load history item failed: {e!s}")
 
     def show_placeholder(self, message: str | None = None) -> None:
         """Show a placeholder message on the graph."""
         if self.canvas:
             # Determine text color based on background luminance for visibility
-            current_theme = normalize_theme(
-                self.settings.value("theme", DEFAULT_THEME)
-            )
+            current_theme = normalize_theme(self.settings.value("theme", DEFAULT_THEME))
             custom_graph_bg = self.settings.value("graph_bg_color")
             graph_bg_color = custom_graph_bg or (
-                DARK_GRAPH_BACKGROUND
-                if current_theme == "dark"
-                else LIGHT_BACKGROUND
+                DARK_GRAPH_BACKGROUND if current_theme == "dark" else LIGHT_BACKGROUND
             )
             text_color = self.get_contrasting_text_color(graph_bg_color)
 
@@ -3878,7 +4647,9 @@ class INatSeasonalVisualizer(QMainWindow):
                     database_stats_text = (
                         f"Local Database Stats:\n"
                         f"  - Total Observations: {obs_count}\n"
-                        f"  - Unique Taxa: {taxa_count}\n\n"
+                        f"  - Unique Taxa: {taxa_count}\n"
+                        f"  - Most Recent Observation: "
+                        f"{getattr(self, 'most_recent_date', 'N/A')}\n\n"
                     )
                     detail_message += database_stats_text
 
@@ -3949,9 +4720,7 @@ class INatSeasonalVisualizer(QMainWindow):
             return dark_fallback if luminance > 128 else light_fallback
         except Exception:
             # Fallback if the color string is invalid
-            current_theme = normalize_theme(
-                self.settings.value("theme", DEFAULT_THEME)
-            )
+            current_theme = normalize_theme(self.settings.value("theme", DEFAULT_THEME))
             return dark_fallback if current_theme == "light" else light_fallback
 
 
@@ -3976,6 +4745,14 @@ def main() -> None:
         default=1.0,
         help="Manual UI scaling factor (e.g., 2.0 for 200%% scaling)",
     )
+    parser.add_argument(
+        "--http-cache-max-mb",
+        type=int,
+        help=(
+            "Maximum API response cache size in MB "
+            f"(default: {DEFAULT_HTTP_CACHE_MAX_MB}; environment: {HTTP_CACHE_MAX_MB_ENV})"
+        ),
+    )
     args = parser.parse_args()
 
     working_dir = ensure_application_data_dir()
@@ -3996,7 +4773,17 @@ def main() -> None:
 
     # Silence noisy third-party DEBUG chatter (matplotlib font scoring, PIL,
     # HTTP internals) so --debug stays focused on this app's own messages.
-    for noisy_logger in ("matplotlib", "PIL", "urllib3", "requests", "asyncio"):
+    for noisy_logger in (
+        "matplotlib",
+        "PIL",
+        "urllib3",
+        "requests",
+        "requests_cache",
+        "requests_ratelimiter",
+        "pyrate_limiter",
+        "pyinaturalist",
+        "asyncio",
+    ):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
     logging.info(
@@ -4035,7 +4822,9 @@ def main() -> None:
         print("DEBUG: QApplication created.")
 
     if args.smoke_test:
-        logging.info("Packaged application smoke test passed for version %s", __version__)
+        logging.info(
+            "Packaged application smoke test passed for version %s", __version__
+        )
         return
 
     # Show splash screen
@@ -4046,7 +4835,6 @@ def main() -> None:
         splash = CustomSplashScreen(splash_image_path)
         splash.update_status("Starting iNaturalist Seasonal Visualizer...")
         QApplication.processEvents()
-        time.sleep(0.5)  # Brief pause to show splash screen
     else:
         if args.debug:
             print(f"DEBUG: Splash screen not found at {splash_image_path}. Skipping.")
@@ -4057,7 +4845,6 @@ def main() -> None:
     if splash:
         splash.update_status("Loading application components...")
         QApplication.processEvents()
-        time.sleep(0.3)
 
     if args.debug:
         print("DEBUG: Initializing main window (INatSeasonalVisualizer)...")
@@ -4068,6 +4855,7 @@ def main() -> None:
         scale_factor=args.scale_factor,
         splash_screen=splash,
         working_dir=working_dir,
+        http_cache_max_mb=args.http_cache_max_mb,
     )
     if args.debug:
         print("DEBUG: Main window initialized.")
@@ -4075,7 +4863,6 @@ def main() -> None:
     if splash:
         splash.update_status("Application ready!")
         QApplication.processEvents()
-        time.sleep(0.5)
         if args.debug:
             print("DEBUG: Closing splash screen...")
         splash.close()
@@ -4083,6 +4870,7 @@ def main() -> None:
     if args.debug:
         print("DEBUG: Showing main window maximized...")
     window.showMaximized()
+    QTimer.singleShot(0, window.start_database_update_check)
 
     if args.debug:
         print("DEBUG: Starting event loop (app.exec)...")

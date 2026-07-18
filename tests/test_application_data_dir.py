@@ -4,14 +4,94 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from visualizer import (
+from startup_config import (
     APP_DATA_DIRECTORY_NAME,
+    SOURCE_CACHE_DIRECTORY_NAME,
+    application_cache_dir,
+    configure_matplotlib_config_dir,
+)
+from visualizer import (
     application_data_dir,
     ensure_application_data_dir,
 )
 
 
 class ApplicationDataDirTests(unittest.TestCase):
+    def test_source_cache_uses_hidden_current_directory(self) -> None:
+        current_dir = Path("/project/runtime")
+
+        result = application_cache_dir(frozen=False, current_dir=current_dir)
+
+        self.assertEqual(result, current_dir / SOURCE_CACHE_DIRECTORY_NAME)
+
+    def test_frozen_cache_uses_platform_conventions(self) -> None:
+        cases = (
+            (
+                "darwin",
+                {},
+                "/Users/friend",
+                Path("/Users/friend/Library/Caches") / APP_DATA_DIRECTORY_NAME,
+            ),
+            (
+                "win32",
+                {"LOCALAPPDATA": r"C:\Users\friend\AppData\Local"},
+                r"C:\Users\friend",
+                Path(r"C:\Users\friend\AppData\Local") / APP_DATA_DIRECTORY_NAME,
+            ),
+            (
+                "linux",
+                {"XDG_CACHE_HOME": "/cache/friend"},
+                "/home/friend",
+                Path("/cache/friend") / APP_DATA_DIRECTORY_NAME,
+            ),
+        )
+        for platform_name, environ, home_dir, expected in cases:
+            with self.subTest(platform_name=platform_name):
+                self.assertEqual(
+                    application_cache_dir(
+                        frozen=True,
+                        platform_name=platform_name,
+                        environ=environ,
+                        home_dir=home_dir,
+                    ),
+                    expected,
+                )
+
+    def test_matplotlib_fallback_is_persistent_and_respects_explicit_value(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            blocked_home = root / "blocked-home"
+            blocked_home.write_text("not a directory", encoding="utf-8")
+            current_dir = root / "runtime"
+            current_dir.mkdir()
+            environ: dict[str, str] = {}
+
+            result = configure_matplotlib_config_dir(
+                frozen=False,
+                platform_name="linux",
+                environ=environ,
+                home_dir=blocked_home,
+                current_dir=current_dir,
+            )
+
+            expected = current_dir / SOURCE_CACHE_DIRECTORY_NAME / "matplotlib"
+            self.assertEqual(result, expected)
+            self.assertEqual(environ["MPLCONFIGDIR"], str(expected))
+            self.assertTrue(expected.is_dir())
+
+            explicit = root / "explicit-matplotlib"
+            explicit_environ = {"MPLCONFIGDIR": str(explicit)}
+            self.assertEqual(
+                configure_matplotlib_config_dir(
+                    environ=explicit_environ,
+                    current_dir=current_dir,
+                ),
+                explicit,
+            )
+            self.assertFalse(explicit.exists())
+
     def test_source_run_keeps_current_directory(self) -> None:
         current_dir = Path("/project/runtime")
 
@@ -29,8 +109,7 @@ class ApplicationDataDirTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            Path("/Users/friend/Library/Application Support")
-            / APP_DATA_DIRECTORY_NAME,
+            Path("/Users/friend/Library/Application Support") / APP_DATA_DIRECTORY_NAME,
         )
 
     def test_frozen_windows_prefers_local_app_data(self) -> None:

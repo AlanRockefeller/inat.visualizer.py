@@ -2,6 +2,32 @@
 
 All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
+## [1.0.6] - 2026-07-17
+
+### Added
+
+- Add a Cancel Search button for live and local searches.
+
+### Fixed
+
+- App now starts a lot faster
+- Keep the app responsive while it gets live iNaturalist data, and show progress
+  so the user knows the search is still running.
+- Bound the live API response cache, prune expired entries, and reclaim space
+  from the oversized legacy pyinaturalist cache.
+- Default the search end date to today instead of limiting live searches to the
+  newest date in the periodically refreshed local database.
+
+### Changed
+
+- Package release applications in PyInstaller one-folder mode to avoid
+  extracting the full dependency bundle on every launch.
+- Remove the extra search mode message from the sidebar.
+- Store the API response cache in the app data directory with a configurable
+  `128 MB` default budget.
+- Rely on pyinaturalist's built-in GET rate limiter and log concise live-search
+  summaries instead of full request URLs and HTTP headers.
+
 ## [1.0.5] - 2026-07-17
 
 ### Changed

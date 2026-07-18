@@ -206,9 +206,7 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
                 raise_for_status=MagicMock(),
             )
 
-            with patch(
-                "visualizer.requests.head", return_value=response
-            ) as head_mock:
+            with patch("visualizer.requests.head", return_value=response) as head_mock:
                 updates = available_database_updates(temp_dir)
 
         self.assertEqual(updates, [])
@@ -273,6 +271,43 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
                 updates = available_database_updates(temp_dir)
 
         self.assertEqual(updates, [])
+
+    def test_database_update_check_starts_in_background(self) -> None:
+        worker = MagicMock()
+        window = SimpleNamespace(
+            local_database_available=True,
+            database_update_worker=None,
+            working_dir="/runtime",
+            _offer_database_updates=MagicMock(),
+            _on_database_update_worker_done=MagicMock(),
+        )
+
+        with patch(
+            "visualizer.DatabaseUpdateCheckWorker", return_value=worker
+        ) as worker_class:
+            INatSeasonalVisualizer.start_database_update_check(window)
+
+        worker_class.assert_called_once_with("/runtime")
+        worker.updates_ready.connect.assert_called_once_with(
+            window._offer_database_updates
+        )
+        worker.finished.connect.assert_called_once_with(
+            window._on_database_update_worker_done
+        )
+        worker.start.assert_called_once_with()
+        self.assertIs(window.database_update_worker, worker)
+
+    def test_database_update_check_is_not_started_in_api_only_mode(self) -> None:
+        window = SimpleNamespace(
+            local_database_available=False,
+            database_update_worker=None,
+            working_dir="/runtime",
+        )
+
+        with patch("visualizer.DatabaseUpdateCheckWorker") as worker_class:
+            INatSeasonalVisualizer.start_database_update_check(window)
+
+        worker_class.assert_not_called()
 
     def test_declining_database_update_leaves_files_untouched(self) -> None:
         update = ("observations.parquet", DATABASE_FILE_INFO["observations.parquet"])
@@ -370,9 +405,7 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
                 )
 
             self.assertEqual(observations_path.read_bytes(), new_database)
-            expected_mtime = datetime(
-                2025, 1, 2, tzinfo=timezone.utc
-            ).timestamp()
+            expected_mtime = datetime(2025, 1, 2, tzinfo=timezone.utc).timestamp()
             self.assertEqual(observations_path.stat().st_mtime, expected_mtime)
 
     def test_taxonomy_update_invalidates_only_descendant_cache_entries(self) -> None:
@@ -394,8 +427,10 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
         def text_field(value: str) -> SimpleNamespace:
             return SimpleNamespace(text=lambda: value)
 
+        worker = MagicMock()
         window = SimpleNamespace(
             canvas=object(),
+            api_search_worker=None,
             lat_input=text_field("37.7749"),
             lon_input=text_field("-122.4194"),
             radius_input=text_field("25"),
@@ -404,20 +439,112 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
             date_from=text_field("2025-01-01"),
             date_to=text_field("2025-12-31"),
             view_combo=SimpleNamespace(currentText=lambda: "Weekly"),
-            taxonomy_file="/missing/taxonomy.parquet",
-            get_taxon_id=MagicMock(return_value=47170),
-            get_descendant_taxon_ids=MagicMock(),
-            fetch_all_observations=MagicMock(return_value=([], None)),
+            taxon_cache={"Agaricales": 47170},
+            http_cache_file="/runtime/inat_api_cache.db",
+            http_cache_max_bytes=128 * 1024 * 1024,
+            local_database_available=False,
+            enhanced_progress=MagicMock(),
+            status_bar=MagicMock(),
+            local_search_button=MagicMock(),
+            search_button=MagicMock(),
+            cancel_search_button=MagicMock(),
+            show_url_button=MagicMock(),
+            _on_api_search_progress=MagicMock(),
+            _on_api_call_completed=MagicMock(),
+            _on_api_taxon_resolved=MagicMock(),
+            _on_api_search_finished=MagicMock(),
+            _on_api_search_failed=MagicMock(),
+            _on_api_search_cancelled=MagicMock(),
+            _on_api_search_worker_done=MagicMock(),
             show_placeholder=MagicMock(),
-            update_status_bar=MagicMock(),
         )
 
-        INatSeasonalVisualizer.search_observations(window)
+        with patch("visualizer.ApiSearchWorker", return_value=worker) as worker_class:
+            INatSeasonalVisualizer.search_observations(window)
 
-        window.get_descendant_taxon_ids.assert_not_called()
-        window.fetch_all_observations.assert_called_once()
-        params = window.fetch_all_observations.call_args.args[0]
-        self.assertEqual(params["taxon_id"], 47170)
+        (
+            params,
+            organism,
+            exclude,
+            taxon_cache,
+            http_cache_file,
+            http_cache_max_bytes,
+        ) = worker_class.call_args.args
+        self.assertNotIn("taxon_id", params)
+        self.assertEqual(organism, "Agaricales")
+        self.assertEqual(exclude, "")
+        self.assertEqual(taxon_cache, {"Agaricales": 47170})
+        self.assertEqual(http_cache_file, "/runtime/inat_api_cache.db")
+        self.assertEqual(http_cache_max_bytes, 128 * 1024 * 1024)
+        worker.start.assert_called_once_with()
+        window.enhanced_progress.start_progress.assert_called_once_with(
+            0, "Starting live iNaturalist search..."
+        )
+        window.local_search_button.setEnabled.assert_called_once_with(False)
+        window.search_button.setEnabled.assert_called_once_with(False)
+        window.search_button.setText.assert_called_once_with(
+            "Searching live iNat data..."
+        )
+        window.show_url_button.setEnabled.assert_called_once_with(False)
+        window.cancel_search_button.setEnabled.assert_called_once_with(True)
+
+    def test_api_only_local_button_stays_disabled_after_live_search(self) -> None:
+        window = SimpleNamespace(
+            local_database_available=False,
+            local_search_button=MagicMock(),
+            search_button=MagicMock(),
+            cancel_search_button=MagicMock(),
+            show_url_button=MagicMock(),
+            api_search_worker=object(),
+        )
+
+        INatSeasonalVisualizer._on_api_search_worker_done(window)
+
+        window.local_search_button.setEnabled.assert_called_once_with(False)
+        window.search_button.setEnabled.assert_called_once_with(True)
+        window.search_button.setText.assert_called_once_with(
+            "Graph with live iNat data"
+        )
+        window.show_url_button.setEnabled.assert_called_once_with(True)
+        window.cancel_search_button.setEnabled.assert_called_once_with(False)
+        self.assertIsNone(window.api_search_worker)
+
+    def test_cancel_button_requests_live_search_cancellation(self) -> None:
+        api_worker = MagicMock()
+        api_worker.isRunning.return_value = True
+        window = SimpleNamespace(
+            api_search_worker=api_worker,
+            local_search_worker=None,
+            cancel_search_button=MagicMock(),
+            status_bar=MagicMock(),
+            enhanced_progress=MagicMock(),
+        )
+
+        INatSeasonalVisualizer.cancel_search(window)
+
+        api_worker.cancel.assert_called_once_with()
+        window.cancel_search_button.setText.assert_called_once_with("Cancelling...")
+        window.cancel_search_button.setEnabled.assert_called_once_with(False)
+        status = window.status_bar.showMessage.call_args.args[0]
+        self.assertIn("current network request", status)
+
+    def test_cancel_button_requests_local_search_cancellation(self) -> None:
+        local_worker = MagicMock()
+        local_worker.isRunning.return_value = True
+        window = SimpleNamespace(
+            api_search_worker=None,
+            local_search_worker=local_worker,
+            cancel_search_button=MagicMock(),
+            status_bar=MagicMock(),
+            enhanced_progress=MagicMock(),
+        )
+
+        INatSeasonalVisualizer.cancel_search(window)
+
+        local_worker.cancel.assert_called_once_with()
+        window.status_bar.showMessage.assert_called_once_with(
+            "Cancelling local search..."
+        )
 
 
 if __name__ == "__main__":

@@ -11,6 +11,9 @@ taxon_cache.json
 printcsv.py
 
 # Cache/tiles
+.inat-visualizer-cache/
+database_stats.json*
+inat_api_cache.db*
 tilecache*.png
 tilecache/
 tile_cache/

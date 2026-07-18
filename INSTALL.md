@@ -11,9 +11,10 @@ is required.
 
 ## Windows 10 or 11
 
-1. Under **Assets**, download `iNat-Seasonal-Visualizer.exe`.
-2. Open your Downloads folder and double-click the file. This is a portable
-   application, not an installer, so you can move it anywhere you like.
+1. Under **Assets**, download `iNat-Seasonal-Visualizer-Windows.zip`.
+2. Extract the ZIP file, open the extracted `iNat-Seasonal-Visualizer` folder,
+   and double-click `iNat-Seasonal-Visualizer.exe`. Keep the other extracted
+   files beside the executable; together they make up the portable app.
 3. If Microsoft Defender SmartScreen says **Windows protected your PC**, click
    **More info**. Confirm that the app name is
    `iNat-Seasonal-Visualizer.exe`, then click **Run anyway**.
@@ -49,8 +50,9 @@ choose **Open**, and then click **Open** again.
 
 ## Linux
 
-Download `iNat-Seasonal-Visualizer-Linux.tar.gz`, extract it, and run
-`iNat-Seasonal-Visualizer`.
+Download `iNat-Seasonal-Visualizer-Linux.tar.gz`, extract it, open the extracted
+`iNat-Seasonal-Visualizer` directory, and run the `iNat-Seasonal-Visualizer`
+executable inside it.
 
 ## First launch
 
