@@ -1,16 +1,16 @@
 # iNaturalist Seasonal Visualizer
 
-# By Alan Rockefeller - January 5, 2026
+# By Alan Rockefeller - July 17, 2026
 
-Current source version: **1.0.1**. See [CHANGELOG.md](CHANGELOG.md) for release
+Current version: **1.0.2**. See [CHANGELOG.md](CHANGELOG.md) for release
 details.
 
-A desktop GUI app for exploring **seasonal patterns in iNaturalist observations** within a geographic radius. Search by organism (anything from a genus/species to higher taxa like *Agaricales*), choose a date range, and plot observation frequency by **day**, **week**, or **month** of the year.
+A desktop GUI app for exploring **seasonal patterns in iNaturalist observations** within a geographic radius. Search by organism (anything from a genus/species to higher taxa like _Agaricales_), choose a date range, and plot observation frequency by **day**, **week**, or **month** of the year.
 
 The app supports two search modes:
 
-- **Local Search (fast, offline-ish):** Queries a local `observations.parquet` file using DuckDB (recommended).
-- **Search with API (online):** Queries the iNaturalist API via `pyinaturalist` (slower and rate-limited, but works without local data).
+- **Graph with local data (fast, offline-ish):** Queries a local `observations.parquet` file using DuckDB (recommended).
+- **Graph with live iNat data (online):** Queries the iNaturalist API via `pyinaturalist` (slower and rate-limited, but works without local data).
 
 It also includes an **interactive map dialog** (OpenStreetMap tiles) to set coordinates and radius visually, plus export options for both graphs and data.
 
@@ -20,7 +20,7 @@ It also includes an **interactive map dialog** (OpenStreetMap tiles) to set coor
 
 - **Interactive GUI** (PyQt6 + Matplotlib) with a sidebar of search controls and a live plot.
 - **Local database mode** using DuckDB against `observations.parquet` for fast queries.
-- **Taxonomy expansion** using `taxonomy.parquet` to include *all descendant taxa* of a selected organism (recursive query).
+- **Taxonomy expansion** using `taxonomy.parquet` to include _all descendant taxa_ of a selected organism (recursive query).
 - **Taxon cache** (`taxon_cache.json`) to avoid repeated API lookups and repeated descendant expansion.
 - **Interactive map picker** for latitude/longitude + radius:
   - OpenStreetMap tile fetching
@@ -59,9 +59,9 @@ The easiest way to get started — no Python required. Grab the latest build fro
   The first time, right-click the app and choose **Open** (it is unsigned).
 - **Linux:** download and extract `iNat-Seasonal-Visualizer-Linux.tar.gz`, then run the binary.
 
-On first launch the app offers to download the required data files
-(`observations.parquet` ~1 GB and `taxonomy.parquet`) into its per-user application
-data directory.
+On first launch the app offers to download the approximately 1 GB local database
+into its per-user application data directory. The download is optional; without
+it, searches use the online iNaturalist API instead of the local-data graph.
 
 ### Creating a release
 
@@ -122,7 +122,7 @@ pip install -r requirements.txt
 
 ---
 
-## Data files (optional; enables Local Search and taxonomy expansion)
+## Data files (optional; enables local-data graphing and taxonomy expansion)
 
 The application uses two Parquet files in its runtime data directory:
 
@@ -136,11 +136,12 @@ If either is missing at startup, the app offers two choices:
   such as orders and families to their descendant species.
 - **Use iNaturalist API Only:** starts immediately without the large download.
   Searches require an internet connection and may be slower or rate-limited.
-  Local Search remains disabled until `observations.parquet` is installed.
+  **Graph with local data** remains disabled until `observations.parquet` is
+  installed.
 
 If `observations.parquet` is already installed and only the much smaller taxonomy
-file is missing, Local Search remains available; higher-taxon expansion may be
-limited until the taxonomy file is downloaded.
+file is missing, **Graph with local data** remains available; higher-taxon
+expansion may be limited until the taxonomy file is downloaded.
 
 Packaged apps store mutable files in these writable per-user locations:
 
@@ -165,7 +166,8 @@ The download URLs are:
 - `decimalLongitude`
 - `taxonID`
 
-If these columns are missing, Local Search will fail with an explanatory error.
+If these columns are missing, local-data graphing will fail with an explanatory
+error.
 
 ---
 
@@ -219,8 +221,8 @@ Logs go to:
 5. Choose view: **Daily / Weekly / Monthly**
 
 6. Click:
-   - **Local Search** (fast, when the optional database is installed)
-   - **Search with API** (online, rate-limited, and available without local data)
+   - **Graph with local data** (fast, when the optional database is installed)
+   - **Graph with live iNat data** (online, rate-limited, and available without local data)
 
 ---
 
@@ -231,6 +233,7 @@ To reduce API calls, the app stores cached results in:
 - `taxon_cache.json`
 
 This cache includes:
+
 - Name → taxon ID
 - Name → list of descendant taxon IDs (`<name>_descendants`)
 
@@ -260,7 +263,7 @@ The map dialog fetches OpenStreetMap tiles and caches them:
 
 ## Notes on iNaturalist API limits
 
-Anonymous API usage can be rate-limited (HTTP 429 / 403). The app uses pagination and backoff, but large queries may still be slow.    Local searches are better - they are much faster, and don't hit the API at all.
+Anonymous API usage can be rate-limited (HTTP 429 / 403). The app uses pagination and backoff, but large queries may still be slow. Local searches are better - they are much faster, and don't hit the API at all.
 
 If you plan to do lots of API queries, you can increase limits by configuring credentials (if supported by your setup). The script references:
 
@@ -274,6 +277,7 @@ If you plan to do lots of API queries, you can increase limits by configuring cr
 ## Troubleshooting
 
 ### Wayland / Qt crashes (Linux)
+
 On Linux the app forces Qt onto XWayland (`QT_QPA_PLATFORM=xcb`) automatically.
 If you still have rendering issues, ensure the required libs are installed:
 
@@ -286,11 +290,11 @@ launching. (This forcing does not apply on Windows or macOS, which use their
 native Qt platform plugins.)
 
 ### Environment check fails
+
 At startup the app verifies that the required Python packages are importable.
 A missing package stops startup with an install hint
 (`pip install -r requirements.txt`). Version differences from the tested set are
 logged as warnings only and do not block the app.
-
 
 ---
 
@@ -310,7 +314,5 @@ directory:
 ## License
 
 MIT
-
-
 
 [GitHub Repository](https://github.com/AlanRockefeller/inat.visualizer.py)

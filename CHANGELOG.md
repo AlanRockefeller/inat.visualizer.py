@@ -4,8 +4,13 @@ All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-07-17
+
 ### Changed
 
+- Reduce the main-screen settings and database-statistics text to half the
+  welcome-instruction font size, and move Fetch Taxon IDs from the sidebar to
+  the File menu.
 - Make dark mode the default on a clean installation while preserving each
   user's explicitly saved light/dark preference.
 - Recalculate graph-text contrast from the graph background and recolor
@@ -14,8 +19,10 @@ All notable changes to the iNaturalist Seasonal Visualizer are documented here.
   choice dialog now explains local-search speed and storage benefits versus the
   online API's connectivity and rate-limit tradeoffs.
 - Allow the application to continue in API-only mode when the user skips the
-  database download or a download fails, and visibly disable Local Search when
-  the observation database is unavailable.
+  database download or a download fails, and visibly disable local-data graphing
+  when the observation database is unavailable.
+- Rename the graph buttons to clarify the choice between local database results
+  and live iNaturalist data, and reflect those names in the welcome instructions.
 
 ## [1.0.1] - 2026-07-17
 

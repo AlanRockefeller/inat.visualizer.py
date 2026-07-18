@@ -21,7 +21,7 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
         message = database_download_choice_message(missing_files)
 
         self.assertIn("approximately 1 GB", message)
-        self.assertIn("fast Local Search", message)
+        self.assertIn("Graph with local data", message)
         self.assertIn("disk space", message)
         self.assertIn("API-only mode", message)
         self.assertIn("internet connection", message)
@@ -35,7 +35,7 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
         message = database_download_choice_message(missing_files)
 
         self.assertIn("approximately 8.3 MB", message)
-        self.assertIn("still support Local Search", message)
+        self.assertIn("still support 'Graph with local data'", message)
         self.assertIn("higher taxa", message)
 
     def test_declining_download_continues_in_api_only_mode(self) -> None:

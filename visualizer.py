@@ -130,6 +130,10 @@ DEFAULT_THEME = "dark"
 DARK_WINDOW_BACKGROUND = "#2e2e2e"
 DARK_GRAPH_BACKGROUND = "#3e3e3e"
 LIGHT_BACKGROUND = "#ffffff"
+PLACEHOLDER_DETAILS_FONT_SCALE = 0.5
+PLACEHOLDER_DETAILS_MIN_FONT_SIZE = 6.0
+LOCAL_GRAPH_ACTION_TEXT = "Graph with local data"
+LIVE_GRAPH_ACTION_TEXT = "Graph with live iNat data"
 DATABASE_FILE_INFO: dict[str, dict[str, Any]] = {
     "observations.parquet": {
         "url": "http://images.mushroomobserver.org/observations.parquet",
@@ -232,8 +236,8 @@ def database_download_choice_message(
     download_benefits = []
     if observations_missing:
         download_benefits.append(
-            "Enables fast Local Search without requesting every search from the "
-            "iNaturalist API"
+            f"Enables fast '{LOCAL_GRAPH_ACTION_TEXT}' searches without requesting "
+            "every search from the iNaturalist API"
         )
     if taxonomy_missing:
         download_benefits.append(
@@ -244,16 +248,17 @@ def database_download_choice_message(
     if observations_missing:
         alternative_heading = "Use iNaturalist API Only"
         without_download = (
-            "The app will start immediately in API-only mode. Search with API "
-            "requires an internet connection and may be slower or rate-limited. "
-            "Local Search will be unavailable."
+            f"The app will start immediately in API-only mode. "
+            f"'{LIVE_GRAPH_ACTION_TEXT}' requires an internet connection and may "
+            f"be slower or rate-limited. '{LOCAL_GRAPH_ACTION_TEXT}' will be "
+            "unavailable."
         )
     else:
         alternative_heading = "Continue Without Taxonomy Download"
         without_download = (
-            "The existing observation database will still support Local Search, "
-            "but searches for higher taxa may include only the selected parent "
-            "taxon unless descendants are already cached."
+            f"The existing observation database will still support "
+            f"'{LOCAL_GRAPH_ACTION_TEXT}', but searches for higher taxa may include "
+            "only the selected parent taxon unless descendants are already cached."
         )
 
     benefits_text = "\n".join(f"• {benefit}." for benefit in download_benefits)
@@ -2088,30 +2093,27 @@ class INatSeasonalVisualizer(QMainWindow):
         self.search_mode_label.setWordWrap(True)
         self.sidebar_layout.addRow("Search Mode:", self.search_mode_label)
 
-        # Local Search button
-        self.local_search_button = QPushButton("Local Search")
+        # Graph with local data button
+        self.local_search_button = QPushButton(LOCAL_GRAPH_ACTION_TEXT)
         self.local_search_button.clicked.connect(self.local_search)
         if not self.local_database_available:
-            self.local_search_button.setText("Local Search (Database Not Installed)")
+            self.local_search_button.setText(
+                f"{LOCAL_GRAPH_ACTION_TEXT} (Database Not Installed)"
+            )
             self.local_search_button.setEnabled(False)
             self.local_search_button.setToolTip(
                 "Download observations.parquet to enable fast local searches. "
-                "Use Search with API in the meantime."
+                f"Use {LIVE_GRAPH_ACTION_TEXT} in the meantime."
             )
         self.sidebar_layout.addWidget(self.local_search_button)
 
-        # Search with API button
-        self.search_button = QPushButton("Search with API")
+        # Graph with live iNaturalist data button
+        self.search_button = QPushButton(LIVE_GRAPH_ACTION_TEXT)
         self.search_button.clicked.connect(self.search_observations)
         self.search_button.setToolTip(
             "Search online using the iNaturalist API; an internet connection is required."
         )
         self.sidebar_layout.addWidget(self.search_button)
-
-        # Fetch Taxon IDs button
-        self.fetch_taxon_ids_button = QPushButton("Fetch Taxon IDs")
-        self.fetch_taxon_ids_button.clicked.connect(self.fetch_taxon_ids)
-        self.sidebar_layout.addWidget(self.fetch_taxon_ids_button)
 
         # Show URL button
         self.show_url_button = QPushButton("Show URL")
@@ -2223,6 +2225,10 @@ class INatSeasonalVisualizer(QMainWindow):
         save_action = QAction("Save Settings", self)
         save_action.triggered.connect(self.save_settings)
         file_menu.addAction(save_action)
+
+        fetch_taxon_ids_action = QAction("Fetch Taxon IDs", self)
+        fetch_taxon_ids_action.triggered.connect(self.fetch_taxon_ids)
+        file_menu.addAction(fetch_taxon_ids_action)
 
         export_graph = QAction("Export Graph", self)
         export_graph.triggered.connect(self.export_graph)
@@ -3564,8 +3570,9 @@ class INatSeasonalVisualizer(QMainWindow):
             text_color = self.get_contrasting_text_color(graph_bg_color)
 
             self.ax.clear()
+            detail_message = None
             if message:
-                display_message = message
+                main_message = message
             else:
                 # Load current settings from UI widgets to display them
                 lat = self.lat_input.text()
@@ -3593,24 +3600,27 @@ class INatSeasonalVisualizer(QMainWindow):
 
                 if self.local_database_available:
                     search_instructions = (
-                        "2. Click 'Local Search' to use local data or "
-                        "'Search with API' for online data.\n\n"
+                        f"2. Click '{LOCAL_GRAPH_ACTION_TEXT}' for a fast local "
+                        f"database lookup or '{LIVE_GRAPH_ACTION_TEXT}' to retrieve "
+                        "current observations from iNaturalist.\n\n"
                     )
                 else:
                     search_instructions = (
-                        "2. Click 'Search with API'. The optional local database "
-                        "is not installed, so Local Search is unavailable.\n\n"
+                        f"2. Click '{LIVE_GRAPH_ACTION_TEXT}' to retrieve current "
+                        "observations from iNaturalist. The optional local database "
+                        f"is not installed, so '{LOCAL_GRAPH_ACTION_TEXT}' is "
+                        "unavailable.\n\n"
                     )
 
-                display_message = (
+                main_message = (
                     "Welcome to iNaturalist Seasonal Visualizer!\n\n"
                     "To get started:\n"
                     "1. Enter an organism name (e.g., Russula brevipes, "
                     "Agaricales, etc).\n"
                     + search_instructions
                     + "The graph will display seasonal observation patterns.\n\n"
-                    + settings_text
                 )
+                detail_message = settings_text
 
                 if self.total_observations:
                     try:
@@ -3625,16 +3635,44 @@ class INatSeasonalVisualizer(QMainWindow):
                         f"  - Total Observations: {obs_count}\n"
                         f"  - Unique Taxa: {taxa_count}\n\n"
                     )
-                    display_message += database_stats_text
-            self.ax.text(
-                0.5,
-                0.5,
-                display_message,
-                color=text_color,
-                ha="center",
-                va="center",
-                wrap=True,
-            )
+                    detail_message += database_stats_text
+
+            main_font_size = self.graph_font_size * self.scale_factor
+            if detail_message is None:
+                self.ax.text(
+                    0.5,
+                    0.5,
+                    main_message,
+                    color=text_color,
+                    fontsize=main_font_size,
+                    ha="center",
+                    va="center",
+                    wrap=True,
+                )
+            else:
+                self.ax.text(
+                    0.5,
+                    0.51,
+                    main_message.rstrip(),
+                    color=text_color,
+                    fontsize=main_font_size,
+                    ha="center",
+                    va="bottom",
+                    wrap=True,
+                )
+                self.ax.text(
+                    0.5,
+                    0.49,
+                    detail_message.rstrip(),
+                    color=text_color,
+                    fontsize=max(
+                        PLACEHOLDER_DETAILS_MIN_FONT_SIZE,
+                        main_font_size * PLACEHOLDER_DETAILS_FONT_SCALE,
+                    ),
+                    ha="center",
+                    va="top",
+                    wrap=True,
+                )
             self.ax.set_axis_off()
             self.canvas.draw()
             self.info_bar.setText("")

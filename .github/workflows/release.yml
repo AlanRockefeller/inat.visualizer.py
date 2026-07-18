@@ -1,7 +1,7 @@
 name: Build and Release
 
 # Builds standalone executables for Windows, macOS, and Linux whenever a
-# version tag (e.g. v1.0.1) is pushed, then publishes them to a GitHub Release.
+# version tag (e.g. v1.0.2) is pushed, then publishes them to a GitHub Release.
 # You can also run it manually from the Actions tab via workflow_dispatch.
 
 on:
@@ -172,13 +172,13 @@ jobs:
           body: |
             Standalone builds of the iNaturalist Seasonal Visualizer for Windows, macOS, and Linux.
 
-            **v1.0.1 fixes the packaged-app startup crash caused by incompatible
-            `pyinaturalist` rate-limiter dependencies.**
+            **v1.0.2 makes the local database optional and improves dark-mode
+            consistency and text contrast.**
 
-            **Note:** On first launch the app will offer to download the required
-            data files (`observations.parquet`, ~1 GB, and `taxonomy.parquet`)
-            into a writable per-user application data directory. An internet
-            connection is needed for that one-time download.
+            **Note:** On first launch the app offers to download the approximately
+            1 GB local database into a writable per-user application data
+            directory. The download is optional; without it, searches use the
+            online iNaturalist API instead of Local Search.
 
             - **Windows:** download `iNat-Seasonal-Visualizer.exe` and run it.
             - **macOS (Apple Silicon):** download and unzip
