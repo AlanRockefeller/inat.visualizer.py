@@ -15,17 +15,19 @@ if sys.platform.startswith("linux") and "QT_QPA_PLATFORM" not in os.environ:
 
 # --- stdlib ---
 import argparse
-from collections.abc import Mapping
-from typing import Any
 import importlib
 import json
 import logging
 import math
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from io import BytesIO
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlencode
 
 from inat_visualizer_version import __version__
@@ -136,7 +138,7 @@ LOCAL_GRAPH_ACTION_TEXT = "Graph with local data"
 LIVE_GRAPH_ACTION_TEXT = "Graph with live iNat data"
 DATABASE_FILE_INFO: dict[str, dict[str, Any]] = {
     "observations.parquet": {
-        "url": "http://images.mushroomobserver.org/observations.parquet",
+        "url": "https://images.mushroomobserver.org/observations.parquet",
         "size": 1025327222,
         "description": (
             "iNaturalist observation dates, locations, and taxon IDs for fast "
@@ -144,7 +146,7 @@ DATABASE_FILE_INFO: dict[str, dict[str, Any]] = {
         ),
     },
     "taxonomy.parquet": {
-        "url": "http://images.mushroomobserver.org/taxonomy.parquet",
+        "url": "https://images.mushroomobserver.org/taxonomy.parquet",
         "size": 8697166,
         "description": (
             "the iNaturalist taxonomy hierarchy used to include descendants of "
@@ -152,6 +154,8 @@ DATABASE_FILE_INFO: dict[str, dict[str, Any]] = {
         ),
     },
 }
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 2
 
 
 def normalize_theme(value: Any) -> str:
@@ -219,6 +223,79 @@ def missing_database_files(
     ]
 
 
+def available_database_updates(
+    working_dir: str | Path,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return changed files from a differently sized hosted database release.
+
+    The observation database is the opt-in marker for local mode. If it is not
+    installed, avoid all network requests so API-only users are not repeatedly
+    asked about the optional database.
+    """
+    data_dir = Path(working_dir)
+    if not (data_dir / "observations.parquet").exists():
+        return []
+
+    def differently_sized_remote_file(
+        filename: str, configured_info: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]] | None:
+        local_path = data_dir / filename
+        if not local_path.exists():
+            return None
+
+        local_stat = local_path.stat()
+        try:
+            response = requests.head(
+                configured_info["url"],
+                headers={"User-Agent": build_app_user_agent()},
+                allow_redirects=True,
+                timeout=5,
+            )
+            if response.status_code == 304:
+                return None
+            response.raise_for_status()
+        except RequestException as error:
+            # An update check must never prevent an offline startup.
+            logging.info("Could not check %s for updates: %s", filename, error)
+            return None
+
+        try:
+            remote_size = int(response.headers.get("content-length", ""))
+        except (TypeError, ValueError):
+            logging.info("Update check for %s returned no file size.", filename)
+            return None
+
+        # Uploading a locally generated file gives the hosted copy a newer
+        # Last-Modified timestamp even though its contents are identical. The
+        # database build guarantees that real updates have a different size,
+        # so Content-Length is the authoritative version signal.
+        if remote_size == local_stat.st_size:
+            return None
+
+        remote_info = dict(configured_info)
+        remote_info["size"] = remote_size
+        return filename, remote_info
+
+    # observations.parquet is the release marker for the coordinated database
+    # files. In particular, do not offer an old hosted taxonomy snapshot when a
+    # freshly built observation database has already been uploaded and matches.
+    observations_update = differently_sized_remote_file(
+        "observations.parquet", DATABASE_FILE_INFO["observations.parquet"]
+    )
+    if observations_update is None:
+        return []
+
+    updates = [observations_update]
+    for filename, configured_info in DATABASE_FILE_INFO.items():
+        if filename == "observations.parquet":
+            continue
+        companion_update = differently_sized_remote_file(filename, configured_info)
+        if companion_update is not None:
+            updates.append(companion_update)
+
+    return updates
+
+
 def database_download_choice_message(
     files_to_download: list[tuple[str, dict[str, Any]]],
 ) -> str:
@@ -275,6 +352,7 @@ def database_download_choice_message(
 INATURALIST_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
 INATURALIST_GET_QUERY_LIMIT = 1800
 OBSERVATION_TAXON_FILTER_KEYS = ("taxon_id", "not_in_taxon_id")
+HTTP_ERROR_BODY_LOG_LIMIT = 500
 MAX_TILES_PER_REQUEST = 100
 MAX_CACHE_SIZE = 500  # Max number of tiles to keep in memory (RAM)
 TILE_CACHE_DIR_NAME = "tile_cache"
@@ -302,6 +380,47 @@ def calculate_local_search_bounds(
     lon_min = lon - math.degrees(lon_diff)
     lon_max = lon + math.degrees(lon_diff)
     return lat_min, lat_max, lon_min, lon_max
+
+
+def calendar_aligned_week_numbers(dates: pd.Series) -> pd.Series:
+    """Return 1-52 week bins with ISO year-boundary dates kept by month.
+
+    ISO week 53 straddles December and January, while some late-December dates
+    belong to ISO week 1 and some early-January dates belong to ISO week 52.
+    Seasonal plots use a fixed 52-bin calendar, so put January boundary dates
+    in week 1 and December boundary dates in week 52 instead of dropping them
+    or displaying them at the opposite end of the year.
+    """
+    weeks = dates.dt.isocalendar().week.astype("int64")
+    months = dates.dt.month
+    january_boundary = (months == 1) & weeks.isin((52, 53))
+    december_boundary = (months == 12) & weeks.isin((1, 53))
+    return weeks.mask(january_boundary, 1).mask(december_boundary, 52)
+
+
+def http_error_details(error: HTTPError) -> tuple[int | None, str | None]:
+    """Return an HTTP status and bounded single-line response-body excerpt."""
+    response = error.response
+    if response is None:
+        return None, None
+    body = ""
+    try:
+        body = " ".join(response.text.split())
+    except (AttributeError, UnicodeError):
+        pass
+    if len(body) > HTTP_ERROR_BODY_LOG_LIMIT:
+        body = body[: HTTP_ERROR_BODY_LOG_LIMIT - 3] + "..."
+    return response.status_code, body or None
+
+
+def create_log_file_handler(log_path: str | Path) -> RotatingFileHandler:
+    """Create the application's bounded, UTF-8 rotating file handler."""
+    return RotatingFileHandler(
+        log_path,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
 
 
 def should_post_observation_search(params: dict[str, Any]) -> bool:
@@ -1714,7 +1833,13 @@ class INatSeasonalVisualizer(QMainWindow):
         if self.splash_screen:
             self.splash_screen.update_status("Checking for missing data files...")
             QApplication.processEvents()
+        check_for_updates = self.local_database_available
         self.download_missing_files()  # Offer local database or API-only mode.
+        if check_for_updates:
+            if self.splash_screen:
+                self.splash_screen.update_status("Checking for database updates...")
+                QApplication.processEvents()
+            self.check_for_database_updates()
 
         if self.splash_screen:
             self.splash_screen.update_status("Initializing application settings...")
@@ -1837,6 +1962,43 @@ class INatSeasonalVisualizer(QMainWindow):
         dialog.exec()
         return dialog.clickedButton() is download_button
 
+    def prompt_for_database_update(
+        self, files_to_update: list[tuple[str, dict[str, Any]]]
+    ) -> bool:
+        """Return whether the user chose to replace installed database files."""
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setWindowTitle("Local Database Update Available")
+        dialog.setText("A newer local iNaturalist database is available.")
+        total_bytes = sum(int(info["size"]) for _name, info in files_to_update)
+        file_names = ", ".join(filename for filename, _info in files_to_update)
+        dialog.setInformativeText(
+            f"Download approximately {self.human_readable_size(total_bytes)} now? "
+            "The app will replace the installed database only after the new "
+            "file finishes downloading successfully."
+        )
+        dialog.setDetailedText(f"Files to update: {file_names}")
+        update_button = dialog.addButton(
+            "Download Update", QMessageBox.ButtonRole.AcceptRole
+        )
+        later_button = dialog.addButton(
+            "Not Now", QMessageBox.ButtonRole.RejectRole
+        )
+        dialog.setDefaultButton(later_button)
+        dialog.setEscapeButton(later_button)
+        dialog.exec()
+        return dialog.clickedButton() is update_button
+
+    def check_for_database_updates(self) -> None:
+        """Offer newer remote files only to users with a local database."""
+        files_to_update = available_database_updates(self.working_dir)
+        if not files_to_update:
+            return
+        if not self.prompt_for_database_update(files_to_update):
+            logging.info("User deferred the available local database update.")
+            return
+        self.download_database_files(files_to_update, replacing_existing=True)
+
     def download_missing_files(self) -> None:
         """Offer to download missing local data without making it mandatory."""
         files_to_download = missing_database_files(self.working_dir)
@@ -1850,7 +2012,16 @@ class INatSeasonalVisualizer(QMainWindow):
             )
             return
 
-        # Download each missing file
+        self.download_database_files(files_to_download, replacing_existing=False)
+
+    def download_database_files(
+        self,
+        files_to_download: list[tuple[str, dict[str, Any]]],
+        *,
+        replacing_existing: bool,
+    ) -> None:
+        """Download database files and atomically install each completed file."""
+
         for filename, info in files_to_download:
             file_path = os.path.join(self.working_dir, filename)
             url = info["url"]
@@ -1890,6 +2061,23 @@ class INatSeasonalVisualizer(QMainWindow):
                                 )
                                 QApplication.processEvents()  # Update progress bar in real-time
 
+                if total_size > 0 and downloaded != total_size:
+                    raise OSError(
+                        f"download ended at {downloaded} of {total_size} bytes"
+                    )
+
+                remote_modified = response.headers.get("last-modified")
+                if remote_modified:
+                    try:
+                        remote_timestamp = parsedate_to_datetime(
+                            remote_modified
+                        ).timestamp()
+                        os.utime(temp_path, (remote_timestamp, remote_timestamp))
+                    except (OSError, TypeError, ValueError, OverflowError):
+                        logging.debug(
+                            "Could not preserve Last-Modified for %s", filename
+                        )
+
                 os.replace(temp_path, file_path)
                 logging.info(f"Successfully downloaded {filename} to {file_path}")
                 self.status_bar.showMessage(f"Downloaded {filename} ({human_size})")
@@ -1897,6 +2085,9 @@ class INatSeasonalVisualizer(QMainWindow):
                     f"Successfully downloaded {filename}"
                 )
                 QApplication.processEvents()
+
+                if filename == "taxonomy.parquet":
+                    self.invalidate_descendant_taxon_cache()
 
             except Exception as e:
                 logging.error(f"Failed to download {filename}: {e!s}")
@@ -1907,12 +2098,17 @@ class INatSeasonalVisualizer(QMainWindow):
                 except OSError:
                     pass
                 self.enhanced_progress.hide_progress()
+                failure_outcome = (
+                    "The currently installed file was left unchanged. "
+                    if replacing_existing
+                    else "The app will continue without this file. "
+                )
                 QMessageBox.warning(
                     self,
                     "Download Error",
                     f"Failed to download {filename}: {e!s}\n\n"
-                    "The app will continue without this file. You can use Search "
-                    "with API, or restart later to try the download again.\n\n"
+                    f"{failure_outcome}You can use Search with API, or restart "
+                    "later to try the download again.\n\n"
                     f"You can also manually download it from {url} and place it "
                     f"in {self.working_dir}.",
                 )
@@ -1924,6 +2120,20 @@ class INatSeasonalVisualizer(QMainWindow):
                 QApplication.processEvents()
 
         self.local_database_available = os.path.exists(self.observations_file)
+
+    def invalidate_descendant_taxon_cache(self) -> None:
+        """Remove taxonomy-derived cache entries after installing new taxonomy."""
+        stale_keys = [
+            key for key in self.taxon_cache if key.endswith("_descendants")
+        ]
+        if not stale_keys:
+            return
+        for key in stale_keys:
+            del self.taxon_cache[key]
+        self.save_taxon_cache()
+        logging.info(
+            "Removed %d stale descendant-taxonomy cache entries.", len(stale_keys)
+        )
 
     def init_args(
         self, lat: float | None, lon: float | None, radius: float | None
@@ -1947,10 +2157,18 @@ class INatSeasonalVisualizer(QMainWindow):
             if os.path.exists(self.taxon_cache_file):
                 with open(self.taxon_cache_file, "r") as f:
                     self.taxon_cache = json.load(f)
-                logging.info(f"Loaded taxon cache from {self.taxon_cache_file}")
+                descendant_lists = sum(
+                    key.endswith("_descendants") for key in self.taxon_cache
+                )
+                logging.info(
+                    "Loaded taxon cache from %s (%d entries, %d descendant lists)",
+                    self.taxon_cache_file,
+                    len(self.taxon_cache),
+                    descendant_lists,
+                )
                 for key, value in self.taxon_cache.items():
                     if key.endswith("_descendants"):
-                        logging.info(
+                        logging.debug(
                             f"Loaded {len(value)} descendant taxon IDs for {key[:-11]}"
                         )
             else:
@@ -2583,7 +2801,7 @@ class INatSeasonalVisualizer(QMainWindow):
                     break  # Exit retry loop on success
 
                 except HTTPError as e:
-                    status_code = e.response.status_code if e.response else None
+                    status_code, response_body = http_error_details(e)
                     if status_code == 414 and not force_post:
                         force_post = True
                         logging.warning(
@@ -2607,7 +2825,17 @@ class INatSeasonalVisualizer(QMainWindow):
                         time.sleep(wait_time)
                     else:
                         self.enhanced_progress.hide_progress()
-                        logging.error("API search HTTP %s on page %s", status_code, page)
+                        if response_body:
+                            logging.error(
+                                "API search HTTP %s on page %s: %s",
+                                status_code,
+                                page,
+                                response_body,
+                            )
+                        else:
+                            logging.error(
+                                "API search HTTP %s on page %s", status_code, page
+                            )
                         return all_results, str(e)  # Return partial data with error
                 except Exception as e:
                     self.enhanced_progress.hide_progress()
@@ -2909,7 +3137,7 @@ class INatSeasonalVisualizer(QMainWindow):
             tick_interval = 30
             tick_positions = range(0, bins, tick_interval)
         elif view == "weekly":
-            df["group"] = df["date"].dt.isocalendar().week
+            df["group"] = calendar_aligned_week_numbers(df["date"])
             bins = 52
             labels = [
                 "Jan",
@@ -3358,7 +3586,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 labels = [f"Day {i}" for i in range(1, 367)]
                 tick_positions = range(0, bins, 30)
             elif view == "weekly":
-                df["group"] = df["date"].dt.isocalendar().week
+                df["group"] = calendar_aligned_week_numbers(df["date"])
                 bins = 52
                 labels = [
                     "Jan",
@@ -3743,15 +3971,23 @@ def main() -> None:
         level=log_level,
         format="%(asctime)s - %(levelname)s - %(message)s",
         handlers=[
-            logging.FileHandler(working_dir / "inat_visualizer.log"),
+            create_log_file_handler(working_dir / "inat_visualizer.log"),
             logging.StreamHandler(),
         ],
+        force=True,
     )
 
     # Silence noisy third-party DEBUG chatter (matplotlib font scoring, PIL,
     # HTTP internals) so --debug stays focused on this app's own messages.
     for noisy_logger in ("matplotlib", "PIL", "urllib3", "requests", "asyncio"):
         logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
+    logging.info(
+        "Starting iNaturalist Seasonal Visualizer v%s (debug=%s, data_dir=%s)",
+        __version__,
+        args.debug,
+        working_dir,
+    )
 
     if args.debug:
         print(f"DEBUG: Logging level set to {log_level}")

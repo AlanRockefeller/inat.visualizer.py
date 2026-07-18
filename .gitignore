@@ -1,6 +1,8 @@
 # Data files
 *.parquet
 *.csv
+*.zip
+*.zip.part
 taxoncache.json
 duckdb.query
 *.zip.url

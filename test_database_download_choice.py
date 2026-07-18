@@ -2,12 +2,17 @@
 
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from requests.exceptions import RequestException
+
 from visualizer import (
+    DATABASE_FILE_INFO,
     INatSeasonalVisualizer,
+    available_database_updates,
     database_download_choice_message,
     missing_database_files,
 )
@@ -89,10 +94,262 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
                 patch("visualizer.QMessageBox.warning") as warning_mock,
                 patch("visualizer.QApplication.processEvents"),
             ):
-                INatSeasonalVisualizer.download_missing_files(window)
+                INatSeasonalVisualizer.download_database_files(
+                    window,
+                    missing_database_files(temp_dir),
+                    replacing_existing=False,
+                )
 
         self.assertFalse(window.local_database_available)
         warning_mock.assert_called_once()
+
+    def test_update_check_is_skipped_for_api_only_installation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("visualizer.requests.head") as head_mock:
+                updates = available_database_updates(temp_dir)
+
+        self.assertEqual(updates, [])
+        head_mock.assert_not_called()
+
+    def test_head_finds_installed_database_with_different_size(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            observations_path = Path(temp_dir, "observations.parquet")
+            observations_path.write_bytes(b"old")
+            response = SimpleNamespace(
+                status_code=200,
+                headers={
+                    "content-length": "12",
+                    "last-modified": "Thu, 02 Jan 2025 00:00:00 GMT",
+                },
+                raise_for_status=MagicMock(),
+            )
+
+            with patch("visualizer.requests.head", return_value=response) as head_mock:
+                updates = available_database_updates(temp_dir)
+
+        self.assertEqual([name for name, _info in updates], ["observations.parquet"])
+        self.assertEqual(updates[0][1]["size"], 12)
+        call = head_mock.call_args
+        self.assertEqual(
+            call.args[0], DATABASE_FILE_INFO["observations.parquet"]["url"]
+        )
+        self.assertNotIn("If-Modified-Since", call.kwargs["headers"])
+        self.assertTrue(call.kwargs["allow_redirects"])
+
+    def test_same_size_does_not_offer_update_even_if_server_timestamp_is_newer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = b"same database"
+            Path(temp_dir, "observations.parquet").write_bytes(database)
+            response = SimpleNamespace(
+                status_code=200,
+                headers={
+                    "content-length": str(len(database)),
+                    "last-modified": "Sat, 18 Jul 2026 03:51:22 GMT",
+                },
+                raise_for_status=MagicMock(),
+            )
+
+            with patch("visualizer.requests.head", return_value=response):
+                updates = available_database_updates(temp_dir)
+
+        self.assertEqual(updates, [])
+
+    def test_matching_observations_suppress_older_taxonomy_offer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            observations = b"current observations"
+            Path(temp_dir, "observations.parquet").write_bytes(observations)
+            Path(temp_dir, "taxonomy.parquet").write_bytes(b"new local taxonomy")
+            response = SimpleNamespace(
+                status_code=200,
+                headers={"content-length": str(len(observations))},
+                raise_for_status=MagicMock(),
+            )
+
+            with patch(
+                "visualizer.requests.head", return_value=response
+            ) as head_mock:
+                updates = available_database_updates(temp_dir)
+
+        self.assertEqual(updates, [])
+        head_mock.assert_called_once()
+        self.assertEqual(
+            head_mock.call_args.args[0],
+            DATABASE_FILE_INFO["observations.parquet"]["url"],
+        )
+
+    def test_observations_update_includes_different_companion_taxonomy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            Path(temp_dir, "observations.parquet").write_bytes(b"old observations")
+            Path(temp_dir, "taxonomy.parquet").write_bytes(b"old taxonomy")
+            observation_response = SimpleNamespace(
+                status_code=200,
+                headers={"content-length": "100"},
+                raise_for_status=MagicMock(),
+            )
+            taxonomy_response = SimpleNamespace(
+                status_code=200,
+                headers={"content-length": "50"},
+                raise_for_status=MagicMock(),
+            )
+
+            with patch(
+                "visualizer.requests.head",
+                side_effect=[observation_response, taxonomy_response],
+            ):
+                updates = available_database_updates(temp_dir)
+
+        self.assertEqual(
+            [name for name, _info in updates],
+            ["observations.parquet", "taxonomy.parquet"],
+        )
+
+    def test_different_size_is_offered_without_using_server_timestamp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            observations_path = Path(temp_dir, "observations.parquet")
+            observations_path.write_bytes(b"new local DWCA build")
+            response = SimpleNamespace(
+                status_code=200,
+                headers={
+                    "content-length": "3",
+                    "last-modified": "Sat, 03 May 2025 06:32:58 GMT",
+                },
+                raise_for_status=MagicMock(),
+            )
+
+            with patch("visualizer.requests.head", return_value=response):
+                updates = available_database_updates(temp_dir)
+
+        self.assertEqual([name for name, _info in updates], ["observations.parquet"])
+
+    def test_failed_head_check_does_not_interrupt_offline_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            Path(temp_dir, "observations.parquet").write_bytes(b"current")
+
+            with patch(
+                "visualizer.requests.head",
+                side_effect=RequestException("offline"),
+            ):
+                updates = available_database_updates(temp_dir)
+
+        self.assertEqual(updates, [])
+
+    def test_declining_database_update_leaves_files_untouched(self) -> None:
+        update = ("observations.parquet", DATABASE_FILE_INFO["observations.parquet"])
+        window = SimpleNamespace(
+            working_dir="/unused",
+            prompt_for_database_update=MagicMock(return_value=False),
+            download_database_files=MagicMock(),
+        )
+
+        with patch("visualizer.available_database_updates", return_value=[update]):
+            INatSeasonalVisualizer.check_for_database_updates(window)
+
+        window.prompt_for_database_update.assert_called_once_with([update])
+        window.download_database_files.assert_not_called()
+
+    def test_accepting_database_update_starts_replacement_download(self) -> None:
+        update = ("observations.parquet", DATABASE_FILE_INFO["observations.parquet"])
+        window = SimpleNamespace(
+            working_dir="/unused",
+            prompt_for_database_update=MagicMock(return_value=True),
+            download_database_files=MagicMock(),
+        )
+
+        with patch("visualizer.available_database_updates", return_value=[update]):
+            INatSeasonalVisualizer.check_for_database_updates(window)
+
+        window.download_database_files.assert_called_once_with(
+            [update], replacing_existing=True
+        )
+
+    def test_failed_update_preserves_installed_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            observations_path = Path(temp_dir, "observations.parquet")
+            observations_path.write_bytes(b"old database")
+            info = {**DATABASE_FILE_INFO["observations.parquet"], "size": 20}
+            response = MagicMock()
+            response.headers = {"content-length": "20"}
+            response.iter_content.return_value = [b"incomplete"]
+            window = SimpleNamespace(
+                working_dir=temp_dir,
+                observations_file=str(observations_path),
+                human_readable_size=MagicMock(return_value="20 B"),
+                status_bar=MagicMock(),
+                enhanced_progress=MagicMock(),
+            )
+
+            with (
+                patch("visualizer.requests.get", return_value=response),
+                patch("visualizer.QMessageBox.warning") as warning_mock,
+                patch("visualizer.QApplication.processEvents"),
+            ):
+                INatSeasonalVisualizer.download_database_files(
+                    window,
+                    [("observations.parquet", info)],
+                    replacing_existing=True,
+                )
+
+            self.assertEqual(observations_path.read_bytes(), b"old database")
+            self.assertFalse(Path(f"{observations_path}.part").exists())
+
+        self.assertIn("left unchanged", warning_mock.call_args.args[2])
+
+    def test_successful_update_replaces_file_and_preserves_remote_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            observations_path = Path(temp_dir, "observations.parquet")
+            observations_path.write_bytes(b"old database")
+            new_database = b"new database contents"
+            remote_modified = "Thu, 02 Jan 2025 00:00:00 GMT"
+            info = {
+                **DATABASE_FILE_INFO["observations.parquet"],
+                "size": len(new_database),
+            }
+            response = MagicMock()
+            response.headers = {
+                "content-length": str(len(new_database)),
+                "last-modified": remote_modified,
+            }
+            response.iter_content.return_value = [new_database[:5], new_database[5:]]
+            window = SimpleNamespace(
+                working_dir=temp_dir,
+                observations_file=str(observations_path),
+                human_readable_size=MagicMock(return_value="21 B"),
+                status_bar=MagicMock(),
+                enhanced_progress=MagicMock(),
+            )
+
+            with (
+                patch("visualizer.requests.get", return_value=response),
+                patch("visualizer.QApplication.processEvents"),
+            ):
+                INatSeasonalVisualizer.download_database_files(
+                    window,
+                    [("observations.parquet", info)],
+                    replacing_existing=True,
+                )
+
+            self.assertEqual(observations_path.read_bytes(), new_database)
+            expected_mtime = datetime(
+                2025, 1, 2, tzinfo=timezone.utc
+            ).timestamp()
+            self.assertEqual(observations_path.stat().st_mtime, expected_mtime)
+
+    def test_taxonomy_update_invalidates_only_descendant_cache_entries(self) -> None:
+        window = SimpleNamespace(
+            taxon_cache={
+                "Agaricales": 47170,
+                "Agaricales_descendants": [47170, 48723],
+                "Fungi_descendants": [47170],
+            },
+            save_taxon_cache=MagicMock(),
+        )
+
+        INatSeasonalVisualizer.invalidate_descendant_taxon_cache(window)
+
+        self.assertEqual(window.taxon_cache, {"Agaricales": 47170})
+        window.save_taxon_cache.assert_called_once_with()
 
     def test_api_search_does_not_require_local_taxonomy(self) -> None:
         def text_field(value: str) -> SimpleNamespace:

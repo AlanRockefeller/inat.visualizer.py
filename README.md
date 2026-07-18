@@ -124,10 +124,14 @@ pip install -r requirements.txt
 
 ## Data files (optional; enables local-data graphing and taxonomy expansion)
 
-The application uses two Parquet files in its runtime data directory:
+The application uses two Parquet files in its runtime data directory. Sizes
+depend on the source snapshot; the July 2026 DWCA rebuild produced:
 
-- `observations.parquet` (~1.02 GB)
-- `taxonomy.parquet` (~8.7 MB)
+- `observations.parquet` (~1.6 GB)
+- `taxonomy.parquet` (~6.2 MB)
+
+The older hosted snapshots downloaded by the app are approximately 1.02 GB and
+8.7 MB, respectively.
 
 If either is missing at startup, the app offers two choices:
 
@@ -154,8 +158,39 @@ Runs from source continue to use the current working directory.
 
 The download URLs are:
 
-- `http://images.mushroomobserver.org/observations.parquet`
-- `http://images.mushroomobserver.org/taxonomy.parquet`
+- `https://images.mushroomobserver.org/observations.parquet`
+- `https://images.mushroomobserver.org/taxonomy.parquet`
+
+When the observation database is installed, startup uses a lightweight HEAD
+request to compare the hosted `observations.parquet` `Content-Length` with its
+installed file size. A different size means a coordinated database update is
+available; the app then checks the companion taxonomy file, asks before
+downloading the changed files, and atomically replaces each installed copy only
+after its download completes. A matching observation file does not prompt,
+regardless of `Last-Modified` timestamps or a different older taxonomy snapshot
+on the server. API-only installations do not perform this update check.
+
+### Rebuilding the local databases from iNaturalist
+
+Run the repository's updater to rebuild both Parquet files from the current
+iNaturalist Darwin Core archives:
+
+```bash
+./update_database.py
+```
+
+The script uses `gbif-observations-dwca.zip` from the repository directory when
+it is already present (including a file downloaded separately with `wget`). If
+it is absent, the script downloads it. It also downloads and rebuilds the
+separate iNaturalist taxonomy archive required for higher-taxon searches.
+
+Close the visualizer before running the update. The observation archive is
+about 25 GB and its required CSV currently expands to more than 100 GB, so allow
+roughly 140 GB of free space. The updater extracts only the two CSV members the
+app needs; it does not retain the media or DNA extension data. New databases are
+validated before they atomically replace the installed files. Extracted CSVs
+and source archives are removed after success. Use `--keep-archives` to retain
+the ZIP files, or `--help` for paths and other options.
 
 ### Expected columns
 
@@ -307,7 +342,10 @@ directory:
 - `taxon_cache.json` (API/taxon cache)
 - `descendant_taxons.txt` (optional manual descendant list)
 - `tile_cache/` (map tile disk cache)
-- `observations.parquet` + `taxonomy.parquet` (Quite large (1 gb), if downloaded)
+- `observations.parquet` + `taxonomy.parquet` (large; size varies by snapshot)
+
+The application log rotates at 2 MiB and retains at most two backups, preventing
+debug sessions or long-running installations from growing it without bound.
 
 ---
 

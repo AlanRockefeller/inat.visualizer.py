@@ -4,6 +4,29 @@ All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Add a resumable DWCA database updater that rebuilds and validates both local
+  Parquet databases, invalidates stale taxonomy descendant caches, and removes
+  the large raw inputs after a successful atomic replacement.
+- Check installed local databases for differently sized remote versions with
+  HEAD requests, ask before downloading, and atomically replace completed files.
+
+### Fixed
+
+- Prevent false update prompts after a locally generated database is copied to
+  the web server by comparing file sizes instead of `Last-Modified` timestamps
+  and using the observation database as the coordinated release marker.
+- Keep ISO year-boundary observations in a fixed 52-week seasonal graph by
+  assigning January boundary dates to week 1 and December dates to week 52.
+- Preserve HTTP error status codes for falsey `requests` responses and include a
+  bounded response-body excerpt in diagnostics.
+
+### Changed
+
+- Rotate application logs at 2 MiB with two backups, record versioned startup
+  markers, and move per-taxon cache-loading details from INFO to DEBUG.
+
 ## [1.0.2] - 2026-07-17
 
 ### Changed
