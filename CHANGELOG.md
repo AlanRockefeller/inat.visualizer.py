@@ -2,6 +2,14 @@
 
 All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
+## [1.0.5] - 2026-07-17
+
+### Changed
+
+- Add step-by-step Windows SmartScreen and macOS Gatekeeper instructions to
+  every GitHub release, and keep the version-neutral installation guide in the
+  repository for easy reference.
+
 ## [1.0.4] - 2026-07-17
 
 ### Changed

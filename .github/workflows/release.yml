@@ -159,34 +159,17 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: artifacts/**/*
           generate_release_notes: true
-          body: |
-            Standalone builds of the iNaturalist Seasonal Visualizer for Windows, macOS, and Linux.
-
-            **v1.0.2 makes the local database optional and improves dark-mode
-            consistency and text contrast.**
-
-            **Note:** On first launch the app offers to download the approximately
-            1 GB local database into a writable per-user application data
-            directory. The download is optional; without it, searches use the
-            online iNaturalist API instead of Local Search.
-
-            - **Windows:** download `iNat-Seasonal-Visualizer.exe` and run it.
-            - **macOS (Apple Silicon):** download and unzip
-              `iNat-Seasonal-Visualizer-macOS-Apple-Silicon.zip`.
-            - **macOS (Intel):** download and unzip
-              `iNat-Seasonal-Visualizer-macOS-Intel.zip`.
-            - **Linux:** download and extract `iNat-Seasonal-Visualizer-Linux.tar.gz`,
-              then run the binary.
-
-            **macOS note:** Right-click → Open the app the first time, since the
-            current builds are unsigned.
+          body_path: INSTALL.md

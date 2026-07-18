@@ -31,6 +31,17 @@ class VersionMetadataTests(unittest.TestCase):
 
         self.assertIn(f"Current source version: **{__version__}**", readme)
 
+    def test_release_workflow_uses_installation_guide(self) -> None:
+        workflow = (PROJECT_ROOT / ".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+        install_guide = (PROJECT_ROOT / "INSTALL.md").read_text(encoding="utf-8")
+
+        self.assertIn("body_path: INSTALL.md", workflow)
+        self.assertIn("## Windows 10 or 11", install_guide)
+        self.assertIn("## macOS", install_guide)
+        self.assertIn("## Linux", install_guide)
+
 
 if __name__ == "__main__":
     unittest.main()

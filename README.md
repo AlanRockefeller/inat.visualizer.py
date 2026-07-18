@@ -2,7 +2,7 @@
 
 # By Alan Rockefeller - July 17, 2026
 
-Current source version: **1.0.4**. See [CHANGELOG.md](CHANGELOG.md) for release
+Current source version: **1.0.5**. See [CHANGELOG.md](CHANGELOG.md) for release
 details.
 
 A desktop GUI app for exploring **seasonal patterns in iNaturalist observations** within a geographic radius. Search by organism (anything from a genus/species to higher taxa like _Agaricales_), choose a date range, and plot observation frequency by **day**, **week**, or **month** of the year.
@@ -48,20 +48,12 @@ It also includes an **interactive map dialog** (OpenStreetMap tiles) to set coor
 
 ## Download (prebuilt apps for Windows & macOS)
 
-The easiest way to get started — no Python required. Grab the latest build from the
-[**Releases**](https://github.com/AlanRockefeller/inat.visualizer.py/releases) page:
-
-- **Windows:** download `iNat-Seasonal-Visualizer.exe` and double-click it.
-- **macOS (Apple Silicon):** download and unzip
-  `iNat-Seasonal-Visualizer-macOS-Apple-Silicon.zip`.
-- **macOS (Intel):** download and unzip
-  `iNat-Seasonal-Visualizer-macOS-Intel.zip`.
-  The first time, right-click the app and choose **Open** (it is unsigned).
-- **Linux:** download and extract `iNat-Seasonal-Visualizer-Linux.tar.gz`, then run the binary.
-
-On first launch the app offers to download the approximately 1 GB local database
-into its per-user application data directory. The download is optional; without
-it, searches use the online iNaturalist API instead of the local-data graph.
+The easiest way to get started — no Python required — is to grab the latest build
+from the [**Releases**](https://github.com/AlanRockefeller/inat.visualizer.py/releases)
+page. See the [Windows, macOS, and Linux installation guide](INSTALL.md) for the
+first-launch security steps required by the unsigned Windows and unnotarized
+macOS builds. The same guide is included automatically on every GitHub release
+page.
 
 ### Creating a release
 
