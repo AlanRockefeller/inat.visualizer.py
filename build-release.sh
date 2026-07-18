@@ -71,7 +71,7 @@ if ! grep -Fq "## [$version]" CHANGELOG.md; then
     exit 1
 fi
 
-"$python_bin" -m unittest -q test_version_metadata
+"$python_bin" -m unittest -q tests.test_version_metadata
 
 echo "Fetching origin to verify that main and release tags are current..."
 git fetch --quiet origin --tags

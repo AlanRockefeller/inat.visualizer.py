@@ -6,7 +6,7 @@ from pathlib import Path
 from inat_visualizer_version import __version__
 
 
-PROJECT_ROOT = Path(__file__).parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class VersionMetadataTests(unittest.TestCase):
