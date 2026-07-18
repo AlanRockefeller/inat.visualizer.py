@@ -2,7 +2,7 @@
 
 All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
-## [Unreleased]
+## [1.0.3] - 2026-07-17
 
 ### Added
 
