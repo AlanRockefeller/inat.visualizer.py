@@ -15,18 +15,20 @@ if sys.platform.startswith("linux") and "QT_QPA_PLATFORM" not in os.environ:
 
 # --- stdlib ---
 import argparse
+from collections.abc import Mapping
 from typing import Any
 import importlib
 import json
 import logging
 import math
-import platform
 import time
 from collections import OrderedDict
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlencode
+
+from inat_visualizer_version import __version__
 
 # --- third-party ---
 import duckdb
@@ -45,7 +47,6 @@ from PIL import Image
 from PyQt6.QtCore import (
     QMutex,
     QMutexLocker,
-    QObject,
     QSettings,
     Qt,
     QThread,
@@ -57,8 +58,6 @@ from PyQt6.QtGui import (
     QAction,
     QCloseEvent,
     QColor,
-    QDoubleValidator,
-    QFont,
     QGuiApplication,
     QPixmap,
 )
@@ -76,12 +75,10 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
-    QMenuBar,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QSizePolicy,
-    QSlider,
     QSpinBox,
     QSplashScreen,
     QStatusBar,
@@ -128,6 +125,57 @@ def resource_path(filename: str) -> str:
     return candidates[0]
 
 
+APP_DATA_DIRECTORY_NAME = "iNat Seasonal Visualizer"
+
+
+def application_data_dir(
+    *,
+    frozen: bool | None = None,
+    platform_name: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    home_dir: str | Path | None = None,
+    current_dir: str | Path | None = None,
+) -> Path:
+    """Return the directory for mutable application data.
+
+    A Finder-launched macOS app does not have a useful writable working
+    directory, so frozen builds use each platform's conventional per-user data
+    location. Source runs retain the historical current-directory behavior.
+    Optional arguments make the platform selection deterministic in tests.
+    """
+    is_frozen = (
+        bool(getattr(sys, "frozen", False)) if frozen is None else bool(frozen)
+    )
+    if not is_frozen:
+        return Path.cwd() if current_dir is None else Path(current_dir)
+
+    target_platform = sys.platform if platform_name is None else platform_name
+    environment = os.environ if environ is None else environ
+    home = Path.home() if home_dir is None else Path(home_dir)
+
+    if target_platform == "darwin":
+        base_dir = home / "Library" / "Application Support"
+    elif target_platform.startswith("win"):
+        configured_dir = environment.get("LOCALAPPDATA") or environment.get("APPDATA")
+        base_dir = (
+            Path(configured_dir)
+            if configured_dir
+            else home / "AppData" / "Local"
+        )
+    else:
+        configured_dir = environment.get("XDG_DATA_HOME")
+        base_dir = Path(configured_dir) if configured_dir else home / ".local" / "share"
+
+    return base_dir / APP_DATA_DIRECTORY_NAME
+
+
+def ensure_application_data_dir(**kwargs: Any) -> Path:
+    """Resolve and create the writable application data directory."""
+    data_dir = application_data_dir(**kwargs)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
+
+
 # --- Constants for MapDialog ---
 INATURALIST_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
 INATURALIST_GET_QUERY_LIMIT = 1800
@@ -136,6 +184,29 @@ MAX_TILES_PER_REQUEST = 100
 MAX_CACHE_SIZE = 500  # Max number of tiles to keep in memory (RAM)
 TILE_CACHE_DIR_NAME = "tile_cache"
 MAX_DISK_CACHE_SIZE_MB = 200
+
+
+def calculate_local_search_bounds(
+    lat: float, lon: float, radius: float
+) -> tuple[float, float, float, float]:
+    """Calculate a latitude/longitude bounding box around a radius in km."""
+    lat_rad = math.radians(lat)
+    earth_radius_km = 6371
+    lat_diff = radius / earth_radius_km
+
+    cos_lat = math.cos(lat_rad)
+    if abs(cos_lat) < 1e-12:
+        lon_diff = math.pi
+    else:
+        asin_arg = math.sin(lat_diff) / cos_lat
+        asin_arg = max(-1.0, min(1.0, asin_arg))
+        lon_diff = math.asin(asin_arg)
+
+    lat_min = max(-90.0, lat - math.degrees(lat_diff))
+    lat_max = min(90.0, lat + math.degrees(lat_diff))
+    lon_min = lon - math.degrees(lon_diff)
+    lon_max = lon + math.degrees(lon_diff)
+    return lat_min, lat_max, lon_min, lon_max
 
 
 def should_post_observation_search(params: dict[str, Any]) -> bool:
@@ -163,7 +234,7 @@ def fetch_observations_page(
             doseq=True,
         )
         taxon_filter_sizes = {
-            key: len(value)
+            key: len(params[key])
             for key in OBSERVATION_TAXON_FILTER_KEYS
             if isinstance(params.get(key), list)
         }
@@ -610,6 +681,158 @@ class TileLoaderWorker(QThread):
             self.tiles_skipped.emit()
 
         return recovered_any
+
+
+class LocalSearchWorker(QThread):
+    """Background worker for local DuckDB searches."""
+
+    progress = pyqtSignal(str)
+    search_finished = pyqtSignal(object, int)
+    search_failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        parquet_path: str,
+        date_from: str,
+        date_to: str,
+        lat: float,
+        lon: float,
+        radius: float,
+        taxon_ids: list[int] | None = None,
+        exclude_taxon_ids: list[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.parquet_path = parquet_path
+        self.date_from = date_from
+        self.date_to = date_to
+        self.lat = lat
+        self.lon = lon
+        self.radius = radius
+        self.taxon_ids = taxon_ids or []
+        self.exclude_taxon_ids = exclude_taxon_ids or []
+
+    def run(self) -> None:
+        try:
+            observations, estimated_count = run_local_observation_query(
+                self.parquet_path,
+                self.date_from,
+                self.date_to,
+                self.lat,
+                self.lon,
+                self.radius,
+                self.taxon_ids,
+                self.exclude_taxon_ids,
+                self.progress.emit,
+            )
+            self.search_finished.emit(observations, estimated_count)
+        except Exception as e:
+            logging.error("Local search worker failed: %s", e)
+            self.search_failed.emit(str(e))
+
+
+def run_local_observation_query(
+    parquet_path: str,
+    date_from: str,
+    date_to: str,
+    lat: float,
+    lon: float,
+    radius: float,
+    taxon_ids: list[int] | None = None,
+    exclude_taxon_ids: list[int] | None = None,
+    progress_callback=None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Query observations.parquet for local observations."""
+    taxon_ids = taxon_ids or []
+    exclude_taxon_ids = exclude_taxon_ids or []
+    escaped_path = parquet_path.replace("'", "''")
+    lat_min, lat_max, lon_min, lon_max = calculate_local_search_bounds(
+        lat, lon, radius
+    )
+    con = None
+    try:
+        con = duckdb.connect()
+        if progress_callback:
+            progress_callback("Checking observations.parquet schema...")
+        schema = con.execute(f"DESCRIBE SELECT * FROM '{escaped_path}'").fetchall()
+        column_names = [row[0].lower() for row in schema]
+        required_columns = [
+            "eventdate",
+            "decimallatitude",
+            "decimallongitude",
+            "taxonid",
+        ]
+        missing_columns = [col for col in required_columns if col not in column_names]
+        if missing_columns:
+            raise ValueError(
+                "Missing required columns in observations.parquet: "
+                + ", ".join(missing_columns)
+                + ". The file must include eventDate, decimalLatitude, "
+                "decimalLongitude, and taxonID."
+            )
+
+        base_where = """
+            WHERE eventDate BETWEEN ? AND ?
+            AND decimalLatitude BETWEEN ? AND ?
+            AND decimalLongitude BETWEEN ? AND ?
+        """
+        filter_sql = ""
+        if taxon_ids:
+            filter_sql += (
+                " AND taxonID IN (" + ",".join(str(id) for id in taxon_ids) + ")"
+            )
+        if exclude_taxon_ids:
+            filter_sql += (
+                " AND taxonID NOT IN ("
+                + ",".join(str(id) for id in exclude_taxon_ids)
+                + ")"
+            )
+
+        bbox_params = [date_from, date_to, lat_min, lat_max, lon_min, lon_max]
+        if progress_callback:
+            progress_callback("Estimating result count...")
+        count_query = f"SELECT COUNT(*) FROM '{escaped_path}' {base_where} {filter_sql}"
+        _count_row = con.execute(count_query, bbox_params).fetchone()
+        estimated_count = _count_row[0] if _count_row else 0
+
+        if progress_callback:
+            progress_callback(
+                f"Executing DuckDB query (estimated {estimated_count:,} candidates)..."
+            )
+
+        # Use DuckDB-native math instead of a Python UDF so large scans do not
+        # call back into Python once per row.
+        query = f"""
+            SELECT id, decimalLatitude, decimalLongitude, eventDate, taxonID
+            FROM '{escaped_path}'
+            {base_where}
+            {filter_sql}
+            AND 2 * 6371 * asin(
+                sqrt(
+                    pow(sin(radians(decimalLatitude - ?) / 2), 2)
+                    + cos(radians(?)) * cos(radians(decimalLatitude))
+                    * pow(sin(radians(decimalLongitude - ?) / 2), 2)
+                )
+            ) <= ?
+        """
+        query_params = bbox_params + [lat, lat, lon, radius]
+        results = con.execute(query, query_params).fetchall()
+
+        if progress_callback:
+            progress_callback("Processing results...")
+        observations = [
+            {
+                "id": row[0],
+                "decimalLatitude": row[1],
+                "decimalLongitude": row[2],
+                "eventDate": row[3],
+                "taxonID": row[4],
+            }
+            for row in results
+        ]
+        return observations, estimated_count
+    finally:
+        if con is not None:
+            con.close()
 
 
 class DatabaseProgressTracker:
@@ -1345,6 +1568,7 @@ class INatSeasonalVisualizer(QMainWindow):
         radius: float | None = None,
         scale_factor: float = 1.0,
         splash_screen=None,
+        working_dir: str | Path | None = None,
     ) -> None:
         super().__init__()
         self.splash_screen = splash_screen
@@ -1357,10 +1581,17 @@ class INatSeasonalVisualizer(QMainWindow):
 
         self.api_call_count = 0  # Initialize API call counter
         self.last_plot_args = None  # Initialize plot arguments cache
+        self.local_search_worker = None
         # In-memory cache for taxon IDs and descendants
         # Persisted to taxon_cache.json to minimize API calls and avoid recomputing descendants
         self.taxon_cache = {}
-        self.working_dir = os.getcwd()
+        resolved_working_dir = (
+            ensure_application_data_dir()
+            if working_dir is None
+            else Path(working_dir)
+        )
+        resolved_working_dir.mkdir(parents=True, exist_ok=True)
+        self.working_dir = str(resolved_working_dir)
         self.taxon_cache_file = os.path.join(self.working_dir, "taxon_cache.json")
         self.descendant_taxons_file = os.path.join(
             self.working_dir, "descendant_taxons.txt"
@@ -1672,7 +1903,7 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def init_ui(self) -> None:
         """Initialize the user interface."""
-        self.setWindowTitle("iNaturalist Seasonal Visualizer")
+        self.setWindowTitle(f"iNaturalist Seasonal Visualizer v{__version__}")
 
         # Use the user-provided or default scale factor
         scale_factor = self.scale_factor
@@ -2251,9 +2482,13 @@ class INatSeasonalVisualizer(QMainWindow):
                         time.sleep(wait_time)
                     else:
                         self.enhanced_progress.hide_progress()
+                        logging.error("API search HTTP %s on page %s", status_code, page)
                         return all_results, str(e)  # Return partial data with error
                 except Exception as e:
                     self.enhanced_progress.hide_progress()
+                    logging.exception(
+                        "API search failed on page %s (%s)", page, type(e).__name__
+                    )
                     return all_results, str(e)  # Return partial data with error
 
             if retries > max_retries:
@@ -2659,7 +2894,10 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def local_search(self) -> None:
         """Query the local observations.parquet file and plot results."""
-        con = None
+        if self.local_search_worker is not None and self.local_search_worker.isRunning():
+            self.status_bar.showMessage("Local search is already running...")
+            return
+
         try:
             lat = float(self.lat_input.text().strip())
             lon = float(self.lon_input.text().strip())
@@ -2670,88 +2908,16 @@ class INatSeasonalVisualizer(QMainWindow):
             date_to = self.date_to.text()
             view = self.view_combo.currentText().lower()
 
-            # Check for parquet file in current working directory
+            # Check for the parquet file in the application data directory.
             parquet_path = self.observations_file
             if not os.path.exists(parquet_path):
                 QMessageBox.critical(
                     self,
                     "Error",
                     f"observations.parquet not found in {self.working_dir}.\n"
-                    "Please ensure the file is in the current working directory.",
+                    "Please ensure the file is in the application data directory.",
                 )
                 return
-
-            # Connect to DuckDB
-            con = duckdb.connect()
-
-            # Register the haversine function
-            con.create_function("haversine", self.haversine, [float, float, float, float], float)  # type: ignore[arg-type]
-
-            # Check schema
-            schema = con.execute(f"DESCRIBE SELECT * FROM '{parquet_path}'").fetchall()
-            column_names = [row[0].lower() for row in schema]
-            required_columns = [
-                "eventdate",
-                "decimallatitude",
-                "decimallongitude",
-                "taxonid",
-            ]
-            missing_columns = [
-                col for col in required_columns if col not in column_names
-            ]
-            if missing_columns:
-                QMessageBox.critical(
-                    self,
-                    "Error",
-                    f"Missing required columns in observations.parquet: {', '.join(missing_columns)}.\n\n"
-                    "The file must include 'eventDate', 'decimalLatitude', 'decimalLongitude', and 'taxonID'.\n"
-                    "Please regenerate the parquet file with these columns. For example, if using a CSV:\n"
-                    "COPY (\n"
-                    "  SELECT id, decimalLatitude, decimalLongitude, eventDate, taxonID\n"
-                    "  FROM read_csv_auto('observations.csv')\n"
-                    ") TO 'observations.parquet' (FORMAT PARQUET);\n",
-                )
-                return
-
-            # Bounding box calculation
-            lat_rad = math.radians(lat)
-            # Radius of Earth in kilometers
-            R = 6371
-            lat_diff = radius / R
-
-            # Prevent math domain error for large radii near poles
-            asin_arg = math.sin(lat_diff) / math.cos(lat_rad)
-            if asin_arg > 1.0:
-                asin_arg = 1.0
-            elif asin_arg < -1.0:
-                asin_arg = -1.0
-            lon_diff = math.asin(asin_arg)
-
-            lat_min = lat - math.degrees(lat_diff)
-            lat_max = lat + math.degrees(lat_diff)
-            lon_min = lon - math.degrees(lon_diff)
-            lon_max = lon + math.degrees(lon_diff)
-
-            # Build DuckDB query
-            query = f"""
-                SELECT id, decimalLatitude, decimalLongitude, eventDate, taxonID
-                FROM '{parquet_path.replace("'", "''")}'
-                WHERE eventDate BETWEEN ? AND ?
-                AND decimalLatitude BETWEEN ? AND ?
-                AND decimalLongitude BETWEEN ? AND ?
-                AND haversine(?, ?, decimalLatitude, decimalLongitude) <= ?
-            """
-            params = [
-                date_from,
-                date_to,
-                lat_min,
-                lat_max,
-                lon_min,
-                lon_max,
-                lat,
-                lon,
-                radius,
-            ]
 
             # Add taxon filter if organism is specified
             taxon_ids = []
@@ -2759,13 +2925,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 taxon_id = self.get_taxon_id(organism)
                 if taxon_id:
                     taxon_ids = self.get_descendant_taxon_ids(organism, taxon_id)
-                    if taxon_ids:
-                        query += (
-                            " AND taxonID IN ("
-                            + ",".join([str(id) for id in taxon_ids])
-                            + ")"
-                        )
-                    else:
+                    if not taxon_ids:
                         QMessageBox.warning(
                             self,
                             "Warning",
@@ -2786,95 +2946,114 @@ class INatSeasonalVisualizer(QMainWindow):
                     exclude_taxon_ids = self.get_descendant_taxon_ids(
                         exclude, exclude_taxon_id
                     )
-                    if exclude_taxon_ids:
-                        query += (
-                            " AND taxonID NOT IN ("
-                            + ",".join([str(id) for id in exclude_taxon_ids])
-                            + ")"
-                        )
 
             # Start database progress tracking with estimated progress
             self.enhanced_progress.db_tracker.start_operation("local database search")
             self.status_bar.showMessage("Performing local search...")
-            QApplication.processEvents()
+            self.local_search_button.setEnabled(False)
+            self.search_button.setEnabled(False)
 
-            # Get estimated count for better progress tracking
-            self.enhanced_progress.db_tracker.update_progress(
-                message="Estimating result count..."
+            worker = LocalSearchWorker(
+                parquet_path,
+                date_from,
+                date_to,
+                lat,
+                lon,
+                radius,
+                taxon_ids,
+                exclude_taxon_ids,
             )
-            count_query = f"""
-                SELECT COUNT(*) FROM '{parquet_path.replace("'", "''")}'
-                WHERE eventDate BETWEEN ? AND ?
-                AND decimalLatitude BETWEEN ? AND ?
-                AND decimalLongitude BETWEEN ? AND ?
-            """
-            count_params = [date_from, date_to, lat_min, lat_max, lon_min, lon_max]
-            if taxon_ids:
-                count_query += (
-                    " AND taxonID IN (" + ",".join([str(id) for id in taxon_ids]) + ")"
+            self.local_search_worker = worker
+            search_context = {
+                "lat": lat,
+                "lon": lon,
+                "radius": radius,
+                "organism": organism,
+                "date_from": date_from,
+                "date_to": date_to,
+                "view": view,
+            }
+            worker.progress.connect(self._on_local_search_progress)
+            worker.search_finished.connect(
+                lambda observations, estimated_count, context=search_context: self._on_local_search_finished(
+                    observations, estimated_count, context
                 )
-            if exclude_taxon_ids:
-                count_query += (
-                    " AND taxonID NOT IN ("
-                    + ",".join([str(id) for id in exclude_taxon_ids])
-                    + ")"
-                )
-
-            _count_row = con.execute(count_query, count_params).fetchone()
-            estimated_count = _count_row[0] if _count_row else 0
-            self.enhanced_progress.db_tracker.estimated_total = estimated_count
-
-            # Execute main query with progress updates
-            self.enhanced_progress.db_tracker.update_progress(
-                message=f"Executing DuckDB query (estimated {estimated_count:,} results)..."
             )
-            results = con.execute(query, params).fetchall()
-
-            self.enhanced_progress.db_tracker.update_progress(
-                message="Processing results..."
-            )
-            # Convert results to list of dicts
-            observations = [
-                {
-                    "id": row[0],
-                    "decimalLatitude": row[1],
-                    "decimalLongitude": row[2],
-                    "eventDate": row[3],
-                    "taxonID": row[4],
-                }
-                for row in results
-            ]
-
-            self.enhanced_progress.db_tracker.finish_operation(
-                len(observations), "Local search completed"
-            )
-            self.status_bar.showMessage("Local search completed.")
-
-            # Plot results
-            if observations:
-                self.plot_observations(
-                    observations,
-                    lat,
-                    lon,
-                    radius,
-                    organism,
-                    date_from,
-                    date_to,
-                    view,
-                    source="Local",
-                )
-            else:
-                self.show_placeholder("No local observations found.")
-                self.update_status_bar(0)
+            worker.search_failed.connect(self._on_local_search_failed)
+            worker.finished.connect(self._on_local_search_worker_done)
+            worker.start()
 
         except Exception as e:
             self.enhanced_progress.hide_progress()
+            # The buttons were disabled above; if the worker never started, its
+            # finished signal won't fire to re-enable them via
+            # _on_local_search_worker_done, so restore them here.
+            if (
+                self.local_search_worker is None
+                or not self.local_search_worker.isRunning()
+            ):
+                self.local_search_button.setEnabled(True)
+                self.search_button.setEnabled(True)
+                self.local_search_worker = None
             QMessageBox.critical(self, "Error", f"Local search failed: {e!s}")
             self.show_placeholder(f"Local search failed: {e!s}")
             logging.error(f"Local search failed: {e!s}")
-        finally:
-            if con is not None:
-                con.close()
+
+    def _on_local_search_progress(self, message: str) -> None:
+        if message.startswith("Executing DuckDB query"):
+            self.status_bar.showMessage("Performing local search...")
+        self.enhanced_progress.db_tracker.update_progress(message=message)
+
+    def _on_local_search_finished(
+        self,
+        observations: list[dict[str, Any]],
+        estimated_count: int,
+        context: dict[str, Any],
+    ) -> None:
+        self.enhanced_progress.db_tracker.estimated_total = estimated_count
+        self.enhanced_progress.db_tracker.finish_operation(
+            len(observations), "Local search completed"
+        )
+        self.status_bar.showMessage("Local search completed.")
+
+        if observations:
+            self.plot_observations(
+                observations,
+                context["lat"],
+                context["lon"],
+                context["radius"],
+                context["organism"],
+                context["date_from"],
+                context["date_to"],
+                context["view"],
+                source="Local",
+            )
+        else:
+            self.show_placeholder("No local observations found.")
+            self.update_status_bar(0)
+
+    def _on_local_search_failed(self, error: str) -> None:
+        self.enhanced_progress.hide_progress()
+        QMessageBox.critical(self, "Error", f"Local search failed: {error}")
+        self.show_placeholder(f"Local search failed: {error}")
+        logging.error("Local search failed: %s", error)
+
+    def _on_local_search_worker_done(self) -> None:
+        self.local_search_button.setEnabled(True)
+        self.search_button.setEnabled(True)
+        self.local_search_worker = None
+
+    def closeEvent(self, a0: QCloseEvent | None) -> None:
+        """Stop the local search worker before the window is destroyed."""
+        worker = self.local_search_worker
+        if worker is not None and worker.isRunning():
+            # run() does a blocking DuckDB query with no event loop, so quit()
+            # can't interrupt it. Wait for it to finish, and terminate as a last
+            # resort, so the QThread is never destroyed while still running.
+            if not worker.wait(5000):
+                worker.terminate()
+                worker.wait()
+        super().closeEvent(a0)
 
     def search_observations(self) -> None:
         """Search observations using iNaturalist API."""
@@ -2913,20 +3092,18 @@ class INatSeasonalVisualizer(QMainWindow):
                 "per_page": 500,
             }
 
-            # Add taxon filter if organism is specified
-            taxon_ids = []
+            # Add taxon filter if organism is specified. iNaturalist's taxon_id
+            # filter already matches the taxon and all of its descendants
+            # server-side, so we pass the single ancestor ID rather than the full
+            # descendant list (which overflows the GET URL; the endpoint is
+            # GET-only and rejects POST with a 400).
             if organism:
                 taxon_id = self.get_taxon_id(organism)
                 if taxon_id:
-                    taxon_ids = self.get_descendant_taxon_ids(organism, taxon_id)
-                    if taxon_ids:
-                        params["taxon_id"] = taxon_ids
-                    else:
-                        QMessageBox.warning(
-                            self,
-                            "Warning",
-                            f"No taxon IDs found for {organism}. Search may yield no results.",
-                        )
+                    params["taxon_id"] = taxon_id
+                    # Resolve descendants too, for the info-bar count and parity
+                    # with local search (cached, so this is cheap after the first).
+                    self.get_descendant_taxon_ids(organism, taxon_id)
                 else:
                     QMessageBox.warning(
                         self,
@@ -2934,15 +3111,11 @@ class INatSeasonalVisualizer(QMainWindow):
                         f"Could not find taxon ID for {organism}. Search may yield no results.",
                     )
 
-            # Add exclude filter
+            # Add exclude filter (iNat expands not_in_taxon_id to descendants too)
             if exclude:
                 exclude_taxon_id = self.get_taxon_id(exclude)
                 if exclude_taxon_id:
-                    exclude_taxon_ids = self.get_descendant_taxon_ids(
-                        exclude, exclude_taxon_id
-                    )
-                    if exclude_taxon_ids:
-                        params["not_in_taxon_id"] = exclude_taxon_ids
+                    params["not_in_taxon_id"] = exclude_taxon_id
 
             # Fetch observations
             observations, error = self.fetch_all_observations(params)
@@ -3366,6 +3539,12 @@ def main() -> None:
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument("--smoke-test", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
         "--scale-factor",
         type=float,
         default=1.0,
@@ -3373,13 +3552,25 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # Configure logging
+    working_dir = ensure_application_data_dir()
+
+    # Configure logging. Always write to the log file; also mirror to the
+    # console (basicConfig with `filename` installs a file-only handler, so
+    # without this nothing shows up on stdout/stderr, even with --debug).
     log_level = logging.DEBUG if args.debug else logging.INFO
     logging.basicConfig(
-        filename="inat_visualizer.log",
         level=log_level,
         format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(working_dir / "inat_visualizer.log"),
+            logging.StreamHandler(),
+        ],
     )
+
+    # Silence noisy third-party DEBUG chatter (matplotlib font scoring, PIL,
+    # HTTP internals) so --debug stays focused on this app's own messages.
+    for noisy_logger in ("matplotlib", "PIL", "urllib3", "requests", "asyncio"):
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 
     if args.debug:
         print(f"DEBUG: Logging level set to {log_level}")
@@ -3403,8 +3594,15 @@ def main() -> None:
     if args.debug:
         print("DEBUG: Creating QApplication...")
     app = QApplication(sys.argv)
+    app.setApplicationName("iNaturalist Seasonal Visualizer")
+    app.setApplicationVersion(__version__)
+    app.setOrganizationName("AlanRockefeller")
     if args.debug:
         print("DEBUG: QApplication created.")
+
+    if args.smoke_test:
+        logging.info("Packaged application smoke test passed for version %s", __version__)
+        return
 
     # Show splash screen
     splash_image_path = resource_path("splash_screen.jpg")
@@ -3435,6 +3633,7 @@ def main() -> None:
         radius=args.radius,
         scale_factor=args.scale_factor,
         splash_screen=splash,
+        working_dir=working_dir,
     )
     if args.debug:
         print("DEBUG: Main window initialized.")

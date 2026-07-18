@@ -2,6 +2,9 @@
 
 # By Alan Rockefeller - January 5, 2026
 
+Current source version: **1.0.1**. See [CHANGELOG.md](CHANGELOG.md) for release
+details.
+
 A desktop GUI app for exploring **seasonal patterns in iNaturalist observations** within a geographic radius. Search by organism (anything from a genus/species to higher taxa like *Agaricales*), choose a date range, and plot observation frequency by **day**, **week**, or **month** of the year.
 
 The app supports two search modes:
@@ -49,12 +52,16 @@ The easiest way to get started — no Python required. Grab the latest build fro
 [**Releases**](https://github.com/AlanRockefeller/inat.visualizer.py/releases) page:
 
 - **Windows:** download `iNat-Seasonal-Visualizer.exe` and double-click it.
-- **macOS:** download and unzip `iNat-Seasonal-Visualizer-macOS.zip`, then open the app.
+- **macOS (Apple Silicon):** download and unzip
+  `iNat-Seasonal-Visualizer-macOS-Apple-Silicon.zip`.
+- **macOS (Intel):** download and unzip
+  `iNat-Seasonal-Visualizer-macOS-Intel.zip`.
   The first time, right-click the app and choose **Open** (it is unsigned).
 - **Linux:** download and extract `iNat-Seasonal-Visualizer-Linux.tar.gz`, then run the binary.
 
 On first launch the app offers to download the required data files
-(`observations.parquet` ~1 GB and `taxonomy.parquet`) into its working directory.
+(`observations.parquet` ~1 GB and `taxonomy.parquet`) into its per-user application
+data directory.
 
 ---
 
@@ -102,12 +109,22 @@ pip install -r requirements.txt
 
 ## Data files (required for Local Search and taxonomy expansion)
 
-The application uses two Parquet files in the **current working directory**:
+The application uses two Parquet files in its runtime data directory:
 
 - `observations.parquet` (~1.02 GB)
 - `taxonomy.parquet` (~8.7 MB)
 
-If either is missing at startup, the app will prompt to download them automatically into the CWD:
+If either is missing at startup, the app will prompt to download it automatically.
+Packaged apps store mutable files in these writable per-user locations:
+
+- **macOS:** `~/Library/Application Support/iNat Seasonal Visualizer/`
+- **Windows:** `%LOCALAPPDATA%\iNat Seasonal Visualizer\`
+- **Linux:** `$XDG_DATA_HOME/iNat Seasonal Visualizer/`, or
+  `~/.local/share/iNat Seasonal Visualizer/` when `XDG_DATA_HOME` is unset
+
+Runs from source continue to use the current working directory.
+
+The download URLs are:
 
 - `http://images.mushroomobserver.org/observations.parquet`
 - `http://images.mushroomobserver.org/taxonomy.parquet`
@@ -149,7 +166,9 @@ Flags:
 
 Logs go to:
 
-- `inat_visualizer.log`
+- Packaged app: `inat_visualizer.log` inside the per-user application data
+  directory listed above
+- Source run: `inat_visualizer.log` in the current working directory
 
 ---
 
@@ -207,7 +226,8 @@ If present, it can be used as a fallback when descendant expansion via `taxonomy
 The map dialog fetches OpenStreetMap tiles and caches them:
 
 - In RAM: LRU cache up to `MAX_CACHE_SIZE` tiles
-- On disk: `./tile_cache/` (relative to CWD) with pruning to ~`200 MB`
+- On disk: `tile_cache/` inside the runtime data directory, with pruning to
+  ~`200 MB`
 
 ---
 
@@ -249,7 +269,8 @@ logged as warnings only and do not block the app.
 
 ## Project structure (runtime artifacts)
 
-When you run the program, it may create:
+When you run the program, it may create the following files in its runtime data
+directory:
 
 - `inat_visualizer.log` (log file)
 - `taxon_cache.json` (API/taxon cache)
