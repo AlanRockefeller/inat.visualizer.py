@@ -1,8 +1,8 @@
 # iNaturalist Seasonal Visualizer
 
-# By Alan Rockefeller - July 17, 2026
+# By Alan Rockefeller - July 18, 2026
 
-Current source version: **1.0.6**. See [CHANGELOG.md](CHANGELOG.md) for release
+Current source version: **1.0.7**. See [CHANGELOG.md](CHANGELOG.md) for release
 details.
 
 A desktop GUI app for exploring **seasonal patterns in iNaturalist observations** within a geographic radius. Search by organism (anything from a genus/species to higher taxa like _Agaricales_), choose a date range, and plot observation frequency by **day**, **week**, or **month** of the year.
@@ -219,7 +219,9 @@ Flags:
 - `--radius` Radius in km (default comes from saved settings)
 - `--scale-factor` Manual UI scale multiplier (useful for 4K/HiDPI)
 - `--http-cache-max-mb` API response cache budget in MB (default: `128`)
-- `--debug` Enable debug logging + extra console prints
+- `--debug` Enable debug logging + extra console prints, including place-search
+  request parameters, qualifier resolution, fallback queries, and bounded API
+  responses
 
 The cache budget can also be set with the
 `INAT_VISUALIZER_HTTP_CACHE_MAX_MB` environment variable. The command-line
@@ -238,6 +240,11 @@ Logs go to:
 1. **Set location**
    - Type latitude/longitude (or paste `"lat, lon"` into the latitude field)
    - Or click **🗺️ Map** to pick a point and radius interactively.
+   - In the map dialog, enter a country, city, park, or other iNaturalist place
+     and press **Enter** or **Search** to jump there. Select a result to fit the
+     map to that place; the current radius remains unchanged.
+   - Qualified searches such as `City, Country` first try the complete phrase,
+     then use the qualifier to narrow matches when a fallback is needed.
 
 2. **Choose an organism**
    - Examples: `Boletus`, `Russula brevipes`, `Agaricales`

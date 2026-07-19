@@ -2,6 +2,10 @@
 
 All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
+## [1.0.7] - 2026-07-18
+
+- Allow users to search by location names in the map
+
 ## [1.0.6] - 2026-07-17
 
 ### Added

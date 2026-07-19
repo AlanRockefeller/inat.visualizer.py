@@ -63,6 +63,7 @@ from PyQt6.QtGui import (
     QCloseEvent,
     QColor,
     QGuiApplication,
+    QKeyEvent,
     QPixmap,
 )
 from PyQt6.QtWidgets import (
@@ -585,6 +586,141 @@ MAX_TILES_PER_REQUEST = 100
 MAX_CACHE_SIZE = 500  # Max number of tiles to keep in memory (RAM)
 TILE_CACHE_DIR_NAME = "tile_cache"
 MAX_DISK_CACHE_SIZE_MB = 200
+PLACE_SEARCH_RESULT_LIMIT = 8
+PLACE_SEARCH_LOG_RESPONSE_LIMIT = 20_000
+WEB_MERCATOR_MAX_LATITUDE = 85.05112878
+
+
+def _coordinate_pairs(value: Any):
+    """Yield longitude/latitude pairs from nested GeoJSON coordinates."""
+    if not isinstance(value, (list, tuple)):
+        return
+    if (
+        len(value) >= 2
+        and isinstance(value[0], (int, float))
+        and isinstance(value[1], (int, float))
+    ):
+        yield float(value[0]), float(value[1])
+        return
+    for child in value:
+        yield from _coordinate_pairs(child)
+
+
+def normalize_place_search_results(response: Any) -> list[dict[str, Any]]:
+    """Return validated, display-ready place records from an iNaturalist search."""
+    if not isinstance(response, dict) or not isinstance(response.get("results"), list):
+        return []
+
+    places = []
+    for result in response["results"]:
+        if (
+            not isinstance(result, dict)
+            or str(result.get("type", "")).lower() != "place"
+        ):
+            continue
+        record = result.get("record")
+        if not isinstance(record, dict):
+            continue
+
+        raw_location = record.get("location")
+        if isinstance(raw_location, str):
+            raw_location = raw_location.split(",")
+        if not isinstance(raw_location, (list, tuple)) or len(raw_location) < 2:
+            continue
+        try:
+            lat, lon = float(raw_location[0]), float(raw_location[1])
+        except (TypeError, ValueError):
+            continue
+        if not (
+            math.isfinite(lat)
+            and math.isfinite(lon)
+            and -90.0 <= lat <= 90.0
+            and -180.0 <= lon <= 180.0
+        ):
+            continue
+
+        display_name = str(
+            record.get("display_name") or record.get("name") or ""
+        ).strip()
+        if not display_name:
+            continue
+
+        bounds = None
+        bounding_geojson = record.get("bounding_box_geojson")
+        if isinstance(bounding_geojson, dict):
+            pairs = list(_coordinate_pairs(bounding_geojson.get("coordinates")))
+            valid_pairs = [
+                (
+                    lon + ((pair_lon - lon + 180.0) % 360.0) - 180.0,
+                    pair_lat,
+                )
+                for pair_lon, pair_lat in pairs
+                if math.isfinite(pair_lon)
+                and math.isfinite(pair_lat)
+                and -180.0 <= pair_lon <= 180.0
+                and -90.0 <= pair_lat <= 90.0
+            ]
+            if valid_pairs:
+                lons, lats = zip(*valid_pairs, strict=True)
+                bounds = (min(lons), max(lons), min(lats), max(lats))
+
+        places.append(
+            {
+                "id": record.get("id"),
+                "name": str(record.get("name") or "").strip(),
+                "display_name": display_name,
+                "admin_level": record.get("admin_level"),
+                "ancestor_place_ids": record.get("ancestor_place_ids") or [],
+                "lat": lat,
+                "lon": lon,
+                "bounds": bounds,
+            }
+        )
+    return places
+
+
+def place_search_response_for_log(response: Any) -> str:
+    """Serialize a bounded place-search response for DEBUG diagnostics."""
+    try:
+        serialized = json.dumps(
+            response,
+            ensure_ascii=False,
+            default=str,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        serialized = repr(response)
+    if len(serialized) > PLACE_SEARCH_LOG_RESPONSE_LIMIT:
+        omitted = len(serialized) - PLACE_SEARCH_LOG_RESPONSE_LIMIT
+        serialized = (
+            serialized[:PLACE_SEARCH_LOG_RESPONSE_LIMIT]
+            + f"... <{omitted} characters omitted>"
+        )
+    return serialized
+
+
+def place_result_view_limits(
+    place: Mapping[str, Any], padding: float = 0.1
+) -> tuple[float, float, float, float]:
+    """Return padded map limits for a normalized place search result."""
+    lat = float(place["lat"])
+    lon = float(place["lon"])
+    bounds = place.get("bounds")
+    if bounds is None:
+        west, east, south, north = lon - 0.25, lon + 0.25, lat - 0.25, lat + 0.25
+    else:
+        west, east, south, north = (float(value) for value in bounds)
+
+    # Give point-sized and very small places enough context to be recognizable.
+    lon_span = max(east - west, 0.02)
+    lat_span = max(north - south, 0.02)
+    center_lon = (west + east) / 2.0
+    center_lat = (south + north) / 2.0
+    half_lon = lon_span * (0.5 + padding)
+    half_lat = lat_span * (0.5 + padding)
+    south = max(-WEB_MERCATOR_MAX_LATITUDE, center_lat - half_lat)
+    north = min(WEB_MERCATOR_MAX_LATITUDE, center_lat + half_lat)
+    return center_lon - half_lon, center_lon + half_lon, south, north
 
 
 def calculate_local_search_bounds(
@@ -930,6 +1066,134 @@ class DiskTileCache:
                     p.rmdir()  # Only removes if empty
                 except OSError:
                     pass
+
+
+class PlaceSearchWorker(QThread):
+    """Search iNaturalist places without blocking the map dialog."""
+
+    results_ready = pyqtSignal(object)
+    search_failed = pyqtSignal(str)
+
+    def __init__(self, query: str, http_cache_file: str | Path | None = None) -> None:
+        super().__init__()
+        self.query = query
+        self.http_cache_file = (
+            str(http_cache_file) if http_cache_file is not None else ":memory:"
+        )
+
+    def cancel(self) -> None:
+        self.requestInterruption()
+
+    @staticmethod
+    def _qualified_query_parts(query: str) -> tuple[str, str] | None:
+        if "," not in query:
+            return None
+        name, qualifier = (part.strip() for part in query.split(",", 1))
+        return (name, qualifier) if name and qualifier else None
+
+    @staticmethod
+    def _exact_qualifier_id(
+        qualifier: str, qualifier_places: list[dict[str, Any]]
+    ) -> Any | None:
+        normalized_qualifier = qualifier.casefold()
+        for place in qualifier_places:
+            names = {
+                str(place.get("name") or "").casefold(),
+                str(place.get("display_name") or "")
+                .split(",", 1)[0]
+                .strip()
+                .casefold(),
+            }
+            if normalized_qualifier in names:
+                return place.get("id")
+        return None
+
+    @staticmethod
+    def _places_with_ancestor(
+        places: list[dict[str, Any]], ancestor_id: Any
+    ) -> list[dict[str, Any]]:
+        return [
+            place
+            for place in places
+            if ancestor_id == place.get("id")
+            or ancestor_id in place.get("ancestor_place_ids", [])
+        ]
+
+    def _search(self, query: str, request_session) -> list[dict[str, Any]]:
+        request_params = {
+            "q": query,
+            "sources": "places",
+            "per_page": PLACE_SEARCH_RESULT_LIMIT,
+        }
+        debug_logging = logging.getLogger().isEnabledFor(logging.DEBUG)
+        if debug_logging:
+            logging.debug(
+                "Place search request: GET https://api.inaturalist.org/v1/search params=%r",
+                request_params,
+            )
+        response = pyinaturalist.search(session=request_session, **request_params)
+        if debug_logging:
+            logging.debug(
+                "Place search response for query=%r: %s",
+                query,
+                place_search_response_for_log(response),
+            )
+        return normalize_place_search_results(response)
+
+    def run(self) -> None:
+        request_session = None
+        try:
+            request_session = pyinaturalist.ClientSession(
+                cache_file=self.http_cache_file,
+                max_retries=0,
+                timeout=8,
+            )
+            places = self._search(self.query, request_session)
+            qualified_parts = self._qualified_query_parts(self.query)
+            if not places and qualified_parts and not self.isInterruptionRequested():
+                name, qualifier = qualified_parts
+                logging.debug(
+                    "Place search query=%r returned no usable results; resolving "
+                    "qualifier=%r and retrying name=%r",
+                    self.query,
+                    qualifier,
+                    name,
+                )
+                qualifier_places = self._search(qualifier, request_session)
+                qualifier_id = self._exact_qualifier_id(qualifier, qualifier_places)
+                fallback_places = self._search(name, request_session)
+                scoped_places = (
+                    self._places_with_ancestor(fallback_places, qualifier_id)
+                    if qualifier_id is not None
+                    else []
+                )
+                if scoped_places:
+                    logging.debug(
+                        "Place search qualifier=%r resolved to place_id=%r; "
+                        "kept %d of %d name matches",
+                        qualifier,
+                        qualifier_id,
+                        len(scoped_places),
+                        len(fallback_places),
+                    )
+                    places = scoped_places
+                else:
+                    logging.debug(
+                        "Place search qualifier=%r could not narrow %d name matches; "
+                        "returning the unqualified matches",
+                        qualifier,
+                        len(fallback_places),
+                    )
+                    places = fallback_places
+            if not self.isInterruptionRequested():
+                self.results_ready.emit(places)
+        except Exception as error:
+            if not self.isInterruptionRequested():
+                logging.exception("Place search failed for %r", self.query)
+                self.search_failed.emit(str(error))
+        finally:
+            if request_session is not None:
+                request_session.close()
 
 
 class TileLoaderWorker(QThread):
@@ -1813,6 +2077,19 @@ class CustomSplashScreen(QSplashScreen):
         QApplication.processEvents()
 
 
+class PlaceSearchLineEdit(QLineEdit):
+    """A search field whose Enter key cannot accept its containing dialog."""
+
+    search_requested = pyqtSignal()
+
+    def keyPressEvent(self, event: QKeyEvent | None) -> None:
+        if event and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.search_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
 class MapDialog(QDialog):
     """Interactive map dialog for setting coordinates and radius using matplotlib"""
 
@@ -1828,6 +2105,8 @@ class MapDialog(QDialog):
         self.lat = lat
         self.lon = lon
         self.radius = radius
+        self.place_search_worker: PlaceSearchWorker | None = None
+        self.place_search_results: list[dict[str, Any]] = []
 
         # Worker setup
         working_dir = parent.working_dir if parent else os.getcwd()
@@ -1855,6 +2134,32 @@ class MapDialog(QDialog):
 
         # Create layout
         layout = QVBoxLayout(self)
+
+        # Explicit place search avoids sending a request for every keystroke.
+        search_layout = QHBoxLayout()
+        self.place_search_input = PlaceSearchLineEdit()
+        self.place_search_input.setPlaceholderText(
+            "Search for a city, country, or park..."
+        )
+        self.place_search_input.setClearButtonEnabled(True)
+        self.place_search_input.search_requested.connect(self.start_place_search)
+        self.place_search_button = QPushButton("Search")
+        self.place_search_button.clicked.connect(self.start_place_search)
+        search_layout.addWidget(self.place_search_input, stretch=1)
+        search_layout.addWidget(self.place_search_button)
+        layout.addLayout(search_layout)
+
+        self.place_search_status_label = QLabel()
+        self.place_search_status_label.hide()
+        layout.addWidget(self.place_search_status_label)
+
+        self.place_search_list = QListWidget()
+        self.place_search_list.setMaximumHeight(170)
+        self.place_search_list.currentRowChanged.connect(
+            self.select_place_search_result
+        )
+        self.place_search_list.hide()
+        layout.addWidget(self.place_search_list)
 
         # Controls layout
         controls_layout = QHBoxLayout()
@@ -1985,9 +2290,92 @@ class MapDialog(QDialog):
         # Trigger initial load
         self.request_tiles_for_current_view()
 
+    def _stop_workers(self) -> None:
+        if self.place_search_worker and self.place_search_worker.isRunning():
+            self.place_search_worker.cancel()
+            self.place_search_worker.wait()
+        if self.worker.isRunning():
+            self.worker.stop()
+
     def closeEvent(self, a0: QCloseEvent | None) -> None:
-        self.worker.stop()
+        self._stop_workers()
         super().closeEvent(a0)
+
+    def start_place_search(self) -> None:
+        query = self.place_search_input.text().strip()
+        if not query:
+            self.place_search_status_label.setText("Enter a place name to search.")
+            self.place_search_status_label.show()
+            self.place_search_list.hide()
+            return
+        if self.place_search_worker and self.place_search_worker.isRunning():
+            return
+
+        self.place_search_results = []
+        self.place_search_list.clear()
+        self.place_search_list.hide()
+        self.place_search_status_label.setText(f'Searching for "{query}"...')
+        self.place_search_status_label.show()
+        self.place_search_button.setEnabled(False)
+
+        cache_file = (
+            self._main_window.http_cache_file
+            if self._main_window and hasattr(self._main_window, "http_cache_file")
+            else None
+        )
+        self.place_search_worker = PlaceSearchWorker(query, cache_file)
+        self.place_search_worker.results_ready.connect(self.on_place_search_results)
+        self.place_search_worker.search_failed.connect(self.on_place_search_failed)
+        self.place_search_worker.finished.connect(self.on_place_search_finished)
+        self.place_search_worker.start()
+
+    def on_place_search_results(self, results: list[dict[str, Any]]) -> None:
+        self.place_search_results = results
+        self.place_search_list.clear()
+        if not results:
+            self.place_search_status_label.setText("No matching places found.")
+            self.place_search_status_label.show()
+            self.place_search_list.hide()
+            return
+
+        for place in results:
+            self.place_search_list.addItem(place["display_name"])
+        self.place_search_status_label.setText(
+            "Select a result to move the map. Your radius will stay unchanged."
+        )
+        self.place_search_status_label.show()
+        self.place_search_list.setCurrentRow(-1)
+        self.place_search_list.show()
+        self.place_search_list.setFocus()
+
+    def on_place_search_failed(self, message: str) -> None:
+        logging.warning("Place search could not be completed: %s", message)
+        self.place_search_status_label.setText(
+            "Place search is unavailable. Check your network connection and try again."
+        )
+        self.place_search_status_label.show()
+        self.place_search_list.hide()
+
+    def on_place_search_finished(self) -> None:
+        self.place_search_button.setEnabled(True)
+
+    def select_place_search_result(self, row: int) -> None:
+        if row < 0 or row >= len(self.place_search_results):
+            return
+        place = self.place_search_results[row]
+        self.lat = place["lat"]
+        self.lon = place["lon"]
+        west, east, south, north = place_result_view_limits(place)
+        self.ax.set_xlim(west, east)
+        self.ax.set_ylim(south, north)
+        self.update_overlays()
+        self.canvas.draw_idle()
+        self.place_search_input.setText(place["display_name"])
+        self.place_search_status_label.setText(
+            f'Showing "{place["display_name"]}". Click the map to fine-tune the point.'
+        )
+        self.place_search_list.hide()
+        self.request_tiles_for_current_view()
 
     def request_tiles_for_current_view(self) -> None:
         x0, x1 = self.ax.get_xlim()
@@ -2110,7 +2498,12 @@ class MapDialog(QDialog):
             self._main_window.lat_input.setText(f"{self.lat:.4f}")
             self._main_window.lon_input.setText(f"{self.lon:.4f}")
             self._main_window.radius_input.setText(str(self.radius))
+        self._stop_workers()
         super().accept()
+
+    def reject(self) -> None:
+        self._stop_workers()
+        super().reject()
 
     def on_mouse_press(self, event: MouseEvent) -> None:
         if event.inaxes != self.ax:
