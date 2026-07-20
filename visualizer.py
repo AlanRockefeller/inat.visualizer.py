@@ -16,6 +16,7 @@ if sys.platform.startswith("linux") and "QT_QPA_PLATFORM" not in os.environ:
 
 # --- stdlib ---
 import argparse
+import hashlib
 import importlib
 import json
 import logging
@@ -29,7 +30,7 @@ from io import BytesIO
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from inat_visualizer_version import __version__
 from startup_config import APP_DATA_DIRECTORY_NAME
@@ -47,7 +48,7 @@ import pyinaturalist
 import requests
 from matplotlib.backend_bases import MouseEvent
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from PyQt6.QtCore import (
     QMutex,
     QMutexLocker,
@@ -65,6 +66,7 @@ from PyQt6.QtGui import (
     QGuiApplication,
     QKeyEvent,
     QPixmap,
+    QShowEvent,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -72,8 +74,10 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -84,7 +88,6 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
-    QSpinBox,
     QSplashScreen,
     QStatusBar,
     QTextEdit,
@@ -270,17 +273,21 @@ def maintain_http_cache(
                 cleared,
                 size_before / (1024 * 1024),
                 size_after / (1024 * 1024),
-                path,
+                privacy_safe_path(path),
             )
         if size_after > max_size_bytes:
             logging.warning(
                 "HTTP cache remains above its %.1f MB budget (size=%.1f MB, path=%s).",
                 max_size_bytes / (1024 * 1024),
                 size_after / (1024 * 1024),
-                path,
+                privacy_safe_path(path),
             )
     except Exception as error:
-        logging.warning("Could not maintain HTTP cache %s: %s", path, error)
+        logging.warning(
+            "Could not maintain HTTP cache %s: %s",
+            privacy_safe_path(path),
+            privacy_safe_message(error),
+        )
 
 
 def maintain_legacy_pyinaturalist_cache(
@@ -298,7 +305,9 @@ def maintain_legacy_pyinaturalist_cache(
             return
     except OSError as error:
         logging.warning(
-            "Could not inspect legacy HTTP cache %s: %s", legacy_path, error
+            "Could not inspect legacy HTTP cache %s: %s",
+            privacy_safe_path(legacy_path),
+            privacy_safe_message(error),
         )
         return
 
@@ -314,7 +323,11 @@ def maintain_legacy_pyinaturalist_cache(
             clear_valid_if_oversize=False,
         )
     except Exception as error:
-        logging.warning("Could not open legacy HTTP cache %s: %s", legacy_path, error)
+        logging.warning(
+            "Could not open legacy HTTP cache %s: %s",
+            privacy_safe_path(legacy_path),
+            privacy_safe_message(error),
+        )
     finally:
         if session is not None:
             session.close()
@@ -427,7 +440,11 @@ def write_database_stats_cache(
             json.dump(payload, cache_file, indent=2)
         os.replace(temp_path, path)
     except OSError as error:
-        logging.warning("Could not save database statistics cache %s: %s", path, error)
+        logging.warning(
+            "Could not save database statistics cache %s: %s",
+            privacy_safe_path(path),
+            privacy_safe_message(error),
+        )
         try:
             temp_path.unlink(missing_ok=True)
         except OSError:
@@ -587,8 +604,198 @@ MAX_CACHE_SIZE = 500  # Max number of tiles to keep in memory (RAM)
 TILE_CACHE_DIR_NAME = "tile_cache"
 MAX_DISK_CACHE_SIZE_MB = 200
 PLACE_SEARCH_RESULT_LIMIT = 8
-PLACE_SEARCH_LOG_RESPONSE_LIMIT = 20_000
 WEB_MERCATOR_MAX_LATITUDE = 85.05112878
+EARTH_RADIUS_KM = 6371.0
+MAP_RADIUS_MIN_KM = 1.0
+MAP_RADIUS_MAX_KM = 1000.0
+_LOG_PRIVACY_KEY = os.urandom(16)
+
+
+def private_text_identifier(value: str) -> str:
+    """Return a session-local identifier without exposing user-provided text."""
+    digest = hashlib.blake2b(
+        str(value).encode("utf-8", errors="replace"),
+        key=_LOG_PRIVACY_KEY,
+        digest_size=6,
+    ).hexdigest()
+    return f"text-{digest}"
+
+
+def privacy_safe_path(path: str | Path) -> str:
+    """Format a path for logs without exposing the user's home directory name."""
+    if str(path) == ":memory:":
+        return ":memory:"
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return str(candidate)
+    try:
+        relative = candidate.resolve(strict=False).relative_to(
+            Path.home().resolve(strict=False)
+        )
+    except (OSError, ValueError):
+        return str(candidate)
+    return str(Path("~") / relative)
+
+
+def privacy_safe_message(value: Any) -> str:
+    """Remove the current home-directory prefix from exception text."""
+    return str(value).replace(str(Path.home()), "~")
+
+
+def place_search_error_diagnostic(error: BaseException) -> str:
+    """Describe a place-search failure without logging query or exception text."""
+    chain: list[str] = []
+    http_status = None
+    response_host = None
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(type(current).__name__)
+        if isinstance(current, HTTPError):
+            response = current.response
+            if response is not None:
+                http_status = response.status_code
+                response_host = urlparse(response.url or "").hostname
+        current = current.__cause__ or current.__context__
+
+    details = [f"error_chain={' -> '.join(chain)}"]
+    if http_status is not None:
+        details.append(f"http_status={http_status}")
+    if response_host:
+        details.append(f"response_host={response_host}")
+    return ", ".join(details)
+
+
+def normalize_longitude(lon: float) -> float:
+    """Return a longitude in the conventional [-180, 180) range."""
+    return (float(lon) + 180.0) % 360.0 - 180.0
+
+
+def clamp_latitude_limits(south: float, north: float) -> tuple[float, float]:
+    """Shift latitude limits inside the Web Mercator drawable range."""
+    if south < -WEB_MERCATOR_MAX_LATITUDE:
+        north += -WEB_MERCATOR_MAX_LATITUDE - south
+        south = -WEB_MERCATOR_MAX_LATITUDE
+    if north > WEB_MERCATOR_MAX_LATITUDE:
+        south -= north - WEB_MERCATOR_MAX_LATITUDE
+        north = WEB_MERCATOR_MAX_LATITUDE
+    return south, north
+
+
+def longitude_near_reference(lon: float, reference: float) -> float:
+    """Unwrap ``lon`` to the world copy nearest ``reference``."""
+    return float(reference) + ((float(lon) - float(reference) + 180.0) % 360.0) - 180.0
+
+
+def geodesic_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Calculate the great-circle distance between two coordinates."""
+    lat1_rad, lon1_rad, lat2_rad, lon2_rad = map(math.radians, (lat1, lon1, lat2, lon2))
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+    a = (
+        math.sin(dlat / 2.0) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2.0) ** 2
+    )
+    return EARTH_RADIUS_KM * 2.0 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def geodesic_destination(
+    lat: float, lon: float, distance_km: float, bearing_degrees: float
+) -> tuple[float, float]:
+    """Return the point reached along a great-circle bearing."""
+    angular_distance = float(distance_km) / EARTH_RADIUS_KM
+    lat1 = math.radians(float(lat))
+    lon1 = math.radians(float(lon))
+    bearing = math.radians(float(bearing_degrees))
+
+    lat2 = math.asin(
+        math.sin(lat1) * math.cos(angular_distance)
+        + math.cos(lat1) * math.sin(angular_distance) * math.cos(bearing)
+    )
+    lon2 = lon1 + math.atan2(
+        math.sin(bearing) * math.sin(angular_distance) * math.cos(lat1),
+        math.cos(angular_distance) - math.sin(lat1) * math.sin(lat2),
+    )
+    normalized_lon = normalize_longitude(math.degrees(lon2))
+    return math.degrees(lat2), longitude_near_reference(normalized_lon, lon)
+
+
+def geodesic_circle_coordinates(
+    lat: float, lon: float, radius_km: float, point_count: int = 181
+) -> tuple[list[float], list[float]]:
+    """Return an antimeridian-safe great-circle boundary for a map overlay."""
+    point_count = max(4, int(point_count))
+    nearer_pole_lat = 90.0 if lat >= 0.0 else -90.0
+    encloses_pole = radius_km >= geodesic_distance_km(
+        lat, lon, nearer_pole_lat, lon
+    )
+    if encloses_pole:
+        boundary = []
+        for bearing in np.linspace(0.0, 360.0, point_count, endpoint=False):
+            point_lat, point_lon = geodesic_destination(
+                lat, lon, radius_km, float(bearing)
+            )
+            boundary.append(
+                (
+                    longitude_near_reference(point_lon, lon),
+                    max(
+                        -WEB_MERCATOR_MAX_LATITUDE,
+                        min(WEB_MERCATOR_MAX_LATITUDE, point_lat),
+                    ),
+                )
+            )
+        boundary.sort(key=lambda point: point[0])
+        west = float(lon) - 180.0
+        east = float(lon) + 180.0
+        boundary_lons = [west, *(point[0] for point in boundary), east]
+        boundary_lats = [
+            boundary[0][1],
+            *(point[1] for point in boundary),
+            boundary[-1][1],
+        ]
+        cap_lat = math.copysign(WEB_MERCATOR_MAX_LATITUDE, nearer_pole_lat)
+        cap_lons = np.linspace(east, west, point_count).tolist()
+        return (
+            [*boundary_lons, *cap_lons, west],
+            [*boundary_lats, *([cap_lat] * point_count), boundary_lats[0]],
+        )
+
+    lats: list[float] = []
+    lons: list[float] = []
+    for bearing in np.linspace(0.0, 360.0, point_count):
+        point_lat, point_lon = geodesic_destination(lat, lon, radius_km, float(bearing))
+        lats.append(point_lat)
+        lons.append(point_lon)
+    return lons, lats
+
+
+def radius_view_limits(
+    lat: float, lon: float, radius_km: float, padding: float = 0.25
+) -> tuple[float, float, float, float]:
+    """Return padded longitude/latitude limits containing a radius circle."""
+    circle_lons, circle_lats = geodesic_circle_coordinates(lat, lon, radius_km)
+    west, east = min(circle_lons), max(circle_lons)
+    south = max(-WEB_MERCATOR_MAX_LATITUDE, min(circle_lats))
+    north = min(WEB_MERCATOR_MAX_LATITUDE, max(circle_lats))
+
+    lat_margin = max((north - south) * padding, 0.005)
+    nearer_pole_lat = 90.0 if lat >= 0.0 else -90.0
+    if radius_km >= geodesic_distance_km(lat, lon, nearer_pole_lat, lon):
+        return (
+            float(lon) - 180.0,
+            float(lon) + 180.0,
+            max(-WEB_MERCATOR_MAX_LATITUDE, south - lat_margin),
+            min(WEB_MERCATOR_MAX_LATITUDE, north + lat_margin),
+        )
+
+    lon_margin = max((east - west) * padding, 0.005)
+    return (
+        west - lon_margin,
+        east + lon_margin,
+        max(-WEB_MERCATOR_MAX_LATITUDE, south - lat_margin),
+        min(WEB_MERCATOR_MAX_LATITUDE, north + lat_margin),
+    )
 
 
 def _coordinate_pairs(value: Any):
@@ -680,23 +887,34 @@ def normalize_place_search_results(response: Any) -> list[dict[str, Any]]:
 
 
 def place_search_response_for_log(response: Any) -> str:
-    """Serialize a bounded place-search response for DEBUG diagnostics."""
-    try:
-        serialized = json.dumps(
-            response,
-            ensure_ascii=False,
-            default=str,
-            separators=(",", ":"),
+    """Serialize a compact, privacy-safe place-search response summary."""
+    if not isinstance(response, dict):
+        return json.dumps(
+            {"response_type": type(response).__name__}, separators=(",", ":")
         )
-    except (TypeError, ValueError):
-        serialized = repr(response)
-    if len(serialized) > PLACE_SEARCH_LOG_RESPONSE_LIMIT:
-        omitted = len(serialized) - PLACE_SEARCH_LOG_RESPONSE_LIMIT
-        serialized = (
-            serialized[:PLACE_SEARCH_LOG_RESPONSE_LIMIT]
-            + f"... <{omitted} characters omitted>"
-        )
-    return serialized
+
+    raw_results = response.get("results")
+    results = raw_results if isinstance(raw_results, list) else []
+    result_types: dict[str, int] = {}
+    records_with_bounds = 0
+    for result in results:
+        if not isinstance(result, dict):
+            result_type = type(result).__name__
+        else:
+            result_type = str(result.get("type") or "unknown")
+            record = result.get("record")
+            if isinstance(record, dict) and record.get("bounding_box_geojson"):
+                records_with_bounds += 1
+        result_types[result_type] = result_types.get(result_type, 0) + 1
+
+    summary = {
+        "total_results": response.get("total_results"),
+        "returned_results": len(results),
+        "result_types": result_types,
+        "usable_places": len(normalize_place_search_results(response)),
+        "records_with_bounds": records_with_bounds,
+    }
+    return json.dumps(summary, separators=(",", ":"), sort_keys=True)
 
 
 def place_result_view_limits(
@@ -728,7 +946,7 @@ def calculate_local_search_bounds(
 ) -> tuple[float, float, float, float]:
     """Calculate a latitude/longitude bounding box around a radius in km."""
     lat_rad = math.radians(lat)
-    earth_radius_km = 6371
+    earth_radius_km = EARTH_RADIUS_KM
     lat_diff = radius / earth_radius_km
 
     cos_lat = math.cos(lat_rad)
@@ -1006,7 +1224,11 @@ class DiskTileCache:
                 with Image.open(path) as img:
                     return img.convert("RGB").copy()
             except Exception as e:
-                logging.warning(f"Corrupt tile in disk cache {path}: {e}")
+                logging.warning(
+                    "Corrupt tile in disk cache %s: %s",
+                    privacy_safe_path(path),
+                    privacy_safe_message(e),
+                )
         return None
 
     def put_tile(self, z: int, x: int, y: int, image_bytes: bytes) -> None:
@@ -1020,7 +1242,11 @@ class DiskTileCache:
             os.replace(temp_path, path)
             self._prune_if_needed()
         except Exception as e:
-            logging.exception(f"Failed to write tile to disk {path}: {e}")
+            logging.error(
+                "Failed to write tile to disk %s: %s",
+                privacy_safe_path(path),
+                privacy_safe_message(e),
+            )
             if temp_path.exists():
                 try:
                     os.remove(temp_path)
@@ -1120,6 +1346,8 @@ class PlaceSearchWorker(QThread):
         ]
 
     def _search(self, query: str, request_session) -> list[dict[str, Any]]:
+        started_at = time.monotonic()
+        query_id = private_text_identifier(query)
         request_params = {
             "q": query,
             "sources": "places",
@@ -1128,14 +1356,18 @@ class PlaceSearchWorker(QThread):
         debug_logging = logging.getLogger().isEnabledFor(logging.DEBUG)
         if debug_logging:
             logging.debug(
-                "Place search request: GET https://api.inaturalist.org/v1/search params=%r",
-                request_params,
+                "Place search request: query_id=%s, chars=%d, qualified=%s, limit=%d",
+                query_id,
+                len(query),
+                "," in query,
+                PLACE_SEARCH_RESULT_LIMIT,
             )
         response = pyinaturalist.search(session=request_session, **request_params)
         if debug_logging:
             logging.debug(
-                "Place search response for query=%r: %s",
-                query,
+                "Place search completed: query_id=%s, duration_ms=%d, summary=%s",
+                query_id,
+                round((time.monotonic() - started_at) * 1000),
                 place_search_response_for_log(response),
             )
         return normalize_place_search_results(response)
@@ -1153,11 +1385,11 @@ class PlaceSearchWorker(QThread):
             if not places and qualified_parts and not self.isInterruptionRequested():
                 name, qualifier = qualified_parts
                 logging.debug(
-                    "Place search query=%r returned no usable results; resolving "
-                    "qualifier=%r and retrying name=%r",
-                    self.query,
-                    qualifier,
-                    name,
+                    "Place search fallback: query_id=%s returned no usable results; "
+                    "resolving qualifier_id=%s and retrying name_id=%s",
+                    private_text_identifier(self.query),
+                    private_text_identifier(qualifier),
+                    private_text_identifier(name),
                 )
                 qualifier_places = self._search(qualifier, request_session)
                 qualifier_id = self._exact_qualifier_id(qualifier, qualifier_places)
@@ -1169,19 +1401,18 @@ class PlaceSearchWorker(QThread):
                 )
                 if scoped_places:
                     logging.debug(
-                        "Place search qualifier=%r resolved to place_id=%r; "
-                        "kept %d of %d name matches",
-                        qualifier,
-                        qualifier_id,
+                        "Place search qualifier_id=%s resolved; kept %d of %d "
+                        "fallback matches",
+                        private_text_identifier(qualifier),
                         len(scoped_places),
                         len(fallback_places),
                     )
                     places = scoped_places
                 else:
                     logging.debug(
-                        "Place search qualifier=%r could not narrow %d name matches; "
-                        "returning the unqualified matches",
-                        qualifier,
+                        "Place search qualifier_id=%s could not narrow %d fallback "
+                        "matches; returning the unqualified matches",
+                        private_text_identifier(qualifier),
                         len(fallback_places),
                     )
                     places = fallback_places
@@ -1189,7 +1420,11 @@ class PlaceSearchWorker(QThread):
                 self.results_ready.emit(places)
         except Exception as error:
             if not self.isInterruptionRequested():
-                logging.exception("Place search failed for %r", self.query)
+                logging.error(
+                    "Place search failed: query_id=%s, %s",
+                    private_text_identifier(self.query),
+                    place_search_error_diagnostic(error),
+                )
                 self.search_failed.emit(str(error))
         finally:
             if request_session is not None:
@@ -1254,7 +1489,10 @@ class TileLoaderWorker(QThread):
                 continue
 
             job_id, base_zoom, x0, x1, y0, y1 = job
-            self._process_job(session, job_id, base_zoom, x0, x1, y0, y1)
+            try:
+                self._process_job(session, job_id, base_zoom, x0, x1, y0, y1)
+            except Exception:
+                logging.exception("Unexpected map tile job failure; continuing")
 
     def _get_tile_range(
         self, z: int, x0: float, x1: float, y0: float, y1: float
@@ -1297,8 +1535,36 @@ class TileLoaderWorker(QThread):
     ) -> None:
         MAX_UNCACHED_TILES = 16
         MAX_TOTAL_TILES = 100
+        started_at = time.monotonic()
+        ram_hits = 0
+        disk_hits = 0
+        network_fetches = 0
+        skipped_tiles = 0
+        failed_tiles = 0
+
+        def log_view_summary(
+            status: str, selected_zoom: int, requested_tiles: int, loaded_tiles: int
+        ) -> None:
+            logging.debug(
+                "Map tile view: job=%d, status=%s, zoom=%d->%d, tiles=%d, "
+                "loaded=%d, ram=%d, disk=%d, network=%d, skipped=%d, failed=%d, "
+                "duration_ms=%d",
+                job_id,
+                status,
+                base_zoom,
+                selected_zoom,
+                requested_tiles,
+                loaded_tiles,
+                ram_hits,
+                disk_hits,
+                network_fetches,
+                skipped_tiles,
+                failed_tiles,
+                round((time.monotonic() - started_at) * 1000),
+            )
 
         zoom = base_zoom
+        total_tiles = 0
         while zoom >= 0:
             x_min, x_max, y_min, y_max = self._get_tile_range(zoom, x0, x1, y0, y1)
             total_tiles = (x_max - x_min + 1) * (y_max - y_min + 1)
@@ -1315,6 +1581,7 @@ class TileLoaderWorker(QThread):
                             self._pending_job is not None
                             and self._pending_job[0] > job_id
                         ):
+                            log_view_summary("superseded", zoom, total_tiles, 0)
                             return
 
                     wrapped_x = tx % int(2.0**zoom)
@@ -1344,6 +1611,7 @@ class TileLoaderWorker(QThread):
             for y in y_range:
                 with QMutexLocker(self.mutex):
                     if self._pending_job is not None and self._pending_job[0] > job_id:
+                        log_view_summary("superseded", zoom, total_tiles, len(tiles))
                         return
 
                 wrapped_x = x % int(2.0**zoom)
@@ -1353,8 +1621,7 @@ class TileLoaderWorker(QThread):
                 if tile_key in self.ram_cache:
                     img = self.ram_cache[tile_key]
                     self.ram_cache.move_to_end(tile_key)
-                    if logging.getLogger().isEnabledFor(logging.DEBUG):
-                        logging.debug(f"RAM cache hit: {zoom}/{wrapped_x}/{y}")
+                    ram_hits += 1
 
                 if img is None:
                     img = self.disk_cache.get_tile(zoom, wrapped_x, y)
@@ -1362,14 +1629,14 @@ class TileLoaderWorker(QThread):
                         self.ram_cache[tile_key] = img
                         if len(self.ram_cache) > MAX_CACHE_SIZE:
                             self.ram_cache.popitem(last=False)
-                        if logging.getLogger().isEnabledFor(logging.DEBUG):
-                            logging.debug(f"Disk cache hit: {zoom}/{wrapped_x}/{y}")
+                        disk_hits += 1
 
                 if img is None:
                     if time.time() < self._network_suspended_until:
                         with QMutexLocker(self.mutex):
                             self._skipped_tiles.add(tile_key)
                         skipped_any = True
+                        skipped_tiles += 1
                         continue
 
                     now = time.time()
@@ -1382,6 +1649,9 @@ class TileLoaderWorker(QThread):
                                 self._pending_job is not None
                                 and self._pending_job[0] > job_id
                             ):
+                                log_view_summary(
+                                    "superseded", zoom, total_tiles, len(tiles)
+                                )
                                 return
 
                     self.last_network_request_time = time.time()
@@ -1390,15 +1660,23 @@ class TileLoaderWorker(QThread):
                     try:
                         resp = session.get(url, timeout=3.0)
                         if resp.status_code == 200:
+                            network_fetches += 1
+                            img_bytes = resp.content
+                            try:
+                                img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                            except (UnidentifiedImageError, OSError, ValueError) as error:
+                                failed_tiles += 1
+                                logging.warning(
+                                    "Map tile decode failed: zoom=%d, error_type=%s",
+                                    zoom,
+                                    type(error).__name__,
+                                )
+                                continue
+
                             if self._notified_error:
                                 self._notified_error = False
                                 self.network_recovered.emit()
                                 trigger_retry = True
-
-                            if logging.getLogger().isEnabledFor(logging.DEBUG):
-                                logging.debug(f"Network fetch: {zoom}/{wrapped_x}/{y}")
-                            img_bytes = resp.content
-                            img = Image.open(BytesIO(img_bytes)).convert("RGB")
 
                             self.ram_cache[tile_key] = img
                             if len(self.ram_cache) > MAX_CACHE_SIZE:
@@ -1408,9 +1686,7 @@ class TileLoaderWorker(QThread):
                             with QMutexLocker(self.mutex):
                                 self._skipped_tiles.discard(tile_key)
                         else:
-                            logging.debug(
-                                f"Tile {zoom}/{wrapped_x}/{y} HTTP {resp.status_code}"
-                            )
+                            failed_tiles += 1
                             if resp.status_code in (
                                 403,
                                 429,
@@ -1434,11 +1710,10 @@ class TileLoaderWorker(QThread):
                                 with QMutexLocker(self.mutex):
                                     self._skipped_tiles.add(tile_key)
                                 skipped_any = True
+                                skipped_tiles += 1
                                 continue
                     except RequestException as e:
-                        logging.debug(
-                            f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e}"
-                        )
+                        failed_tiles += 1
                         if not self._notified_error:
                             self._notified_error = True
                             self.network_error.emit(
@@ -1448,6 +1723,7 @@ class TileLoaderWorker(QThread):
                         with QMutexLocker(self.mutex):
                             self._skipped_tiles.add(tile_key)
                         skipped_any = True
+                        skipped_tiles += 1
                         continue
 
                 if img:
@@ -1475,26 +1751,54 @@ class TileLoaderWorker(QThread):
             self.view_ready.emit(job_id, composite, (west, east, south, north))
         if skipped_any:
             self.tiles_skipped.emit()
+        elif not tiles:
+            self._notified_error = True
+            self.network_error.emit(
+                "Map tiles are unavailable for the selected view."
+            )
+        status = (
+            "ready"
+            if len(tiles) == total_tiles
+            else "partial" if tiles else "unavailable"
+        )
+        log_view_summary(status, zoom, total_tiles, len(tiles))
         if trigger_retry:
             if self._retry_skipped_tiles(session):
                 self.retry_complete.emit()
 
     def _retry_skipped_tiles(self, session: requests.Session) -> bool:
+        started_at = time.monotonic()
         with QMutexLocker(self.mutex):
             skipped = sorted(self._skipped_tiles)
         recovered_any = False
+        recovered_count = 0
+        cached_count = 0
+        attempted_count = 0
+        failed_count = 0
+        status = "complete"
         for tile_key in skipped:
             with QMutexLocker(self.mutex):
                 if self._pending_job is not None:
+                    logging.debug(
+                        "Map tile retry: status=superseded, queued=%d, attempted=%d, "
+                        "recovered=%d, cached=%d, duration_ms=%d",
+                        len(skipped),
+                        attempted_count,
+                        recovered_count,
+                        cached_count,
+                        round((time.monotonic() - started_at) * 1000),
+                    )
                     return recovered_any
 
             zoom, wrapped_x, y = tile_key
             if tile_key in self.ram_cache:
                 with QMutexLocker(self.mutex):
                     self._skipped_tiles.discard(tile_key)
+                cached_count += 1
                 continue
 
             if time.time() < self._network_suspended_until:
+                status = "deferred"
                 break
 
             now = time.time()
@@ -1505,10 +1809,21 @@ class TileLoaderWorker(QThread):
 
             url = f"https://tile.openstreetmap.org/{zoom}/{wrapped_x}/{y}.png"
             try:
+                attempted_count += 1
                 resp = session.get(url, timeout=3.0)
                 if resp.status_code == 200:
                     img_bytes = resp.content
-                    img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                    try:
+                        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                    except (UnidentifiedImageError, OSError, ValueError) as error:
+                        failed_count += 1
+                        status = "failed"
+                        logging.warning(
+                            "Map tile retry decode failed: zoom=%d, error_type=%s",
+                            zoom,
+                            type(error).__name__,
+                        )
+                        continue
                     self.ram_cache[tile_key] = img
                     if len(self.ram_cache) > MAX_CACHE_SIZE:
                         self.ram_cache.popitem(last=False)
@@ -1516,10 +1831,10 @@ class TileLoaderWorker(QThread):
                     with QMutexLocker(self.mutex):
                         self._skipped_tiles.discard(tile_key)
                     recovered_any = True
+                    recovered_count += 1
                 else:
-                    logging.debug(
-                        f"Tile {zoom}/{wrapped_x}/{y} HTTP {resp.status_code}"
-                    )
+                    failed_count += 1
+                    status = "failed"
                     if resp.status_code in (403, 429, 418, 408, 500, 502, 503, 504):
                         if not self._notified_error:
                             self._notified_error = True
@@ -1533,7 +1848,8 @@ class TileLoaderWorker(QThread):
                         self._network_suspended_until = time.time() + 15.0
                     break
             except RequestException as e:
-                logging.debug(f"Failed to load tile {zoom}/{wrapped_x}/{y}: {e!s}")
+                failed_count += 1
+                status = "failed"
                 if not self._notified_error:
                     self._notified_error = True
                     self.network_error.emit(f"Network error: {e!s}. Backing off.")
@@ -1541,9 +1857,25 @@ class TileLoaderWorker(QThread):
                 break
 
         with QMutexLocker(self.mutex):
-            still_skipped = len(self._skipped_tiles) > 0
+            remaining_count = len(self._skipped_tiles)
+            still_skipped = remaining_count > 0
         if still_skipped:
             self.tiles_skipped.emit()
+
+        if still_skipped and status == "complete":
+            status = "partial"
+        logging.debug(
+            "Map tile retry: status=%s, queued=%d, attempted=%d, recovered=%d, "
+            "cached=%d, failed=%d, remaining=%d, duration_ms=%d",
+            status,
+            len(skipped),
+            attempted_count,
+            recovered_count,
+            cached_count,
+            failed_count,
+            remaining_count,
+            round((time.monotonic() - started_at) * 1000),
+        )
 
         return recovered_any
 
@@ -2050,8 +2382,7 @@ class CustomSplashScreen(QSplashScreen):
 
         # Status label
         self.status_label = QLabel(self)
-        self.status_label.setStyleSheet(
-            """
+        self.status_label.setStyleSheet("""
             QLabel {
                 color: white;
                 background-color: rgba(0, 0, 0, 100);
@@ -2060,8 +2391,7 @@ class CustomSplashScreen(QSplashScreen):
                 font-size: 24px;
                 font-weight: bold;
             }
-        """
-        )
+        """)
         self.status_label.setText("Initializing...")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -2091,7 +2421,7 @@ class PlaceSearchLineEdit(QLineEdit):
 
 
 class MapDialog(QDialog):
-    """Interactive map dialog for setting coordinates and radius using matplotlib"""
+    """Professional map picker for the center and radius of a graph search."""
 
     def __init__(
         self,
@@ -2102,44 +2432,61 @@ class MapDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         self._main_window = parent
-        self.lat = lat
-        self.lon = lon
-        self.radius = radius
+        self._original_selection = (float(lat), float(lon), float(radius))
+        self.lat = max(
+            -WEB_MERCATOR_MAX_LATITUDE,
+            min(WEB_MERCATOR_MAX_LATITUDE, float(lat)),
+        )
+        self.lon = normalize_longitude(float(lon))
+        self.radius = max(MAP_RADIUS_MIN_KM, min(MAP_RADIUS_MAX_KM, float(radius)))
         self.place_search_worker: PlaceSearchWorker | None = None
         self.place_search_results: list[dict[str, Any]] = []
-
-        # Worker setup
-        working_dir = parent.working_dir if parent else os.getcwd()
-        self.worker = TileLoaderWorker(working_dir)
-        self.worker.view_ready.connect(self.on_view_ready)
-        self.worker.network_error.connect(self.on_network_error)
-        self.worker.network_recovered.connect(self.on_network_recovered)
-        self.worker.retry_complete.connect(self.request_tiles_for_current_view)
-        self.worker.tiles_skipped.connect(self.on_tiles_skipped)
-        self.worker.start()
-
         self.job_counter = 0
         self.current_job_id = 0
+        self._network_error_message: str | None = None
+        self._initial_view_pending = True
+        self._syncing_controls = False
+        self._selection_source = "initial"
+        self._result_logged = False
+        self._drag_mode: str | None = None
+        self._press_pixel: tuple[float, float] | None = None
+        self._last_pan_pos: tuple[float, float] | None = None
+        self._pan_start_limits: (
+            tuple[tuple[float, float], tuple[float, float]] | None
+        ) = None
 
-        self.setWindowTitle("Interactive Map - Set Location")
+        self.setWindowTitle("Choose Search Area")
         self.setModal(True)
 
         _primary = QApplication.primaryScreen()
         if _primary is not None:
-            screen = _primary.geometry()
-            self.resize(int(screen.width() * 0.75), int(screen.height() * 0.75))
+            screen = _primary.availableGeometry()
+            self.resize(int(screen.width() * 0.82), int(screen.height() * 0.82))
         else:
             logging.warning("No primary screen detected; using fallback dialog size")
-            self.resize(1200, 800)
+            self.resize(1100, 760)
 
-        # Create layout
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
 
-        # Explicit place search avoids sending a request for every keystroke.
+        title_label = QLabel("Choose search area")
+        title_label.setObjectName("mapDialogTitle")
+        layout.addWidget(title_label)
+
+        subtitle_label = QLabel(
+            "Find a place, then click the map to set the center and size the area "
+            "with the radius handle."
+        )
+        subtitle_label.setObjectName("mapDialogSubtitle")
+        subtitle_label.setWordWrap(True)
+        layout.addWidget(subtitle_label)
+
         search_layout = QHBoxLayout()
+        search_layout.setSpacing(8)
         self.place_search_input = PlaceSearchLineEdit()
         self.place_search_input.setPlaceholderText(
-            "Search for a city, country, or park..."
+            "Search for a city, country, park, or other place"
         )
         self.place_search_input.setClearButtonEnabled(True)
         self.place_search_input.search_requested.connect(self.start_place_search)
@@ -2150,145 +2497,376 @@ class MapDialog(QDialog):
         layout.addLayout(search_layout)
 
         self.place_search_status_label = QLabel()
+        self.place_search_status_label.setObjectName("placeSearchStatus")
+        self.place_search_status_label.setWordWrap(True)
         self.place_search_status_label.hide()
         layout.addWidget(self.place_search_status_label)
 
         self.place_search_list = QListWidget()
-        self.place_search_list.setMaximumHeight(170)
-        self.place_search_list.currentRowChanged.connect(
-            self.select_place_search_result
-        )
+        self.place_search_list.setMaximumHeight(150)
+        self.place_search_list.itemClicked.connect(self.activate_place_search_item)
+        self.place_search_list.itemActivated.connect(self.activate_place_search_item)
         self.place_search_list.hide()
         layout.addWidget(self.place_search_list)
 
-        # Controls layout
-        controls_layout = QHBoxLayout()
+        body_layout = QHBoxLayout()
+        body_layout.setSpacing(12)
 
-        instructions = QLabel("Interactive map")
-        instructions.setStyleSheet("font-weight: bold;")
-        controls_layout.addWidget(instructions)
+        map_layout = QVBoxLayout()
+        map_layout.setContentsMargins(0, 0, 0, 0)
+        map_layout.setSpacing(6)
 
-        radius_label = QLabel("Radius (km):")
-        self.radius_spinbox = QSpinBox()
-        self.radius_spinbox.setRange(1, 1000)
-        self.radius_spinbox.setValue(int(radius))
-        self.radius_spinbox.valueChanged.connect(self.update_radius)
+        map_toolbar = QHBoxLayout()
+        map_toolbar.setSpacing(6)
+        map_hint = QLabel("Drag to pan  •  Click to place center  •  Scroll to zoom")
+        map_hint.setObjectName("mapHint")
+        map_toolbar.addWidget(map_hint)
+        map_toolbar.addStretch()
 
-        # Zoom buttons
+        self.fit_area_button = QPushButton("Fit selected area")
+        self.fit_area_button.setToolTip("Show the complete selected radius")
+        self.fit_area_button.clicked.connect(self.fit_selected_area_and_reload)
+        map_toolbar.addWidget(self.fit_area_button)
+
         zoom_in_btn = QPushButton("+")
-        zoom_in_btn.setFixedSize(30, 30)
+        zoom_in_btn.setToolTip("Zoom in")
+        zoom_in_btn.setFixedSize(34, 30)
         zoom_in_btn.clicked.connect(lambda: self.zoom_map(1.0 / 1.5))
 
         zoom_out_btn = QPushButton("-")
-        zoom_out_btn.setFixedSize(30, 30)
+        zoom_out_btn.setToolTip("Zoom out")
+        zoom_out_btn.setFixedSize(34, 30)
         zoom_out_btn.clicked.connect(lambda: self.zoom_map(1.5))
-
-        self.coord_label = QLabel(f"Lat: {lat:.4f}, Lon: {lon:.4f}")
-
-        self.status_label = QLabel()
-        self.status_label.setStyleSheet(
-            "color: red; font-weight: bold; margin-left: 10px;"
-        )
-        self.status_label.hide()
-
-        controls_layout.addWidget(radius_label)
-        controls_layout.addWidget(self.radius_spinbox)
-        controls_layout.addWidget(zoom_in_btn)
-        controls_layout.addWidget(zoom_out_btn)
-        controls_layout.addWidget(self.coord_label)
-        controls_layout.addWidget(self.status_label)
-        controls_layout.addStretch()
-
-        layout.addLayout(controls_layout)
+        map_toolbar.addWidget(zoom_in_btn)
+        map_toolbar.addWidget(zoom_out_btn)
+        map_layout.addLayout(map_toolbar)
 
         self.figure, self.ax = plt.subplots()
+        self.figure.subplots_adjust(left=0, right=1, bottom=0, top=1)
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        self.canvas.setMinimumSize(800, 600)
-        layout.addWidget(self.canvas, stretch=1)
+        self.canvas.setMinimumSize(420, 320)
+        self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
+        map_layout.addWidget(self.canvas, stretch=1)
+
+        self.status_label = QLabel()
+        self.status_label.setObjectName("mapStatus")
+        self.status_label.setWordWrap(True)
+        self.status_label.hide()
+        map_layout.addWidget(self.status_label)
+        body_layout.addLayout(map_layout, stretch=1)
+
+        selection_panel = QFrame()
+        selection_panel.setObjectName("selectionPanel")
+        selection_panel.setMinimumWidth(245)
+        selection_panel.setMaximumWidth(320)
+        selection_layout = QVBoxLayout(selection_panel)
+        selection_layout.setContentsMargins(16, 16, 16, 16)
+        selection_layout.setSpacing(10)
+
+        selection_title = QLabel("Selected area")
+        selection_title.setObjectName("selectionTitle")
+        selection_layout.addWidget(selection_title)
+
+        selection_help = QLabel(
+            "These values are used to build the observation graphs. You can edit "
+            "them directly or use the map."
+        )
+        selection_help.setObjectName("selectionHelp")
+        selection_help.setWordWrap(True)
+        selection_layout.addWidget(selection_help)
+
+        selection_form = QFormLayout()
+        selection_form.setSpacing(8)
+        self.latitude_spinbox = QDoubleSpinBox()
+        self.latitude_spinbox.setDecimals(6)
+        self.latitude_spinbox.setRange(
+            -WEB_MERCATOR_MAX_LATITUDE, WEB_MERCATOR_MAX_LATITUDE
+        )
+        self.latitude_spinbox.setSingleStep(0.001)
+        self.latitude_spinbox.setKeyboardTracking(False)
+
+        self.longitude_spinbox = QDoubleSpinBox()
+        self.longitude_spinbox.setDecimals(6)
+        self.longitude_spinbox.setRange(-180.0, 180.0)
+        self.longitude_spinbox.setSingleStep(0.001)
+        self.longitude_spinbox.setKeyboardTracking(False)
+
+        self.radius_spinbox = QDoubleSpinBox()
+        self.radius_spinbox.setDecimals(1)
+        self.radius_spinbox.setRange(MAP_RADIUS_MIN_KM, MAP_RADIUS_MAX_KM)
+        self.radius_spinbox.setSingleStep(1.0)
+        self.radius_spinbox.setSuffix(" km")
+        self.radius_spinbox.setKeyboardTracking(False)
+        self.radius_spinbox.setAccelerated(True)
+
+        selection_form.addRow("Latitude", self.latitude_spinbox)
+        selection_form.addRow("Longitude", self.longitude_spinbox)
+        selection_form.addRow("Radius", self.radius_spinbox)
+        selection_layout.addLayout(selection_form)
+
+        handle_help = QLabel(
+            "Tip: drag the white handle on the circle for quick visual sizing."
+        )
+        handle_help.setObjectName("selectionHelp")
+        handle_help.setWordWrap(True)
+        selection_layout.addWidget(handle_help)
+        selection_layout.addStretch()
+
+        body_layout.addWidget(selection_panel)
+        layout.addLayout(body_layout, stretch=1)
 
         button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        use_area_button = button_box.button(QDialogButtonBox.StandardButton.Ok)
+        if use_area_button is not None:
+            use_area_button.setText("Use selected area")
+            use_area_button.setObjectName("useSelectedAreaButton")
+            use_area_button.setDefault(True)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
-        # Timer for debounced reloads
-        self.update_timer = QTimer()
+        self._apply_dialog_style(parent)
+        self._initialize_map_artists(parent)
+
+        self.latitude_spinbox.valueChanged.connect(self.update_center_from_fields)
+        self.longitude_spinbox.valueChanged.connect(self.update_center_from_fields)
+        self.radius_spinbox.valueChanged.connect(self.update_radius)
+        self._sync_selection_controls()
+
+        self.update_timer = QTimer(self)
         self.update_timer.setSingleShot(True)
-        self.update_timer.setInterval(200)  # 200ms debounce
+        self.update_timer.setInterval(200)
         self.update_timer.timeout.connect(self.request_tiles_for_current_view)
 
-        # Dedicated timer for retries after network suspension
-        self.retry_timer = QTimer()
+        self.retry_timer = QTimer(self)
         self.retry_timer.setSingleShot(True)
         self.retry_timer.timeout.connect(self.request_tiles_for_current_view)
 
-        # Initialize the map
-        self.ax.set_xlim(self.lon - 5, self.lon + 5)
-        self.ax.set_ylim(self.lat - 5, self.lat + 5)
+        self.canvas.mpl_connect("button_press_event", self.on_mouse_press)  # type: ignore[arg-type]
+        self.canvas.mpl_connect("button_release_event", self.on_mouse_release)  # type: ignore[arg-type]
+        self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)  # type: ignore[arg-type]
+        self.canvas.mpl_connect("scroll_event", self.on_scroll)  # type: ignore[arg-type]
 
-        self.ax.set_xlabel("Longitude", fontsize=12, fontweight="bold")
-        self.ax.set_ylabel("Latitude", fontsize=12, fontweight="bold")
-        self.ax.set_title(
-            "Interactive Map - Click to set location, right-click (or Ctrl+Click) to pan. Scroll or use buttons to zoom.",
-            fontsize=14,
-            fontweight="bold",
+        working_dir = parent.working_dir if parent else os.getcwd()
+        self.worker = TileLoaderWorker(working_dir)
+        self.worker.view_ready.connect(self.on_view_ready)
+        self.worker.network_error.connect(self.on_network_error)
+        self.worker.network_recovered.connect(self.on_network_recovered)
+        self.worker.retry_complete.connect(self.request_tiles_for_current_view)
+        self.worker.tiles_skipped.connect(self.on_tiles_skipped)
+        self.worker.start()
+
+        logging.debug("Map picker opened: radius_km=%.1f", self.radius)
+
+    def _apply_dialog_style(self, parent: "INatSeasonalVisualizer | None") -> None:
+        mode = DEFAULT_THEME
+        if parent and hasattr(parent, "settings"):
+            mode = normalize_theme(parent.settings.value("theme", DEFAULT_THEME))
+        dark = mode == "dark"
+        panel_bg = "#383838" if dark else "#f4f6f8"
+        panel_border = "#555555" if dark else "#d5dbe1"
+        secondary = "#c8c8c8" if dark else "#52606d"
+        warning_bg = "#4a3c20" if dark else "#fff4d6"
+        warning_text = "#ffe29a" if dark else "#6b4e00"
+        self._map_status_normal_style = f"color: {secondary}; padding: 4px 6px;"
+        self._map_status_warning_style = (
+            f"background: {warning_bg}; color: {warning_text}; padding: 6px 8px; "
+            "border-radius: 4px; font-weight: 600;"
         )
-        self.ax.grid(False)
+        self.setStyleSheet(self.styleSheet() + f"""
+            QLabel#mapDialogTitle {{ font-size: 18pt; font-weight: 700; }}
+            QLabel#mapDialogSubtitle, QLabel#mapHint, QLabel#selectionHelp,
+            QLabel#placeSearchStatus {{ color: {secondary}; }}
+            QFrame#selectionPanel {{
+                background-color: {panel_bg};
+                border: 1px solid {panel_border};
+                border-radius: 7px;
+            }}
+            QFrame#selectionPanel QLabel {{ background: transparent; border: none; }}
+            QFrame#selectionPanel QDoubleSpinBox {{
+                background-color: {"#2e2e2e" if dark else "#ffffff"};
+                border: 1px solid {panel_border};
+                border-radius: 4px;
+                padding: 4px 6px;
+            }}
+            QLabel#selectionTitle {{ font-size: 13pt; font-weight: 700; }}
+            QPushButton#useSelectedAreaButton {{
+                background-color: #2f80ed;
+                color: white;
+                border: 1px solid #2671d5;
+                border-radius: 4px;
+                padding: 6px 14px;
+                font-weight: 600;
+            }}
+            QPushButton#useSelectedAreaButton:hover {{ background-color: #3d8cf3; }}
+            """)
 
-        # Overlays - adjust marker size for 4K visibility if needed (using scale_factor from parent if available)
-        marker_size = 12 * (
+    def _initialize_map_artists(self, parent: "INatSeasonalVisualizer | None") -> None:
+        mode = DEFAULT_THEME
+        if parent and hasattr(parent, "settings"):
+            mode = normalize_theme(parent.settings.value("theme", DEFAULT_THEME))
+        map_background = "#252a30" if mode == "dark" else "#e7ebef"
+        self.figure.set_facecolor(map_background)
+        self.ax.set_facecolor(map_background)
+        self.ax.set_axis_off()
+
+        scale_factor = (
             parent.scale_factor if parent and hasattr(parent, "scale_factor") else 1.0
         )
+        accent = "#2f80ed"
+        (self.circle,) = self.ax.plot(
+            [], [], color=accent, linewidth=2.2, alpha=0.95, zorder=7
+        )
+        self.radius_fill = self.ax.fill(
+            [], [], facecolor=accent, edgecolor="none", alpha=0.18, zorder=6
+        )[0]
         (self.marker,) = self.ax.plot(
             [],
             [],
-            "ro",
-            markersize=marker_size,
-            markeredgecolor="darkred",
-            markeredgewidth=3,
+            marker="o",
+            linestyle="none",
+            markersize=10 * scale_factor,
+            markerfacecolor=accent,
+            markeredgecolor="white",
+            markeredgewidth=2,
             zorder=10,
         )
-        (self.circle,) = self.ax.plot([], [], "r-", linewidth=3, alpha=0.8, zorder=5)
-        self.update_overlays()
-
-        # OpenStreetMap attribution overlay
+        (self.radius_handle,) = self.ax.plot(
+            [],
+            [],
+            marker="o",
+            linestyle="none",
+            markersize=9 * scale_factor,
+            markerfacecolor="white",
+            markeredgecolor=accent,
+            markeredgewidth=2,
+            zorder=11,
+        )
         self.ax.text(
             0.99,
-            0.01,
+            0.015,
             "© OpenStreetMap contributors",
             verticalalignment="bottom",
             horizontalalignment="right",
             transform=self.ax.transAxes,
             color="#333333",
-            fontsize=9,
-            fontweight="bold",
+            fontsize=8,
             bbox=dict(
                 facecolor="white",
-                alpha=0.85,
-                edgecolor="gray",
-                boxstyle="round,pad=0.3",
+                alpha=0.88,
+                edgecolor="#b8b8b8",
+                boxstyle="round,pad=0.25",
             ),
             zorder=20,
         )
 
-        # Connect mouse events
-        self.canvas.mpl_connect("button_press_event", self.on_click)  # type: ignore[arg-type]
-        self.canvas.mpl_connect("scroll_event", self.on_scroll)  # type: ignore[arg-type]
+    def _sync_selection_controls(self) -> None:
+        self._syncing_controls = True
+        try:
+            self.latitude_spinbox.setValue(self.lat)
+            self.longitude_spinbox.setValue(normalize_longitude(self.lon))
+            self.radius_spinbox.setValue(self.radius)
+        finally:
+            self._syncing_controls = False
 
-        # Pan support
-        self._is_panning = False
-        self._last_pan_pos: tuple[float, float] | None = None
-        self.canvas.mpl_connect("button_press_event", self.on_mouse_press)  # type: ignore[arg-type]
-        self.canvas.mpl_connect("button_release_event", self.on_mouse_release)  # type: ignore[arg-type]
-        self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)  # type: ignore[arg-type]
+    def _display_longitude(self) -> float:
+        try:
+            x0, x1 = self.ax.get_xlim()
+            reference = (x0 + x1) / 2.0
+        except Exception:
+            reference = self.lon
+        return longitude_near_reference(self.lon, reference)
 
-        # Trigger initial load
+    def _set_view_limits(
+        self, west: float, east: float, south: float, north: float
+    ) -> None:
+        center_lon = (west + east) / 2.0
+        center_lat = max(
+            -WEB_MERCATOR_MAX_LATITUDE,
+            min(WEB_MERCATOR_MAX_LATITUDE, (south + north) / 2.0),
+        )
+        lon_span = max(0.01, east - west)
+        lat_span = max(0.01, north - south)
+
+        width = max(1, self.canvas.width())
+        height = max(1, self.canvas.height())
+        mercator_aspect = 1.0 / max(0.15, math.cos(math.radians(center_lat)))
+        desired_lon_lat_ratio = mercator_aspect * width / height
+        if lon_span / lat_span < desired_lon_lat_ratio:
+            lon_span = lat_span * desired_lon_lat_ratio
+        else:
+            lat_span = lon_span / desired_lon_lat_ratio
+
+        lon_span = min(360.0, lon_span)
+        lat_span = min(WEB_MERCATOR_MAX_LATITUDE * 2.0, lat_span)
+        south = center_lat - lat_span / 2.0
+        north = center_lat + lat_span / 2.0
+        south, north = clamp_latitude_limits(south, north)
+
+        self.ax.set_xlim(center_lon - lon_span / 2.0, center_lon + lon_span / 2.0)
+        self.ax.set_ylim(south, north)
+        self.ax.set_aspect(mercator_aspect, adjustable="box")
+
+    def fit_selected_area(
+        self, extra_bounds: tuple[float, float, float, float] | None = None
+    ) -> None:
+        display_lon = self._display_longitude()
+        west, east, south, north = radius_view_limits(
+            self.lat, display_lon, self.radius
+        )
+        if extra_bounds is not None:
+            extra_west, extra_east, extra_south, extra_north = extra_bounds
+            extra_center = (extra_west + extra_east) / 2.0
+            display_lon = longitude_near_reference(display_lon, extra_center)
+            radius_bounds = radius_view_limits(self.lat, display_lon, self.radius)
+            west = min(extra_west, radius_bounds[0])
+            east = max(extra_east, radius_bounds[1])
+            south = min(extra_south, radius_bounds[2])
+            north = max(extra_north, radius_bounds[3])
+        self._set_view_limits(west, east, south, north)
+        self.update_overlays()
+        self.canvas.draw_idle()
+
+    def fit_selected_area_and_reload(self) -> None:
+        self.fit_selected_area()
         self.request_tiles_for_current_view()
+
+    def ensure_selection_visible(self) -> bool:
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        display_lon = longitude_near_reference(self.lon, (x0 + x1) / 2.0)
+        if not (x0 <= display_lon <= x1 and y0 <= self.lat <= y1):
+            self.fit_selected_area()
+            return True
+
+        circle_lons, circle_lats = geodesic_circle_coordinates(
+            self.lat, display_lon, self.radius
+        )
+        lon_margin = (x1 - x0) * 0.06
+        lat_margin = (y1 - y0) * 0.06
+        if (
+            min(circle_lons) >= x0 + lon_margin
+            and max(circle_lons) <= x1 - lon_margin
+            and min(circle_lats) >= y0 + lat_margin
+            and max(circle_lats) <= y1 - lat_margin
+        ):
+            return False
+
+        circle_bounds = radius_view_limits(self.lat, display_lon, self.radius, 0.12)
+        self._set_view_limits(
+            min(x0, circle_bounds[0]),
+            max(x1, circle_bounds[1]),
+            min(y0, circle_bounds[2]),
+            max(y1, circle_bounds[3]),
+        )
+        self.update_overlays()
+        self.canvas.draw_idle()
+        return True
 
     def _stop_workers(self) -> None:
         if self.place_search_worker and self.place_search_worker.isRunning():
@@ -2298,8 +2876,33 @@ class MapDialog(QDialog):
             self.worker.stop()
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
+        self._log_map_result("cancelled")
         self._stop_workers()
         super().closeEvent(a0)
+
+    def showEvent(self, event: QShowEvent | None) -> None:
+        super().showEvent(event)
+        if self._initial_view_pending:
+            self._initial_view_pending = False
+            QTimer.singleShot(0, self._initialize_initial_view)
+
+    def _initialize_initial_view(self) -> None:
+        if not self.isVisible():
+            self._initial_view_pending = True
+            return
+        self.fit_selected_area()
+        self.request_tiles_for_current_view()
+
+    def _log_map_result(self, status: str) -> None:
+        if self._result_logged:
+            return
+        self._result_logged = True
+        logging.debug(
+            "Map picker %s: radius_km=%.1f, last_change=%s",
+            status,
+            self.radius,
+            self._selection_source,
+        )
 
     def start_place_search(self) -> None:
         query = self.place_search_input.text().strip()
@@ -2341,15 +2944,15 @@ class MapDialog(QDialog):
         for place in results:
             self.place_search_list.addItem(place["display_name"])
         self.place_search_status_label.setText(
-            "Select a result to move the map. Your radius will stay unchanged."
+            "Choose a result to move the selected area."
         )
         self.place_search_status_label.show()
         self.place_search_list.setCurrentRow(-1)
         self.place_search_list.show()
         self.place_search_list.setFocus()
 
-    def on_place_search_failed(self, message: str) -> None:
-        logging.warning("Place search could not be completed: %s", message)
+    def on_place_search_failed(self, _message: str) -> None:
+        logging.warning("Place search could not be completed.")
         self.place_search_status_label.setText(
             "Place search is unavailable. Check your network connection and try again."
         )
@@ -2359,22 +2962,32 @@ class MapDialog(QDialog):
     def on_place_search_finished(self) -> None:
         self.place_search_button.setEnabled(True)
 
+    def activate_place_search_item(self, item) -> None:
+        self.select_place_search_result(self.place_search_list.row(item))
+
     def select_place_search_result(self, row: int) -> None:
         if row < 0 or row >= len(self.place_search_results):
             return
         place = self.place_search_results[row]
-        self.lat = place["lat"]
-        self.lon = place["lon"]
-        west, east, south, north = place_result_view_limits(place)
-        self.ax.set_xlim(west, east)
-        self.ax.set_ylim(south, north)
-        self.update_overlays()
-        self.canvas.draw_idle()
+        self.lat = max(
+            -WEB_MERCATOR_MAX_LATITUDE,
+            min(WEB_MERCATOR_MAX_LATITUDE, float(place["lat"])),
+        )
+        self.lon = normalize_longitude(float(place["lon"]))
+        self._selection_source = "place_search"
+        self._sync_selection_controls()
+        self.fit_selected_area(place_result_view_limits(place))
         self.place_search_input.setText(place["display_name"])
         self.place_search_status_label.setText(
-            f'Showing "{place["display_name"]}". Click the map to fine-tune the point.'
+            f'Showing "{place["display_name"]}". Click the map to fine-tune the center.'
         )
         self.place_search_list.hide()
+        logging.debug(
+            "Map place selected: result_index=%d, admin_level=%r, has_bounds=%s",
+            row,
+            place.get("admin_level"),
+            place.get("bounds") is not None,
+        )
         self.request_tiles_for_current_view()
 
     def request_tiles_for_current_view(self) -> None:
@@ -2404,15 +3017,37 @@ class MapDialog(QDialog):
         # We just send the target zoom and boundary.
         self.job_counter += 1
         self.current_job_id = self.job_counter
+        if self._network_error_message is None:
+            self.status_label.setText("Loading map…")
+            self.status_label.setStyleSheet(self._map_status_normal_style)
+            self.status_label.show()
         self.worker.request_view(
             self.current_job_id, zoom, float(x0), float(x1), float(y0), float(y1)
         )
 
     def on_network_error(self, message: str) -> None:
-        self.status_label.setText(message)
+        self._network_error_message = message
+        if "throttled" in message.lower():
+            display_message = (
+                "The map service is temporarily limiting requests. Retrying "
+                "automatically; you can still adjust the selected area."
+            )
+        elif "timed out" in message.lower():
+            display_message = (
+                "Map tiles are taking too long to load. Retrying automatically; "
+                "you can still adjust the selected area."
+            )
+        else:
+            display_message = (
+                "Map tiles are temporarily unavailable. Check your connection; "
+                "you can still adjust the selected area."
+            )
+        self.status_label.setText(display_message)
+        self.status_label.setStyleSheet(self._map_status_warning_style)
         self.status_label.show()
 
     def on_network_recovered(self) -> None:
+        self._network_error_message = None
         self.status_label.hide()
         self.retry_timer.stop()
 
@@ -2431,123 +3066,213 @@ class MapDialog(QDialog):
         for img in list(self.ax.images):
             img.remove()
 
-        self.ax.imshow(np.array(composite), extent=extent, origin="upper", alpha=0.9)
-        self.ax.set_aspect("equal", adjustable="box")
+        x_limits = self.ax.get_xlim()
+        y_limits = self.ax.get_ylim()
+        self.ax.imshow(
+            np.array(composite), extent=extent, origin="upper", alpha=1.0, zorder=1
+        )
+        self.ax.set_xlim(x_limits)
+        self.ax.set_ylim(y_limits)
+        center_lat = (y_limits[0] + y_limits[1]) / 2.0
+        self.ax.set_aspect(
+            1.0 / max(0.15, math.cos(math.radians(center_lat))),
+            adjustable="box",
+        )
 
-        # Redraw overlays
         self.update_overlays()
+        if self._network_error_message is None:
+            self.status_label.hide()
         self.canvas.draw_idle()
 
     def update_overlays(self) -> None:
-        self.marker.set_data([self.lon], [self.lat])
-
-        circle_lons = []
-        circle_lats = []
-        for angle in np.linspace(0, 2 * np.pi, 100):
-            lat_offset = self.radius / 111.0
-            lon_offset = self.radius / (111.0 * np.cos(np.radians(self.lat)))
-            circle_lats.append(self.lat + lat_offset * np.sin(angle))
-            circle_lons.append(self.lon + lon_offset * np.cos(angle))
-
+        display_lon = self._display_longitude()
+        self.marker.set_data([display_lon], [self.lat])
+        circle_lons, circle_lats = geodesic_circle_coordinates(
+            self.lat, display_lon, self.radius
+        )
         self.circle.set_data(circle_lons, circle_lats)
-        self.coord_label.setText(f"Lat: {self.lat:.4f}, Lon: {self.lon:.4f}")
+        self.radius_fill.set_xy(np.column_stack((circle_lons, circle_lats)))
+        handle_lat, handle_lon = geodesic_destination(
+            self.lat, display_lon, self.radius, 90.0
+        )
+        self.radius_handle.set_data([handle_lon], [handle_lat])
 
-    def on_click(self, event: MouseEvent) -> None:
-        if event.inaxes != self.ax:
+    def _set_selected_center(
+        self, lat: float, lon: float, *, source: str = "map_click"
+    ) -> None:
+        self.lat = max(
+            -WEB_MERCATOR_MAX_LATITUDE,
+            min(WEB_MERCATOR_MAX_LATITUDE, float(lat)),
+        )
+        self.lon = normalize_longitude(float(lon))
+        self._selection_source = source
+        self._sync_selection_controls()
+        self.update_overlays()
+        viewport_changed = self.ensure_selection_visible()
+        self.canvas.draw_idle()
+        if viewport_changed:
+            self.update_timer.start()
+
+    def update_center_from_fields(self, _value: float) -> None:
+        if self._syncing_controls:
             return
-        xdata, ydata = event.xdata, event.ydata
-        if event.button == 1 and event.key not in ("control", "ctrl"):
-            if xdata is None or ydata is None:
-                return
-            self.lat = ydata
-            self.lon = xdata
-            self.update_overlays()
-            self.canvas.draw_idle()
+        self._set_selected_center(
+            self.latitude_spinbox.value(),
+            self.longitude_spinbox.value(),
+            source="coordinate_fields",
+        )
 
     def zoom_map(self, scale: float) -> None:
         x0, x1 = self.ax.get_xlim()
         y0, y1 = self.ax.get_ylim()
-
-        # Center of view
         cx = (x0 + x1) / 2
         cy = (y0 + y1) / 2
+        self._zoom_at(cx, cy, scale, 0.5, 0.5)
 
-        w = x1 - x0
-        h = y1 - y0
-
-        new_w = w * scale
-        new_h = h * scale
-
-        new_x0 = cx - new_w / 2
-        new_x1 = cx + new_w / 2
-        new_y0 = cy - new_h / 2
-        new_y1 = cy + new_h / 2
-
+    def _zoom_at(
+        self, mx: float, my: float, scale: float, relx: float, rely: float
+    ) -> None:
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        new_w = min(360.0, max(0.002, (x1 - x0) * scale))
+        new_h = min(
+            WEB_MERCATOR_MAX_LATITUDE * 2.0,
+            max(0.002, (y1 - y0) * scale),
+        )
+        new_x0 = mx - relx * new_w
+        new_x1 = new_x0 + new_w
+        new_y0 = my - rely * new_h
+        new_y1 = new_y0 + new_h
+        new_y0, new_y1 = clamp_latitude_limits(new_y0, new_y1)
         self.ax.set_xlim(new_x0, new_x1)
         self.ax.set_ylim(new_y0, new_y1)
         self.canvas.draw_idle()
         self.update_timer.start()
 
-    def update_radius(self, value: int) -> None:
-        self.radius = value
+    def update_radius(self, value: float) -> None:
+        if self._syncing_controls:
+            return
+        self.radius = max(MAP_RADIUS_MIN_KM, min(MAP_RADIUS_MAX_KM, float(value)))
+        self._selection_source = "radius_field"
         self.update_overlays()
+        viewport_changed = self.ensure_selection_visible()
         self.canvas.draw_idle()
+        if viewport_changed:
+            self.update_timer.start()
 
     def accept(self) -> None:
-        if self._main_window:
-            self._main_window.lat_input.setText(f"{self.lat:.4f}")
-            self._main_window.lon_input.setText(f"{self.lon:.4f}")
-            self._main_window.radius_input.setText(str(self.radius))
+        if self._selection_source == "initial":
+            self.lat, self.lon, self.radius = self._original_selection
+        self._log_map_result("accepted")
         self._stop_workers()
         super().accept()
 
     def reject(self) -> None:
+        self._log_map_result("cancelled")
         self._stop_workers()
         super().reject()
 
     def on_mouse_press(self, event: MouseEvent) -> None:
-        if event.inaxes != self.ax:
+        if (
+            event.inaxes != self.ax
+            or event.xdata is None
+            or event.ydata is None
+            or event.button not in (1, 3)
+        ):
             return
-        # Pan on: Right Click (3), OR Left Click (1) with Control OR Shift
-        is_pan_click = (event.button == 3) or (
-            event.button == 1 and event.key in ("control", "ctrl", "shift")
+
+        self._press_pixel = (float(event.x), float(event.y))
+        self._last_pan_pos = (float(event.xdata), float(event.ydata))
+        self._pan_start_limits = (self.ax.get_xlim(), self.ax.get_ylim())
+        if event.button == 1 and self._event_near_radius_handle(event):
+            self._drag_mode = "radius"
+            self.canvas.setCursor(Qt.CursorShape.SizeAllCursor)
+        elif event.button == 3:
+            self._drag_mode = "pan"
+            self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
+        else:
+            self._drag_mode = "pan_candidate"
+
+    def _event_near_radius_handle(self, event: MouseEvent) -> bool:
+        handle_x = np.asarray(self.radius_handle.get_xdata())
+        handle_y = np.asarray(self.radius_handle.get_ydata())
+        if not len(handle_x) or not len(handle_y):
+            return False
+        pixel_x, pixel_y = self.ax.transData.transform((handle_x[0], handle_y[0]))
+        tolerance = 14.0 * self.figure.dpi / 72.0
+        return (
+            math.hypot(float(event.x) - pixel_x, float(event.y) - pixel_y) <= tolerance
         )
 
-        xdata, ydata = event.xdata, event.ydata
-        if is_pan_click and xdata is not None and ydata is not None:
-            self._is_panning = True
-            self._last_pan_pos = (xdata, ydata)
-            try:
-                self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
-            except Exception:
-                logging.debug("Failed to set cursor")
+    def on_mouse_release(self, event: MouseEvent) -> None:
+        drag_mode = self._drag_mode
+        self._drag_mode = None
+        self._press_pixel = None
+        self._last_pan_pos = None
+        self._pan_start_limits = None
+        self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
 
-    def on_mouse_release(self, _event: MouseEvent) -> None:
-        if self._is_panning:
-            self._is_panning = False
-            self._last_pan_pos = None
-            try:
-                self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
-            except Exception:
-                pass
+        if drag_mode == "pan_candidate" and event.inaxes == self.ax:
+            if event.xdata is not None and event.ydata is not None:
+                self._set_selected_center(float(event.ydata), float(event.xdata))
+        elif drag_mode == "pan":
             self.update_timer.start()
+        elif drag_mode == "radius":
+            viewport_changed = self.ensure_selection_visible()
+            self.canvas.draw_idle()
+            if viewport_changed:
+                self.update_timer.start()
 
     def on_mouse_move(self, event: MouseEvent) -> None:
-        if not self._is_panning or event.inaxes != self.ax:
+        if (
+            self._drag_mode is None
+            or event.inaxes != self.ax
+            or event.xdata is None
+            or event.ydata is None
+        ):
             return
-        if self._last_pan_pos is None:
-            return
-        xdata, ydata = event.xdata, event.ydata
-        if xdata is None or ydata is None:
-            return
-        dx = xdata - self._last_pan_pos[0]
-        dy = ydata - self._last_pan_pos[1]
 
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
+        if self._drag_mode == "pan_candidate":
+            if self._press_pixel is None:
+                return
+            movement = math.hypot(
+                float(event.x) - self._press_pixel[0],
+                float(event.y) - self._press_pixel[1],
+            )
+            if movement < QApplication.startDragDistance():
+                return
+            self._drag_mode = "pan"
+            self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
 
+        if self._drag_mode == "radius":
+            cursor_lon = longitude_near_reference(float(event.xdata), self.lon)
+            new_radius = geodesic_distance_km(
+                self.lat, self.lon, float(event.ydata), cursor_lon
+            )
+            self.radius = max(MAP_RADIUS_MIN_KM, min(MAP_RADIUS_MAX_KM, new_radius))
+            self._selection_source = "radius_handle"
+            self._sync_selection_controls()
+            self.update_overlays()
+            self.canvas.draw_idle()
+            return
+
+        if (
+            self._drag_mode != "pan"
+            or self._press_pixel is None
+            or self._pan_start_limits is None
+        ):
+            return
+        (x0, x1), (y0, y1) = self._pan_start_limits
+        axes_box = self.ax.get_window_extent()
+        if axes_box.width <= 0 or axes_box.height <= 0:
+            return
+        dx = (float(event.x) - self._press_pixel[0]) * (x1 - x0) / axes_box.width
+        dy = (float(event.y) - self._press_pixel[1]) * (y1 - y0) / axes_box.height
         self.ax.set_xlim(x0 - dx, x1 - dx)
-        self.ax.set_ylim(y0 - dy, y1 - dy)
+        new_y0 = y0 - dy
+        new_y1 = y1 - dy
+        new_y0, new_y1 = clamp_latitude_limits(new_y0, new_y1)
+        self.ax.set_ylim(new_y0, new_y1)
         self.canvas.draw_idle()
 
     def on_scroll(self, event: MouseEvent) -> None:
@@ -2563,21 +3288,9 @@ class MapDialog(QDialog):
         y0, y1 = self.ax.get_ylim()
         w, h = x1 - x0, y1 - y0
 
-        new_w = w * scale
-        new_h = h * scale
-
         relx = (mx - x0) / w
         rely = (my - y0) / h
-
-        new_x0 = mx - relx * new_w
-        new_x1 = new_x0 + new_w
-        new_y0 = my - rely * new_h
-        new_y1 = new_y0 + new_h
-
-        self.ax.set_xlim(new_x0, new_x1)
-        self.ax.set_ylim(new_y0, new_y1)
-        self.canvas.draw_idle()
-        self.update_timer.start()
+        self._zoom_at(float(mx), float(my), scale, relx, rely)
 
 
 class EnhancedProgressWidget(QWidget):
@@ -3182,7 +3895,11 @@ class INatSeasonalVisualizer(QMainWindow):
                         )
 
                 os.replace(temp_path, file_path)
-                logging.info(f"Successfully downloaded {filename} to {file_path}")
+                logging.info(
+                    "Successfully downloaded %s to %s",
+                    filename,
+                    privacy_safe_path(file_path),
+                )
                 self.status_bar.showMessage(f"Downloaded {filename} ({human_size})")
                 self.enhanced_progress.finish_progress(
                     f"Successfully downloaded {filename}"
@@ -3263,19 +3980,24 @@ class INatSeasonalVisualizer(QMainWindow):
                 )
                 logging.info(
                     "Loaded taxon cache from %s (%d entries, %d descendant lists)",
-                    self.taxon_cache_file,
+                    privacy_safe_path(self.taxon_cache_file),
                     len(self.taxon_cache),
                     descendant_lists,
                 )
                 for key, value in self.taxon_cache.items():
                     if key.endswith("_descendants"):
                         logging.debug(
-                            f"Loaded {len(value)} descendant taxon IDs for {key[:-11]}"
+                            "Loaded %d descendant taxon IDs for %s",
+                            len(value),
+                            key.removesuffix("_descendants"),
                         )
             else:
-                logging.info(f"No taxon cache found at {self.taxon_cache_file}")
+                logging.info(
+                    "No taxon cache found at %s",
+                    privacy_safe_path(self.taxon_cache_file),
+                )
         except Exception as e:
-            logging.error(f"Failed to load taxon cache: {e!s}")
+            logging.error("Failed to load taxon cache: %s", privacy_safe_message(e))
             QMessageBox.warning(
                 self,
                 "Warning",
@@ -3288,9 +4010,11 @@ class INatSeasonalVisualizer(QMainWindow):
         try:
             with open(self.taxon_cache_file, "w") as f:
                 json.dump(self.taxon_cache, f, indent=2)
-            logging.info(f"Saved taxon cache to {self.taxon_cache_file}")
+            logging.info(
+                "Saved taxon cache to %s", privacy_safe_path(self.taxon_cache_file)
+            )
         except Exception as e:
-            logging.error(f"Failed to save taxon cache: {e!s}")
+            logging.error("Failed to save taxon cache: %s", privacy_safe_message(e))
 
     def load_descendant_taxons_from_file(self, query: str) -> list[int] | None:
         """Load descendant taxon IDs from a user-provided file."""
@@ -3306,13 +4030,18 @@ class INatSeasonalVisualizer(QMainWindow):
                             if id.strip()
                         ]
                         logging.info(
-                            f"Loaded {len(taxon_ids)} descendant taxon IDs for {query} from {self.descendant_taxons_file}"
+                            "Loaded %d descendant taxon IDs for %s from %s",
+                            len(taxon_ids),
+                            query,
+                            privacy_safe_path(self.descendant_taxons_file),
                         )
                         return taxon_ids
             return None
         except Exception as e:
             logging.error(
-                f"Failed to load descendant taxons from {self.descendant_taxons_file}: {e!s}"
+                "Failed to load descendant taxons from %s: %s",
+                privacy_safe_path(self.descendant_taxons_file),
+                privacy_safe_message(e),
             )
             return None
 
@@ -3381,20 +4110,14 @@ class INatSeasonalVisualizer(QMainWindow):
         self.bg_color_input = QLineEdit(self.settings.value("graph_bg_color", ""))
         self.bg_color_input.setPlaceholderText("Theme Default")
 
-        # Create latitude input layout with map button
-        lat_layout = QHBoxLayout()
-        lat_layout.addWidget(self.lat_input, 2)
-
-        # Map button
-        self.map_button = QPushButton("🗺️ Map")
+        self.map_button = QPushButton("Choose on map…")
         self.map_button.clicked.connect(self.open_map_dialog)
-        self.map_button.setToolTip("Open interactive map to set location")
-        lat_layout.addWidget(self.map_button, 1)
+        self.map_button.setToolTip("Choose the graph center and radius on a map")
 
-        # Add latitude layout to sidebar
-        self.sidebar_layout.addRow("Latitude:", lat_layout)
+        self.sidebar_layout.addRow("Latitude:", self.lat_input)
         self.sidebar_layout.addRow("Longitude:", self.lon_input)
         self.sidebar_layout.addRow("Radius (km):", self.radius_input)
+        self.sidebar_layout.addRow(self.map_button)
         self.sidebar_layout.addRow("Organism:", self.organism_input)
         self.sidebar_layout.addRow("Exclude:", self.exclude_input)
         self.sidebar_layout.addRow("Date From:", self.date_from)
@@ -3790,19 +4513,22 @@ class INatSeasonalVisualizer(QMainWindow):
         """Open the interactive map dialog."""
         try:
             lat = float(self.lat_input.text().strip())
+        except ValueError:
+            lat = float(self.default_lat)
+        try:
             lon = float(self.lon_input.text().strip())
+        except ValueError:
+            lon = float(self.default_lon)
+        try:
             radius = float(self.radius_input.text())
         except ValueError:
-            # Use defaults if current values are invalid
-            lat = float(self.default_lat)
-            lon = float(self.default_lon)
             radius = float(self.default_radius)
 
-        # Open map dialog
         dialog = MapDialog(self, lat, lon, radius)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            # Coordinates are updated in the dialog's accept method
-            pass
+            self.lat_input.setText(f"{dialog.lat:.6f}")
+            self.lon_input.setText(f"{dialog.lon:.6f}")
+            self.radius_input.setText(f"{dialog.radius:.1f}")
 
     def load_settings(self) -> None:
         """Load saved settings."""
@@ -3834,16 +4560,7 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def haversine(self, lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Calculate distance between two points in km using Haversine formula."""
-        R = 6371  # Earth's radius in km
-        lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = (
-            math.sin(dlat / 2) ** 2
-            + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-        )
-        c = 2 * math.asin(math.sqrt(a))
-        return R * c
+        return geodesic_distance_km(lat1, lon1, lat2, lon2)
 
     def fetch_all_observations(
         self, params: dict[str, Any]
@@ -5183,21 +5900,21 @@ def main() -> None:
         "Starting iNaturalist Seasonal Visualizer v%s (debug=%s, data_dir=%s)",
         __version__,
         args.debug,
-        working_dir,
+        privacy_safe_path(working_dir),
     )
 
     if args.debug:
-        print(f"DEBUG: Logging level set to {log_level}")
+        logging.debug("Debug logging enabled (level=%s).", log_level)
 
     # Check environment
     if args.debug:
-        print("DEBUG: Checking environment...")
+        logging.debug("Checking environment...")
     env_error = check_environment()
     if env_error:
         print(env_error)
         sys.exit(1)
     if args.debug:
-        print("DEBUG: Environment check passed.")
+        logging.debug("Environment check passed.")
 
     # --- High DPI stability setup (Wayland + Qt6) ---
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -5206,13 +5923,13 @@ def main() -> None:
 
     # Create QApplication first
     if args.debug:
-        print("DEBUG: Creating QApplication...")
+        logging.debug("Creating QApplication...")
     app = QApplication(sys.argv)
     app.setApplicationName("iNaturalist Seasonal Visualizer")
     app.setApplicationVersion(__version__)
     app.setOrganizationName("AlanRockefeller")
     if args.debug:
-        print("DEBUG: QApplication created.")
+        logging.debug("QApplication created.")
 
     if args.smoke_test:
         logging.info(
@@ -5224,15 +5941,24 @@ def main() -> None:
     splash_image_path = resource_path("splash_screen.jpg")
     if os.path.exists(splash_image_path):
         if args.debug:
-            print(f"DEBUG: Splash screen found at {splash_image_path}. Initializing...")
+            logging.debug(
+                "Splash screen found at %s; initializing.",
+                privacy_safe_path(splash_image_path),
+            )
         splash = CustomSplashScreen(splash_image_path)
         splash.update_status("Starting iNaturalist Seasonal Visualizer...")
         QApplication.processEvents()
     else:
         if args.debug:
-            print(f"DEBUG: Splash screen not found at {splash_image_path}. Skipping.")
+            logging.debug(
+                "Splash screen not found at %s; skipping.",
+                privacy_safe_path(splash_image_path),
+            )
         splash = None
-        logging.warning(f"Splash screen image not found at {splash_image_path}")
+        logging.warning(
+            "Splash screen image not found at %s",
+            privacy_safe_path(splash_image_path),
+        )
 
     # Initialize main window with splash screen updates
     if splash:
@@ -5240,7 +5966,7 @@ def main() -> None:
         QApplication.processEvents()
 
     if args.debug:
-        print("DEBUG: Initializing main window (INatSeasonalVisualizer)...")
+        logging.debug("Initializing main window (INatSeasonalVisualizer)...")
     window = INatSeasonalVisualizer(
         lat=args.lat,
         lon=args.lon,
@@ -5251,22 +5977,22 @@ def main() -> None:
         http_cache_max_mb=args.http_cache_max_mb,
     )
     if args.debug:
-        print("DEBUG: Main window initialized.")
+        logging.debug("Main window initialized.")
 
     if splash:
         splash.update_status("Application ready!")
         QApplication.processEvents()
         if args.debug:
-            print("DEBUG: Closing splash screen...")
+            logging.debug("Closing splash screen...")
         splash.close()
 
     if args.debug:
-        print("DEBUG: Showing main window maximized...")
+        logging.debug("Showing main window maximized...")
     window.showMaximized()
     QTimer.singleShot(0, window.start_database_update_check)
 
     if args.debug:
-        print("DEBUG: Starting event loop (app.exec)...")
+        logging.debug("Starting event loop (app.exec)...")
     sys.exit(app.exec())
 
 

@@ -5,9 +5,10 @@ import unittest
 from unittest.mock import MagicMock, call, patch
 
 from PyQt6.QtCore import QCoreApplication
+from requests import Response
+from requests.exceptions import HTTPError
 
 from visualizer import (
-    PLACE_SEARCH_LOG_RESPONSE_LIMIT,
     PlaceSearchWorker,
     normalize_place_search_results,
     place_result_view_limits,
@@ -98,13 +99,18 @@ class PlaceSearchParsingTests(unittest.TestCase):
 
         self.assertEqual(limits, (1.7, 2.3, 47.7, 48.3))
 
-    def test_debug_response_serialization_is_bounded(self) -> None:
-        logged_response = place_search_response_for_log(
-            {"result": "x" * (PLACE_SEARCH_LOG_RESPONSE_LIMIT + 100)}
-        )
+    def test_debug_response_summary_excludes_names_and_geometry(self) -> None:
+        response = place_response()
+        response["total_results"] = 1
 
-        self.assertIn("characters omitted", logged_response)
-        self.assertLess(len(logged_response), PLACE_SEARCH_LOG_RESPONSE_LIMIT + 100)
+        logged_response = place_search_response_for_log(response)
+
+        self.assertIn('"total_results":1', logged_response)
+        self.assertIn('"usable_places":1', logged_response)
+        self.assertIn('"records_with_bounds":1', logged_response)
+        self.assertNotIn("Yosemite", logged_response)
+        self.assertNotIn("-119.9", logged_response)
+        self.assertLess(len(logged_response), 300)
 
 
 class PlaceSearchWorkerTests(unittest.TestCase):
@@ -144,7 +150,7 @@ class PlaceSearchWorkerTests(unittest.TestCase):
         self.assertEqual(emitted_results[0][0]["id"], 68542)
         request_session.close.assert_called_once_with()
 
-    def test_worker_resolves_qualifier_and_logs_all_responses(self) -> None:
+    def test_worker_resolves_qualifier_and_logs_safe_summaries(self) -> None:
         request_session = MagicMock()
         emitted_results = []
         exact_response = {"total_results": 0, "results": []}
@@ -206,11 +212,13 @@ class PlaceSearchWorkerTests(unittest.TestCase):
             ],
         )
         log_output = "\n".join(captured_logs.output)
-        self.assertIn("Oxapampa, Peru", log_output)
+        self.assertEqual(log_output.count("Place search completed:"), 3)
         self.assertIn('"total_results":0', log_output)
-        self.assertIn("resolving qualifier='Peru'", log_output)
-        self.assertIn('"display_name":"Oxapampa, PA, PE"', log_output)
-        self.assertIn("kept 1 of 2 name matches", log_output)
+        self.assertIn("Place search fallback:", log_output)
+        self.assertIn("kept 1 of 2 fallback matches", log_output)
+        self.assertNotIn("Oxapampa", log_output)
+        self.assertNotIn("Peru", log_output)
+        self.assertNotIn("Somewhere Else", log_output)
         self.assertEqual(emitted_results[0][0]["display_name"], "Oxapampa, PA, PE")
 
     def test_worker_reports_search_failures(self) -> None:
@@ -232,6 +240,36 @@ class PlaceSearchWorkerTests(unittest.TestCase):
                 worker.run()
 
         self.assertEqual(errors, ["offline"])
+
+    def test_worker_logs_safe_http_exception_chain_diagnostics(self) -> None:
+        response = Response()
+        response.status_code = 503
+        response.url = "https://api.inaturalist.org/v1/search?q=PrivatePlace"
+        http_error = HTTPError("request for PrivatePlace failed", response=response)
+        try:
+            raise RuntimeError("wrapper mentions PrivatePlace") from http_error
+        except RuntimeError as error:
+            chained_error = error
+
+        worker = PlaceSearchWorker("PrivatePlace")
+        with (
+            patch(
+                "visualizer.pyinaturalist.ClientSession",
+                return_value=MagicMock(),
+            ),
+            patch(
+                "visualizer.pyinaturalist.search",
+                side_effect=chained_error,
+            ),
+            self.assertLogs(level=logging.ERROR) as captured_logs,
+        ):
+            worker.run()
+
+        output = "\n".join(captured_logs.output)
+        self.assertIn("error_chain=RuntimeError -> HTTPError", output)
+        self.assertIn("http_status=503", output)
+        self.assertIn("response_host=api.inaturalist.org", output)
+        self.assertNotIn("PrivatePlace", output)
 
 
 if __name__ == "__main__":

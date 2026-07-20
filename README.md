@@ -25,7 +25,7 @@ It also includes an **interactive map dialog** (OpenStreetMap tiles) to set coor
 - **Interactive map picker** for latitude/longitude + radius:
   - OpenStreetMap tile fetching
   - **RAM LRU cache** and **disk cache** with pruning
-  - Pan/zoom controls
+  - Place search, familiar click/drag navigation, and a draggable radius handle
 - **Progress widget** for long operations:
   - Download progress for required Parquet files
   - API pagination and rate limiting feedback
@@ -219,9 +219,9 @@ Flags:
 - `--radius` Radius in km (default comes from saved settings)
 - `--scale-factor` Manual UI scale multiplier (useful for 4K/HiDPI)
 - `--http-cache-max-mb` API response cache budget in MB (default: `128`)
-- `--debug` Enable debug logging + extra console prints, including place-search
-  request parameters, qualifier resolution, fallback queries, and bounded API
-  responses
+- `--debug` Enable timestamped debug logging, including privacy-safe place-search
+  summaries, qualifier/fallback decisions, map lifecycle events, and aggregate
+  tile cache/network statistics
 
 The cache budget can also be set with the
 `INAT_VISUALIZER_HTTP_CACHE_MAX_MB` environment variable. The command-line
@@ -239,10 +239,13 @@ Logs go to:
 
 1. **Set location**
    - Type latitude/longitude (or paste `"lat, lon"` into the latitude field)
-   - Or click **🗺️ Map** to pick a point and radius interactively.
+   - Or click **Choose on map…** to pick a point and radius interactively.
    - In the map dialog, enter a country, city, park, or other iNaturalist place
      and press **Enter** or **Search** to jump there. Select a result to fit the
      map to that place; the current radius remains unchanged.
+   - Drag the map to pan, click to place the center, scroll to zoom, or drag the
+     white circle handle to resize the radius. Exact values remain editable in
+     the **Selected area** panel.
    - Qualified searches such as `City, Country` first try the complete phrase,
      then use the qualifier to narrow matches when a fallback is needed.
 
@@ -366,6 +369,9 @@ directory:
 
 The application log rotates at 2 MiB and retains at most two backups, preventing
 debug sessions or long-running installations from growing it without bound.
+Home-directory paths are abbreviated with `~`; place-search text, result names,
+geometry, and precise map coordinates are omitted from logs so diagnostics are
+safer to share.
 
 ---
 
