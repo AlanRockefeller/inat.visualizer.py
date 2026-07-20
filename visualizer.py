@@ -4110,14 +4110,18 @@ class INatSeasonalVisualizer(QMainWindow):
         self.bg_color_input = QLineEdit(self.settings.value("graph_bg_color", ""))
         self.bg_color_input.setPlaceholderText("Theme Default")
 
-        self.map_button = QPushButton("Choose on map…")
+        self.map_button = QPushButton("Choose Location on Map…")
+        self.map_button.setObjectName("mapPickerButton")
+        self.map_button.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
         self.map_button.clicked.connect(self.open_map_dialog)
         self.map_button.setToolTip("Choose the graph center and radius on a map")
 
         self.sidebar_layout.addRow("Latitude:", self.lat_input)
         self.sidebar_layout.addRow("Longitude:", self.lon_input)
         self.sidebar_layout.addRow("Radius (km):", self.radius_input)
-        self.sidebar_layout.addRow(self.map_button)
+        self.sidebar_layout.addRow("", self.map_button)
         self.sidebar_layout.addRow("Organism:", self.organism_input)
         self.sidebar_layout.addRow("Exclude:", self.exclude_input)
         self.sidebar_layout.addRow("Date From:", self.date_from)
@@ -4407,6 +4411,24 @@ class INatSeasonalVisualizer(QMainWindow):
         )
         window_text_color = self.get_contrasting_text_color(window_bg_color)
         graph_text_color = self.get_contrasting_text_color(graph_bg_color)
+        map_picker_button_stylesheet = """
+            QPushButton#mapPickerButton {
+                background-color: #2f80ed;
+                color: #ffffff;
+                border: 2px solid #75b5ff;
+                border-radius: 6px;
+                padding: 7px 14px;
+                font-weight: 700;
+            }
+            QPushButton#mapPickerButton:hover {
+                background-color: #3d8cf3;
+                border-color: #a8d1ff;
+            }
+            QPushButton#mapPickerButton:pressed {
+                background-color: #1f64bd;
+                border-color: #75b5ff;
+            }
+        """
 
         if mode == "dark":
             # UI dark mode
@@ -4417,6 +4439,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.central_widget.setStyleSheet(
                 "QLineEdit, QComboBox, QPushButton, QListWidget, QProgressBar, "
                 "QLabel { background-color: #3e3e3e; color: #ffffff; }"
+                + map_picker_button_stylesheet
             )
         else:
             # UI light mode
@@ -4427,6 +4450,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.central_widget.setStyleSheet(
                 "QLineEdit, QComboBox, QPushButton, QListWidget, QProgressBar, "
                 "QLabel { background-color: #ffffff; color: #000000; }"
+                + map_picker_button_stylesheet
             )
 
         if (

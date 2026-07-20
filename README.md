@@ -1,8 +1,8 @@
 # iNaturalist Seasonal Visualizer
 
-# By Alan Rockefeller - July 18, 2026
+# By Alan Rockefeller - July 20, 2026
 
-Current source version: **1.0.7**. See [CHANGELOG.md](CHANGELOG.md) for release
+Current source version: **1.0.8**. See [CHANGELOG.md](CHANGELOG.md) for release
 details.
 
 A desktop GUI app for exploring **seasonal patterns in iNaturalist observations** within a geographic radius. Search by organism (anything from a genus/species to higher taxa like _Agaricales_), choose a date range, and plot observation frequency by **day**, **week**, or **month** of the year.
@@ -239,7 +239,8 @@ Logs go to:
 
 1. **Set location**
    - Type latitude/longitude (or paste `"lat, lon"` into the latitude field)
-   - Or click **Choose on map…** to pick a point and radius interactively.
+   - Or click **Choose Location on Map…** to pick a point and radius
+     interactively.
    - In the map dialog, enter a country, city, park, or other iNaturalist place
      and press **Enter** or **Search** to jump there. Select a result to fit the
      map to that place; the current radius remains unchanged.

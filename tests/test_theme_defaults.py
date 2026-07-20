@@ -90,6 +90,17 @@ class ThemeDefaultTests(unittest.TestCase):
 
         self.assertEqual(annotation.get_color(), "black")
 
+    def test_map_picker_button_has_distinct_accent_style(self) -> None:
+        harness = theme_harness(FakeSettings())
+
+        INatSeasonalVisualizer.apply_stylesheet(harness)
+
+        stylesheet = harness.central_widget.setStyleSheet.call_args.args[0]
+        self.assertIn("QPushButton#mapPickerButton", stylesheet)
+        self.assertIn("background-color: #2f80ed", stylesheet)
+        self.assertIn("border-radius: 6px", stylesheet)
+        self.assertIn("font-weight: 700", stylesheet)
+
 
 if __name__ == "__main__":
     unittest.main()
