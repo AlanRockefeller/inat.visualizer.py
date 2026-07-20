@@ -4113,7 +4113,7 @@ class INatSeasonalVisualizer(QMainWindow):
         self.map_button = QPushButton("Choose Location on Map…")
         self.map_button.setObjectName("mapPickerButton")
         self.map_button.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
         self.map_button.clicked.connect(self.open_map_dialog)
         self.map_button.setToolTip("Choose the graph center and radius on a map")
@@ -4411,26 +4411,26 @@ class INatSeasonalVisualizer(QMainWindow):
         )
         window_text_color = self.get_contrasting_text_color(window_bg_color)
         graph_text_color = self.get_contrasting_text_color(graph_bg_color)
-        map_picker_button_stylesheet = """
-            QPushButton#mapPickerButton {
-                background-color: #2f80ed;
-                color: #ffffff;
-                border: 2px solid #75b5ff;
-                border-radius: 6px;
-                padding: 7px 14px;
-                font-weight: 700;
-            }
-            QPushButton#mapPickerButton:hover {
-                background-color: #3d8cf3;
-                border-color: #a8d1ff;
-            }
-            QPushButton#mapPickerButton:pressed {
-                background-color: #1f64bd;
-                border-color: #75b5ff;
-            }
-        """
 
         if mode == "dark":
+            map_picker_button_stylesheet = """
+                QPushButton#mapPickerButton {
+                    background-color: #50555b;
+                    color: #ffffff;
+                    border: 2px solid #858d96;
+                    border-radius: 6px;
+                    padding: 7px 14px;
+                    font-weight: 700;
+                }
+                QPushButton#mapPickerButton:hover {
+                    background-color: #5d636a;
+                    border-color: #a0a7af;
+                }
+                QPushButton#mapPickerButton:pressed {
+                    background-color: #454a50;
+                    border-color: #737b84;
+                }
+            """
             # UI dark mode
             self.setStyleSheet(
                 font_stylesheet
@@ -4442,6 +4442,24 @@ class INatSeasonalVisualizer(QMainWindow):
                 + map_picker_button_stylesheet
             )
         else:
+            map_picker_button_stylesheet = """
+                QPushButton#mapPickerButton {
+                    background-color: #e2e5e9;
+                    color: #202428;
+                    border: 2px solid #8a939d;
+                    border-radius: 6px;
+                    padding: 7px 14px;
+                    font-weight: 700;
+                }
+                QPushButton#mapPickerButton:hover {
+                    background-color: #d5d9de;
+                    border-color: #6f7882;
+                }
+                QPushButton#mapPickerButton:pressed {
+                    background-color: #c7ccd2;
+                    border-color: #626b75;
+                }
+            """
             # UI light mode
             self.setStyleSheet(
                 font_stylesheet

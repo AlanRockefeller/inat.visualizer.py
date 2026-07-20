@@ -90,16 +90,21 @@ class ThemeDefaultTests(unittest.TestCase):
 
         self.assertEqual(annotation.get_color(), "black")
 
-    def test_map_picker_button_has_distinct_accent_style(self) -> None:
-        harness = theme_harness(FakeSettings())
+    def test_map_picker_button_has_distinct_neutral_style_in_each_theme(self) -> None:
+        dark_harness = theme_harness(FakeSettings())
+        light_harness = theme_harness(FakeSettings({"theme": "light"}))
 
-        INatSeasonalVisualizer.apply_stylesheet(harness)
+        INatSeasonalVisualizer.apply_stylesheet(dark_harness)
+        INatSeasonalVisualizer.apply_stylesheet(light_harness)
 
-        stylesheet = harness.central_widget.setStyleSheet.call_args.args[0]
-        self.assertIn("QPushButton#mapPickerButton", stylesheet)
-        self.assertIn("background-color: #2f80ed", stylesheet)
-        self.assertIn("border-radius: 6px", stylesheet)
-        self.assertIn("font-weight: 700", stylesheet)
+        dark_stylesheet = dark_harness.central_widget.setStyleSheet.call_args.args[0]
+        light_stylesheet = light_harness.central_widget.setStyleSheet.call_args.args[0]
+        self.assertIn("QPushButton#mapPickerButton", dark_stylesheet)
+        self.assertIn("background-color: #50555b", dark_stylesheet)
+        self.assertIn("background-color: #e2e5e9", light_stylesheet)
+        self.assertIn("border-radius: 6px", dark_stylesheet)
+        self.assertIn("font-weight: 700", dark_stylesheet)
+        self.assertNotIn("#2f80ed", dark_stylesheet + light_stylesheet)
 
 
 if __name__ == "__main__":
