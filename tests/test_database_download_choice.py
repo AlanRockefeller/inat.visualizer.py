@@ -449,6 +449,7 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
             search_button=MagicMock(),
             cancel_search_button=MagicMock(),
             show_url_button=MagicMock(),
+            mode_combo=MagicMock(),
             _on_api_search_progress=MagicMock(),
             _on_api_call_completed=MagicMock(),
             _on_api_taxon_resolved=MagicMock(),
@@ -495,6 +496,7 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
             search_button=MagicMock(),
             cancel_search_button=MagicMock(),
             show_url_button=MagicMock(),
+            mode_combo=MagicMock(),
             api_search_worker=object(),
         )
 
@@ -515,6 +517,7 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
         window = SimpleNamespace(
             api_search_worker=api_worker,
             local_search_worker=None,
+            abundance_worker=None,
             cancel_search_button=MagicMock(),
             status_bar=MagicMock(),
             enhanced_progress=MagicMock(),
@@ -534,6 +537,7 @@ class DatabaseDownloadChoiceTests(unittest.TestCase):
         window = SimpleNamespace(
             api_search_worker=None,
             local_search_worker=local_worker,
+            abundance_worker=None,
             cancel_search_button=MagicMock(),
             status_bar=MagicMock(),
             enhanced_progress=MagicMock(),

@@ -2,6 +2,32 @@
 
 All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
+## [1.0.9] - 2026-09-28
+
+### Added
+
+- **Abundance map mode:** pick an organism and a time of year (the season can
+  wrap across the new year) to see where in the world it is observed most. It
+  shows a heatmap on an OpenStreetMap base map and a ranked top-25 list with
+  place names. Ranking is by raw count or by share of all observations in the
+  area, which corrects for observer effort. **Graph seasonality here** jumps
+  from a hotspot to its seasonal graph. Requires the local database.
+  A **Hide map** button shows just the observation cells on a black
+  background, and a season picker offers presets (months, seasons, around
+  today) plus plain month/day menus.
+
+### Fixed
+
+- Local searches for higher taxa with many descendants (such as Agaricales,
+  about 30,000 taxon IDs) are now roughly 100× faster. Taxon filters are loaded
+  into a DuckDB temporary table instead of a huge literal `IN (...)` list.
+- Map tiles now line up with the search circle and heatmap at continental and
+  world zoom levels. Web-Mercator tiles are resampled to the map's
+  latitude/longitude axes.
+- Recognize OpenStreetMap's "Access blocked" placeholder tile, which is served
+  with a success status. It is no longer cached or shown as map content, and
+  previously cached copies are removed.
+
 ## [1.0.8] - 2026-07-20
 
 ### Changed
