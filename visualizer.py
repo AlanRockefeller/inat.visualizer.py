@@ -48,8 +48,11 @@ import pyinaturalist
 import requests
 from matplotlib.backend_bases import MouseEvent
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.colors import LogNorm, Normalize
+from matplotlib.patches import Rectangle
 from PIL import Image, UnidentifiedImageError
 from PyQt6.QtCore import (
+    QDate,
     QMutex,
     QMutexLocker,
     QSettings,
@@ -69,6 +72,7 @@ from PyQt6.QtGui import (
     QShowEvent,
 )
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QColorDialog,
     QComboBox,
@@ -78,18 +82,25 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QSplashScreen,
+    QStackedWidget,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -144,6 +155,10 @@ PLACEHOLDER_DETAILS_FONT_SCALE = 0.5
 PLACEHOLDER_DETAILS_MIN_FONT_SIZE = 6.0
 LOCAL_GRAPH_ACTION_TEXT = "Graph with local data"
 LIVE_GRAPH_ACTION_TEXT = "Graph with live iNat data"
+ABUNDANCE_ACTION_TEXT = "Map abundance (local data)"
+SEASONAL_MODE_TEXT = "Seasonal graph"
+ABUNDANCE_MODE_TEXT = "Abundance map"
+ABUNDANCE_SEASON_YEAR = 2024
 SPLASH_WINDOW_FLAGS = Qt.WindowType.SplashScreen | Qt.WindowType.FramelessWindowHint
 DATABASE_FILE_INFO: dict[str, dict[str, Any]] = {
     "observations.parquet": {
@@ -1202,6 +1217,41 @@ def fetch_all_observation_pages(
             return all_results, error_msg
 
 
+# OpenStreetMap sometimes answers a blocked client with this "403 Access
+# blocked" placeholder image but an HTTP 200 status. It must never be cached
+# or drawn as map content.
+OSM_BLOCKED_TILE_MD5 = frozenset({"c069a15b2cc2d6b6f527ad09eb93c61a"})
+
+
+def is_blocked_tile_image(image_bytes: bytes) -> bool:
+    return hashlib.md5(image_bytes).hexdigest() in OSM_BLOCKED_TILE_MD5
+
+
+def mercator_rows_to_equirectangular(
+    composite: "Image.Image", y_min_tile: int, zoom: int, south: float, north: float
+) -> "Image.Image":
+    """Resample a Web-Mercator tile mosaic so rows are evenly spaced in latitude.
+
+    The maps plot longitude/latitude axes, so drawing Mercator tiles straight
+    into a latitude extent misplaces features by hundreds of kilometres once a
+    view spans a continent. Remapping rows keeps tiles aligned with overlays
+    such as the search circle and the abundance heatmap.
+    """
+    pixels = np.asarray(composite)
+    height = pixels.shape[0]
+    if height == 0:
+        return composite
+    row_lats = north - (np.arange(height) + 0.5) * (north - south) / height
+    row_lats = np.clip(row_lats, -WEB_MERCATOR_MAX_LATITUDE, WEB_MERCATOR_MAX_LATITUDE)
+    tile_y = (
+        (1.0 - np.arcsinh(np.tan(np.radians(row_lats))) / np.pi) / 2.0 * 2.0**zoom
+    )
+    source_rows = np.clip(
+        ((tile_y - y_min_tile) * 256.0).astype(int), 0, height - 1
+    )
+    return Image.fromarray(pixels[source_rows])
+
+
 class DiskTileCache:
     """Persistent disk cache for map tiles with size limit and LRU pruning."""
 
@@ -1219,9 +1269,13 @@ class DiskTileCache:
         path = self.get_path(z, x, y)
         if path.exists():
             try:
+                image_bytes = path.read_bytes()
+                if is_blocked_tile_image(image_bytes):
+                    path.unlink(missing_ok=True)
+                    return None
                 # Update mtime for LRU
                 path.touch()
-                with Image.open(path) as img:
+                with Image.open(BytesIO(image_bytes)) as img:
                     return img.convert("RGB").copy()
             except Exception as e:
                 logging.warning(
@@ -1659,7 +1713,10 @@ class TileLoaderWorker(QThread):
 
                     try:
                         resp = session.get(url, timeout=3.0)
-                        if resp.status_code == 200:
+                        status_code = resp.status_code
+                        if status_code == 200 and is_blocked_tile_image(resp.content):
+                            status_code = 403
+                        if status_code == 200:
                             network_fetches += 1
                             img_bytes = resp.content
                             try:
@@ -1687,7 +1744,7 @@ class TileLoaderWorker(QThread):
                                 self._skipped_tiles.discard(tile_key)
                         else:
                             failed_tiles += 1
-                            if resp.status_code in (
+                            if status_code in (
                                 403,
                                 429,
                                 418,
@@ -1699,12 +1756,12 @@ class TileLoaderWorker(QThread):
                             ):
                                 if not self._notified_error:
                                     self._notified_error = True
-                                    if resp.status_code in (403, 429, 418):
-                                        msg = f"Map service throttled requests (HTTP {resp.status_code})."
-                                    elif resp.status_code == 408:
+                                    if status_code in (403, 429, 418):
+                                        msg = f"Map service throttled requests (HTTP {status_code})."
+                                    elif status_code == 408:
                                         msg = "Map service request timed out."
                                     else:
-                                        msg = f"Map service error (HTTP {resp.status_code})."
+                                        msg = f"Map service error (HTTP {status_code})."
                                     self.network_error.emit(f"{msg} Backing off.")
                                 self._network_suspended_until = time.time() + 15.0
                                 with QMutexLocker(self.mutex):
@@ -1748,6 +1805,9 @@ class TileLoaderWorker(QThread):
         south, east = num2deg(x_max + 1, y_max + 1, zoom)
 
         if tiles:
+            composite = mercator_rows_to_equirectangular(
+                composite, y_min, zoom, south, north
+            )
             self.view_ready.emit(job_id, composite, (west, east, south, north))
         if skipped_any:
             self.tiles_skipped.emit()
@@ -1811,7 +1871,10 @@ class TileLoaderWorker(QThread):
             try:
                 attempted_count += 1
                 resp = session.get(url, timeout=3.0)
-                if resp.status_code == 200:
+                status_code = resp.status_code
+                if status_code == 200 and is_blocked_tile_image(resp.content):
+                    status_code = 403
+                if status_code == 200:
                     img_bytes = resp.content
                     try:
                         img = Image.open(BytesIO(img_bytes)).convert("RGB")
@@ -1835,15 +1898,15 @@ class TileLoaderWorker(QThread):
                 else:
                     failed_count += 1
                     status = "failed"
-                    if resp.status_code in (403, 429, 418, 408, 500, 502, 503, 504):
+                    if status_code in (403, 429, 418, 408, 500, 502, 503, 504):
                         if not self._notified_error:
                             self._notified_error = True
-                            if resp.status_code in (403, 429, 418):
-                                msg = f"Map service throttled requests (HTTP {resp.status_code})."
-                            elif resp.status_code == 408:
+                            if status_code in (403, 429, 418):
+                                msg = f"Map service throttled requests (HTTP {status_code})."
+                            elif status_code == 408:
                                 msg = "Map service request timed out."
                             else:
-                                msg = f"Map service error (HTTP {resp.status_code})."
+                                msg = f"Map service error (HTTP {status_code})."
                             self.network_error.emit(f"{msg} Backing off.")
                         self._network_suspended_until = time.time() + 15.0
                     break
@@ -2163,6 +2226,60 @@ class LocalSearchWorker(QThread):
                 self.search_failed.emit(str(e))
 
 
+REQUIRED_OBSERVATION_COLUMNS = (
+    "eventdate",
+    "decimallatitude",
+    "decimallongitude",
+    "taxonid",
+)
+
+
+def check_observation_columns(con, escaped_path: str) -> None:
+    """Raise ValueError if observations.parquet lacks a column the queries use."""
+    schema = con.execute(f"DESCRIBE SELECT * FROM '{escaped_path}'").fetchall()
+    column_names = [row[0].lower() for row in schema]
+    missing_columns = [
+        col for col in REQUIRED_OBSERVATION_COLUMNS if col not in column_names
+    ]
+    if missing_columns:
+        raise ValueError(
+            "Missing required columns in observations.parquet: "
+            + ", ".join(missing_columns)
+            + ". The file must include eventDate, decimalLatitude, "
+            "decimalLongitude, and taxonID."
+        )
+
+
+def register_taxon_filter(con, table_name: str, taxon_ids: list[int]) -> str:
+    """Load taxon IDs into a temp table and return an ``IN (SELECT ...)`` operand.
+
+    Higher taxa such as Agaricales expand to tens of thousands of descendant
+    IDs. DuckDB evaluates a literal ``IN (1, 2, ...)`` list of that size very
+    slowly (minutes over the full database), while a temp-table subquery is
+    planned as a hash semi-join and stays under a second.
+    """
+    con.execute(
+        f"CREATE OR REPLACE TEMP TABLE {table_name} AS "
+        "SELECT DISTINCT unnest(?::BIGINT[]) AS id",
+        [[int(taxon_id) for taxon_id in taxon_ids]],
+    )
+    return f"(SELECT id FROM {table_name})"
+
+
+def taxon_filter_sql(
+    con, taxon_ids: list[int], exclude_taxon_ids: list[int]
+) -> str:
+    """Return SQL predicates (each starting with AND) for include/exclude taxa."""
+    filter_sql = ""
+    if taxon_ids:
+        include = register_taxon_filter(con, "include_taxa", taxon_ids)
+        filter_sql += f" AND taxonID IN {include}"
+    if exclude_taxon_ids:
+        exclude = register_taxon_filter(con, "exclude_taxa", exclude_taxon_ids)
+        filter_sql += f" AND taxonID NOT IN {exclude}"
+    return filter_sql
+
+
 def run_local_observation_query(
     parquet_path: str,
     date_from: str,
@@ -2190,40 +2307,15 @@ def run_local_observation_query(
         raise_if_search_cancelled(cancel_callback)
         if progress_callback:
             progress_callback("Checking observations.parquet schema...")
-        schema = con.execute(f"DESCRIBE SELECT * FROM '{escaped_path}'").fetchall()
+        check_observation_columns(con, escaped_path)
         raise_if_search_cancelled(cancel_callback)
-        column_names = [row[0].lower() for row in schema]
-        required_columns = [
-            "eventdate",
-            "decimallatitude",
-            "decimallongitude",
-            "taxonid",
-        ]
-        missing_columns = [col for col in required_columns if col not in column_names]
-        if missing_columns:
-            raise ValueError(
-                "Missing required columns in observations.parquet: "
-                + ", ".join(missing_columns)
-                + ". The file must include eventDate, decimalLatitude, "
-                "decimalLongitude, and taxonID."
-            )
 
         base_where = """
             WHERE eventDate BETWEEN ? AND ?
             AND decimalLatitude BETWEEN ? AND ?
             AND decimalLongitude BETWEEN ? AND ?
         """
-        filter_sql = ""
-        if taxon_ids:
-            filter_sql += (
-                " AND taxonID IN (" + ",".join(str(id) for id in taxon_ids) + ")"
-            )
-        if exclude_taxon_ids:
-            filter_sql += (
-                " AND taxonID NOT IN ("
-                + ",".join(str(id) for id in exclude_taxon_ids)
-                + ")"
-            )
+        filter_sql = taxon_filter_sql(con, taxon_ids, exclude_taxon_ids)
 
         bbox_params = [date_from, date_to, lat_min, lat_max, lon_min, lon_max]
         if progress_callback:
@@ -2279,6 +2371,194 @@ def run_local_observation_query(
             connection_callback(None)
         if con is not None:
             con.close()
+
+
+def season_filter_sql(
+    season_start: tuple[int, int], season_end: tuple[int, int]
+) -> tuple[str, list[int]]:
+    """Return a month-day predicate and params; ranges past Dec 31 wrap to Jan."""
+    start = season_start[0] * 100 + season_start[1]
+    end = season_end[0] * 100 + season_end[1]
+    month_day = "(month(CAST(eventDate AS DATE)) * 100 + day(CAST(eventDate AS DATE)))"
+    if start <= end:
+        return f"{month_day} BETWEEN ? AND ?", [start, end]
+    return f"({month_day} >= ? OR {month_day} <= ?)", [start, end]
+
+
+def run_local_abundance_query(
+    parquet_path: str,
+    date_from: str,
+    date_to: str,
+    season_start: tuple[int, int],
+    season_end: tuple[int, int],
+    cell_deg: float,
+    taxon_ids: list[int],
+    exclude_taxon_ids: list[int] | None = None,
+    progress_callback=None,
+    cancel_callback=None,
+    connection_callback=None,
+) -> list[dict[str, Any]]:
+    """Count a taxon's observations per grid cell worldwide for a season.
+
+    Each returned cell also carries the total number of observations of any
+    organism in that cell and season, so callers can rank by raw count or by
+    share of all observations (which corrects for how many observers live in
+    an area) without re-running the query.
+    """
+    if not taxon_ids:
+        raise ValueError("An organism is required to map where it is most abundant.")
+    if cell_deg <= 0:
+        raise ValueError("Grid cell size must be positive.")
+    exclude_taxon_ids = exclude_taxon_ids or []
+    escaped_path = parquet_path.replace("'", "''")
+    con = None
+    try:
+        raise_if_search_cancelled(cancel_callback)
+        con = duckdb.connect()
+        if connection_callback:
+            connection_callback(con)
+        if progress_callback:
+            progress_callback("Checking observations.parquet schema...")
+        check_observation_columns(con, escaped_path)
+        raise_if_search_cancelled(cancel_callback)
+
+        include = register_taxon_filter(con, "include_taxa", taxon_ids)
+        target_sql = f"taxonID IN {include}"
+        if exclude_taxon_ids:
+            exclude = register_taxon_filter(con, "exclude_taxa", exclude_taxon_ids)
+            target_sql += f" AND taxonID NOT IN {exclude}"
+        season_sql, season_params = season_filter_sql(season_start, season_end)
+        raise_if_search_cancelled(cancel_callback)
+
+        if progress_callback:
+            progress_callback("Scanning all observations for the selected season...")
+        query = f"""
+            SELECT
+                CAST(floor(CAST(decimalLatitude AS DOUBLE) / ?) AS BIGINT) AS lat_index,
+                CAST(floor(CAST(decimalLongitude AS DOUBLE) / ?) AS BIGINT) AS lon_index,
+                count(*) FILTER (WHERE {target_sql}) AS target_count,
+                count(*) AS total_count,
+                avg(CAST(decimalLatitude AS DOUBLE)) FILTER (WHERE {target_sql})
+                    AS centroid_lat,
+                avg(CAST(decimalLongitude AS DOUBLE)) FILTER (WHERE {target_sql})
+                    AS centroid_lon
+            FROM '{escaped_path}'
+            WHERE CAST(eventDate AS DATE) BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+            AND {season_sql}
+            GROUP BY lat_index, lon_index
+            HAVING target_count > 0
+        """
+        params = [cell_deg, cell_deg, date_from, date_to, *season_params]
+        rows = con.execute(query, params).fetchall()
+        raise_if_search_cancelled(cancel_callback)
+
+        if progress_callback:
+            progress_callback("Processing results...")
+        cells = []
+        for (
+            lat_index,
+            lon_index,
+            target_count,
+            total_count,
+            centroid_lat,
+            centroid_lon,
+        ) in rows:
+            cells.append(
+                {
+                    "cell_lat": lat_index * cell_deg,
+                    "cell_lon": lon_index * cell_deg,
+                    "cell_deg": cell_deg,
+                    "count": int(target_count),
+                    "total": int(total_count),
+                    "share": target_count / total_count if total_count else 0.0,
+                    "centroid_lat": float(centroid_lat),
+                    "centroid_lon": float(centroid_lon),
+                }
+            )
+        cells.sort(key=lambda cell: cell["count"], reverse=True)
+        return cells
+    finally:
+        if connection_callback:
+            connection_callback(None)
+        if con is not None:
+            con.close()
+
+
+class LocalAbundanceWorker(QThread):
+    """Background worker for worldwide seasonal abundance queries."""
+
+    progress = pyqtSignal(str)
+    search_finished = pyqtSignal(object)
+    search_failed = pyqtSignal(str)
+    search_cancelled = pyqtSignal()
+
+    def __init__(
+        self,
+        parquet_path: str,
+        date_from: str,
+        date_to: str,
+        season_start: tuple[int, int],
+        season_end: tuple[int, int],
+        cell_deg: float,
+        taxon_ids: list[int],
+        exclude_taxon_ids: list[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.parquet_path = parquet_path
+        self.date_from = date_from
+        self.date_to = date_to
+        self.season_start = season_start
+        self.season_end = season_end
+        self.cell_deg = cell_deg
+        self.taxon_ids = taxon_ids
+        self.exclude_taxon_ids = exclude_taxon_ids or []
+        self._cancel_requested = False
+        self._connection = None
+        self._connection_mutex = QMutex()
+
+    def _set_connection(self, connection) -> None:
+        with QMutexLocker(self._connection_mutex):
+            self._connection = connection
+
+    def cancel(self) -> None:
+        """Cancel the query and interrupt an active DuckDB scan."""
+        self._cancel_requested = True
+        self.requestInterruption()
+        with QMutexLocker(self._connection_mutex):
+            if self._connection is not None:
+                try:
+                    self._connection.interrupt()
+                except Exception as e:
+                    logging.debug("Could not interrupt DuckDB query: %s", e)
+
+    def is_cancelled(self) -> bool:
+        return self._cancel_requested or self.isInterruptionRequested()
+
+    def run(self) -> None:
+        try:
+            cells = run_local_abundance_query(
+                self.parquet_path,
+                self.date_from,
+                self.date_to,
+                self.season_start,
+                self.season_end,
+                self.cell_deg,
+                self.taxon_ids,
+                self.exclude_taxon_ids,
+                progress_callback=self.progress.emit,
+                cancel_callback=self.is_cancelled,
+                connection_callback=self._set_connection,
+            )
+            raise_if_search_cancelled(self.is_cancelled)
+            self.search_finished.emit(cells)
+        except SearchCancelled:
+            self.search_cancelled.emit()
+        except Exception as e:
+            if self.is_cancelled():
+                self.search_cancelled.emit()
+            else:
+                logging.error("Abundance search worker failed: %s", e)
+                self.search_failed.emit(str(e))
 
 
 class DatabaseProgressTracker:
@@ -2420,7 +2700,359 @@ class PlaceSearchLineEdit(QLineEdit):
         super().keyPressEvent(event)
 
 
-class MapDialog(QDialog):
+class TileMapInteractionMixin:
+    """OpenStreetMap tiles plus pan/zoom handling for a lon/lat Matplotlib axes.
+
+    Hosts provide ``figure``, ``ax``, ``canvas`` and ``status_label``, call
+    ``_init_tile_map_state`` before building widgets and ``_start_tile_map``
+    once they exist, and override the hook methods for custom clicks/drags.
+    """
+
+    _map_network_hint = "you can still adjust the selected area."
+
+    def _init_tile_map_state(self) -> None:
+        self.job_counter = 0
+        self.current_job_id = 0
+        self._network_error_message: str | None = None
+        self._drag_mode: str | None = None
+        self._press_pixel: tuple[float, float] | None = None
+        self._last_pan_pos: tuple[float, float] | None = None
+        self._pan_start_limits: (
+            tuple[tuple[float, float], tuple[float, float]] | None
+        ) = None
+
+    def _set_map_status_styles(self, dark: bool) -> None:
+        secondary = "#c8c8c8" if dark else "#52606d"
+        warning_bg = "#4a3c20" if dark else "#fff4d6"
+        warning_text = "#ffe29a" if dark else "#6b4e00"
+        self._map_status_normal_style = f"color: {secondary}; padding: 4px 6px;"
+        self._map_status_warning_style = (
+            f"background: {warning_bg}; color: {warning_text}; padding: 6px 8px; "
+            "border-radius: 4px; font-weight: 600;"
+        )
+
+    def _init_map_axes(self, dark: bool) -> None:
+        map_background = "#252a30" if dark else "#e7ebef"
+        self.figure.set_facecolor(map_background)
+        self.ax.set_facecolor(map_background)
+        self.ax.set_axis_off()
+        if getattr(self, "_map_attribution", None) is not None:
+            return
+        self._map_attribution = self.ax.text(
+            0.99,
+            0.015,
+            "© OpenStreetMap contributors",
+            verticalalignment="bottom",
+            horizontalalignment="right",
+            transform=self.ax.transAxes,
+            color="#333333",
+            fontsize=8,
+            bbox=dict(
+                facecolor="white",
+                alpha=0.88,
+                edgecolor="#b8b8b8",
+                boxstyle="round,pad=0.25",
+            ),
+            zorder=20,
+        )
+
+    def _start_tile_map(self, working_dir: str | Path) -> None:
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.setInterval(200)
+        self.update_timer.timeout.connect(self.request_tiles_for_current_view)
+
+        self.retry_timer = QTimer(self)
+        self.retry_timer.setSingleShot(True)
+        self.retry_timer.timeout.connect(self.request_tiles_for_current_view)
+
+        self.canvas.mpl_connect("button_press_event", self.on_mouse_press)  # type: ignore[arg-type]
+        self.canvas.mpl_connect("button_release_event", self.on_mouse_release)  # type: ignore[arg-type]
+        self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)  # type: ignore[arg-type]
+        self.canvas.mpl_connect("scroll_event", self.on_scroll)  # type: ignore[arg-type]
+
+        self.worker = TileLoaderWorker(working_dir)
+        self.worker.view_ready.connect(self.on_view_ready)
+        self.worker.network_error.connect(self.on_network_error)
+        self.worker.network_recovered.connect(self.on_network_recovered)
+        self.worker.retry_complete.connect(self.request_tiles_for_current_view)
+        self.worker.tiles_skipped.connect(self.on_tiles_skipped)
+        self.worker.start()
+
+    def _stop_tile_worker(self) -> None:
+        if self.worker.isRunning():
+            self.worker.stop()
+
+    # Hooks for hosts
+    def update_overlays(self) -> None:
+        """Refresh artists drawn above the tiles after the view changes."""
+
+    def _on_map_click(self, lat: float, lon: float) -> None:
+        """Handle a left click that did not turn into a pan."""
+
+    def _begin_custom_drag(self, event: MouseEvent) -> str | None:
+        """Return a drag-mode name to claim a left-button press, or None to pan."""
+        return None
+
+    def _custom_drag_move(self, drag_mode: str, event: MouseEvent) -> None:
+        """Handle mouse motion for a drag claimed by ``_begin_custom_drag``."""
+
+    def _end_custom_drag(self, drag_mode: str) -> None:
+        """Handle release of a drag claimed by ``_begin_custom_drag``."""
+
+    def _set_view_limits(
+        self, west: float, east: float, south: float, north: float
+    ) -> None:
+        center_lon = (west + east) / 2.0
+        center_lat = max(
+            -WEB_MERCATOR_MAX_LATITUDE,
+            min(WEB_MERCATOR_MAX_LATITUDE, (south + north) / 2.0),
+        )
+        lon_span = max(0.01, east - west)
+        lat_span = max(0.01, north - south)
+
+        width = max(1, self.canvas.width())
+        height = max(1, self.canvas.height())
+        mercator_aspect = 1.0 / max(0.15, math.cos(math.radians(center_lat)))
+        desired_lon_lat_ratio = mercator_aspect * width / height
+        if lon_span / lat_span < desired_lon_lat_ratio:
+            lon_span = lat_span * desired_lon_lat_ratio
+        else:
+            lat_span = lon_span / desired_lon_lat_ratio
+
+        lon_span = min(360.0, lon_span)
+        lat_span = min(WEB_MERCATOR_MAX_LATITUDE * 2.0, lat_span)
+        south = center_lat - lat_span / 2.0
+        north = center_lat + lat_span / 2.0
+        south, north = clamp_latitude_limits(south, north)
+
+        self.ax.set_xlim(center_lon - lon_span / 2.0, center_lon + lon_span / 2.0)
+        self.ax.set_ylim(south, north)
+        self.ax.set_aspect(mercator_aspect, adjustable="box")
+
+    def request_tiles_for_current_view(self) -> None:
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+
+        # Calculate optimal zoom
+        try:
+            bbox = self.ax.get_window_extent().transformed(
+                self.figure.dpi_scale_trans.inverted()
+            )
+            width_px = bbox.width * self.figure.dpi
+        except Exception:
+            width_px = 800
+
+        lon_span = abs(x1 - x0)
+        if lon_span == 0 or width_px <= 0:
+            return
+
+        # Target: pixel density.
+        target_scale = 1.5
+        needed_2z = (target_scale * width_px * 360.0) / (256.0 * max(0.0001, lon_span))
+        zoom = int(math.log2(needed_2z)) if needed_2z > 0 else 0
+        zoom = max(0, min(zoom, 15))  # Changed max zoom to 15
+
+        # Check tile budget (now pushed down to Worker for uncached tile budgeting)
+        # We just send the target zoom and boundary.
+        self.job_counter += 1
+        self.current_job_id = self.job_counter
+        if self._network_error_message is None:
+            self.status_label.setText("Loading map…")
+            self.status_label.setStyleSheet(self._map_status_normal_style)
+            self.status_label.show()
+        self.worker.request_view(
+            self.current_job_id, zoom, float(x0), float(x1), float(y0), float(y1)
+        )
+
+    def on_network_error(self, message: str) -> None:
+        self._network_error_message = message
+        if "throttled" in message.lower():
+            display_message = (
+                "The map service is temporarily limiting requests. Retrying "
+                f"automatically; {self._map_network_hint}"
+            )
+        elif "timed out" in message.lower():
+            display_message = (
+                "Map tiles are taking too long to load. Retrying automatically; "
+                f"{self._map_network_hint}"
+            )
+        else:
+            display_message = (
+                "Map tiles are temporarily unavailable. Check your connection; "
+                f"{self._map_network_hint}"
+            )
+        self.status_label.setText(display_message)
+        self.status_label.setStyleSheet(self._map_status_warning_style)
+        self.status_label.show()
+
+    def on_network_recovered(self) -> None:
+        self._network_error_message = None
+        self.status_label.hide()
+        self.retry_timer.stop()
+
+    def on_tiles_skipped(self) -> None:
+        """Called when some tiles were skipped due to network suspension. Schedule a retry."""
+        # Schedule a retry after the 15-second suspension period ends.
+        # We use 16 seconds to be safe. We always restart to sync with any back-off extension.
+        self.retry_timer.start(16000)
+
+    def on_view_ready(
+        self, job_id: int, composite, extent: tuple[float, float, float, float]
+    ) -> None:
+        if job_id < self.current_job_id:
+            return
+
+        for img in list(self.ax.images):
+            img.remove()
+
+        x_limits = self.ax.get_xlim()
+        y_limits = self.ax.get_ylim()
+        self.ax.imshow(
+            np.array(composite), extent=extent, origin="upper", alpha=1.0, zorder=1
+        )
+        self.ax.set_xlim(x_limits)
+        self.ax.set_ylim(y_limits)
+        center_lat = (y_limits[0] + y_limits[1]) / 2.0
+        self.ax.set_aspect(
+            1.0 / max(0.15, math.cos(math.radians(center_lat))),
+            adjustable="box",
+        )
+
+        self.update_overlays()
+        if self._network_error_message is None:
+            self.status_label.hide()
+        self.canvas.draw_idle()
+
+    def zoom_map(self, scale: float) -> None:
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        cx = (x0 + x1) / 2
+        cy = (y0 + y1) / 2
+        self._zoom_at(cx, cy, scale, 0.5, 0.5)
+
+    def _zoom_at(
+        self, mx: float, my: float, scale: float, relx: float, rely: float
+    ) -> None:
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        new_w = min(360.0, max(0.002, (x1 - x0) * scale))
+        new_h = min(
+            WEB_MERCATOR_MAX_LATITUDE * 2.0,
+            max(0.002, (y1 - y0) * scale),
+        )
+        new_x0 = mx - relx * new_w
+        new_x1 = new_x0 + new_w
+        new_y0 = my - rely * new_h
+        new_y1 = new_y0 + new_h
+        new_y0, new_y1 = clamp_latitude_limits(new_y0, new_y1)
+        self.ax.set_xlim(new_x0, new_x1)
+        self.ax.set_ylim(new_y0, new_y1)
+        self.canvas.draw_idle()
+        self.update_timer.start()
+
+    def on_scroll(self, event: MouseEvent) -> None:
+        if event.inaxes != self.ax:
+            return
+        mx, my = event.xdata, event.ydata
+        if mx is None or my is None:
+            return
+
+        scale = 1.0 / 1.5 if event.button == "up" else 1.5
+
+        x0, x1 = self.ax.get_xlim()
+        y0, y1 = self.ax.get_ylim()
+        w, h = x1 - x0, y1 - y0
+
+        relx = (mx - x0) / w
+        rely = (my - y0) / h
+        self._zoom_at(float(mx), float(my), scale, relx, rely)
+
+
+    def on_mouse_press(self, event: MouseEvent) -> None:
+        if (
+            event.inaxes != self.ax
+            or event.xdata is None
+            or event.ydata is None
+            or event.button not in (1, 3)
+        ):
+            return
+
+        self._press_pixel = (float(event.x), float(event.y))
+        self._last_pan_pos = (float(event.xdata), float(event.ydata))
+        self._pan_start_limits = (self.ax.get_xlim(), self.ax.get_ylim())
+        custom_mode = self._begin_custom_drag(event) if event.button == 1 else None
+        if custom_mode:
+            self._drag_mode = custom_mode
+            self.canvas.setCursor(Qt.CursorShape.SizeAllCursor)
+        elif event.button == 3:
+            self._drag_mode = "pan"
+            self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
+        else:
+            self._drag_mode = "pan_candidate"
+
+    def on_mouse_release(self, event: MouseEvent) -> None:
+        drag_mode = self._drag_mode
+        self._drag_mode = None
+        self._press_pixel = None
+        self._last_pan_pos = None
+        self._pan_start_limits = None
+        self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
+
+        if drag_mode == "pan_candidate" and event.inaxes == self.ax:
+            if event.xdata is not None and event.ydata is not None:
+                self._on_map_click(float(event.ydata), float(event.xdata))
+        elif drag_mode == "pan":
+            self.update_timer.start()
+        elif drag_mode is not None:
+            self._end_custom_drag(drag_mode)
+
+    def on_mouse_move(self, event: MouseEvent) -> None:
+        if (
+            self._drag_mode is None
+            or event.inaxes != self.ax
+            or event.xdata is None
+            or event.ydata is None
+        ):
+            return
+
+        if self._drag_mode == "pan_candidate":
+            if self._press_pixel is None:
+                return
+            movement = math.hypot(
+                float(event.x) - self._press_pixel[0],
+                float(event.y) - self._press_pixel[1],
+            )
+            if movement < QApplication.startDragDistance():
+                return
+            self._drag_mode = "pan"
+            self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+        if self._drag_mode not in ("pan", "pan_candidate"):
+            self._custom_drag_move(self._drag_mode, event)
+            return
+
+        if (
+            self._drag_mode != "pan"
+            or self._press_pixel is None
+            or self._pan_start_limits is None
+        ):
+            return
+        (x0, x1), (y0, y1) = self._pan_start_limits
+        axes_box = self.ax.get_window_extent()
+        if axes_box.width <= 0 or axes_box.height <= 0:
+            return
+        dx = (float(event.x) - self._press_pixel[0]) * (x1 - x0) / axes_box.width
+        dy = (float(event.y) - self._press_pixel[1]) * (y1 - y0) / axes_box.height
+        self.ax.set_xlim(x0 - dx, x1 - dx)
+        new_y0 = y0 - dy
+        new_y1 = y1 - dy
+        new_y0, new_y1 = clamp_latitude_limits(new_y0, new_y1)
+        self.ax.set_ylim(new_y0, new_y1)
+        self.canvas.draw_idle()
+
+
+class MapDialog(TileMapInteractionMixin, QDialog):
     """Professional map picker for the center and radius of a graph search."""
 
     def __init__(
@@ -2441,19 +3073,11 @@ class MapDialog(QDialog):
         self.radius = max(MAP_RADIUS_MIN_KM, min(MAP_RADIUS_MAX_KM, float(radius)))
         self.place_search_worker: PlaceSearchWorker | None = None
         self.place_search_results: list[dict[str, Any]] = []
-        self.job_counter = 0
-        self.current_job_id = 0
-        self._network_error_message: str | None = None
+        self._init_tile_map_state()
         self._initial_view_pending = True
         self._syncing_controls = False
         self._selection_source = "initial"
         self._result_logged = False
-        self._drag_mode: str | None = None
-        self._press_pixel: tuple[float, float] | None = None
-        self._last_pan_pos: tuple[float, float] | None = None
-        self._pan_start_limits: (
-            tuple[tuple[float, float], tuple[float, float]] | None
-        ) = None
 
         self.setWindowTitle("Choose Search Area")
         self.setModal(True)
@@ -2638,28 +3262,7 @@ class MapDialog(QDialog):
         self.radius_spinbox.valueChanged.connect(self.update_radius)
         self._sync_selection_controls()
 
-        self.update_timer = QTimer(self)
-        self.update_timer.setSingleShot(True)
-        self.update_timer.setInterval(200)
-        self.update_timer.timeout.connect(self.request_tiles_for_current_view)
-
-        self.retry_timer = QTimer(self)
-        self.retry_timer.setSingleShot(True)
-        self.retry_timer.timeout.connect(self.request_tiles_for_current_view)
-
-        self.canvas.mpl_connect("button_press_event", self.on_mouse_press)  # type: ignore[arg-type]
-        self.canvas.mpl_connect("button_release_event", self.on_mouse_release)  # type: ignore[arg-type]
-        self.canvas.mpl_connect("motion_notify_event", self.on_mouse_move)  # type: ignore[arg-type]
-        self.canvas.mpl_connect("scroll_event", self.on_scroll)  # type: ignore[arg-type]
-
-        working_dir = parent.working_dir if parent else os.getcwd()
-        self.worker = TileLoaderWorker(working_dir)
-        self.worker.view_ready.connect(self.on_view_ready)
-        self.worker.network_error.connect(self.on_network_error)
-        self.worker.network_recovered.connect(self.on_network_recovered)
-        self.worker.retry_complete.connect(self.request_tiles_for_current_view)
-        self.worker.tiles_skipped.connect(self.on_tiles_skipped)
-        self.worker.start()
+        self._start_tile_map(parent.working_dir if parent else os.getcwd())
 
         logging.debug("Map picker opened: radius_km=%.1f", self.radius)
 
@@ -2671,13 +3274,7 @@ class MapDialog(QDialog):
         panel_bg = "#383838" if dark else "#f4f6f8"
         panel_border = "#555555" if dark else "#d5dbe1"
         secondary = "#c8c8c8" if dark else "#52606d"
-        warning_bg = "#4a3c20" if dark else "#fff4d6"
-        warning_text = "#ffe29a" if dark else "#6b4e00"
-        self._map_status_normal_style = f"color: {secondary}; padding: 4px 6px;"
-        self._map_status_warning_style = (
-            f"background: {warning_bg}; color: {warning_text}; padding: 6px 8px; "
-            "border-radius: 4px; font-weight: 600;"
-        )
+        self._set_map_status_styles(dark)
         self.setStyleSheet(self.styleSheet() + f"""
             QLabel#mapDialogTitle {{ font-size: 18pt; font-weight: 700; }}
             QLabel#mapDialogSubtitle, QLabel#mapHint, QLabel#selectionHelp,
@@ -2710,10 +3307,7 @@ class MapDialog(QDialog):
         mode = DEFAULT_THEME
         if parent and hasattr(parent, "settings"):
             mode = normalize_theme(parent.settings.value("theme", DEFAULT_THEME))
-        map_background = "#252a30" if mode == "dark" else "#e7ebef"
-        self.figure.set_facecolor(map_background)
-        self.ax.set_facecolor(map_background)
-        self.ax.set_axis_off()
+        self._init_map_axes(mode == "dark")
 
         scale_factor = (
             parent.scale_factor if parent and hasattr(parent, "scale_factor") else 1.0
@@ -2747,23 +3341,6 @@ class MapDialog(QDialog):
             markeredgewidth=2,
             zorder=11,
         )
-        self.ax.text(
-            0.99,
-            0.015,
-            "© OpenStreetMap contributors",
-            verticalalignment="bottom",
-            horizontalalignment="right",
-            transform=self.ax.transAxes,
-            color="#333333",
-            fontsize=8,
-            bbox=dict(
-                facecolor="white",
-                alpha=0.88,
-                edgecolor="#b8b8b8",
-                boxstyle="round,pad=0.25",
-            ),
-            zorder=20,
-        )
 
     def _sync_selection_controls(self) -> None:
         self._syncing_controls = True
@@ -2781,36 +3358,6 @@ class MapDialog(QDialog):
         except Exception:
             reference = self.lon
         return longitude_near_reference(self.lon, reference)
-
-    def _set_view_limits(
-        self, west: float, east: float, south: float, north: float
-    ) -> None:
-        center_lon = (west + east) / 2.0
-        center_lat = max(
-            -WEB_MERCATOR_MAX_LATITUDE,
-            min(WEB_MERCATOR_MAX_LATITUDE, (south + north) / 2.0),
-        )
-        lon_span = max(0.01, east - west)
-        lat_span = max(0.01, north - south)
-
-        width = max(1, self.canvas.width())
-        height = max(1, self.canvas.height())
-        mercator_aspect = 1.0 / max(0.15, math.cos(math.radians(center_lat)))
-        desired_lon_lat_ratio = mercator_aspect * width / height
-        if lon_span / lat_span < desired_lon_lat_ratio:
-            lon_span = lat_span * desired_lon_lat_ratio
-        else:
-            lat_span = lon_span / desired_lon_lat_ratio
-
-        lon_span = min(360.0, lon_span)
-        lat_span = min(WEB_MERCATOR_MAX_LATITUDE * 2.0, lat_span)
-        south = center_lat - lat_span / 2.0
-        north = center_lat + lat_span / 2.0
-        south, north = clamp_latitude_limits(south, north)
-
-        self.ax.set_xlim(center_lon - lon_span / 2.0, center_lon + lon_span / 2.0)
-        self.ax.set_ylim(south, north)
-        self.ax.set_aspect(mercator_aspect, adjustable="box")
 
     def fit_selected_area(
         self, extra_bounds: tuple[float, float, float, float] | None = None
@@ -2872,8 +3419,7 @@ class MapDialog(QDialog):
         if self.place_search_worker and self.place_search_worker.isRunning():
             self.place_search_worker.cancel()
             self.place_search_worker.wait()
-        if self.worker.isRunning():
-            self.worker.stop()
+        self._stop_tile_worker()
 
     def closeEvent(self, a0: QCloseEvent | None) -> None:
         self._log_map_result("cancelled")
@@ -2990,100 +3536,6 @@ class MapDialog(QDialog):
         )
         self.request_tiles_for_current_view()
 
-    def request_tiles_for_current_view(self) -> None:
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
-
-        # Calculate optimal zoom
-        try:
-            bbox = self.ax.get_window_extent().transformed(
-                self.figure.dpi_scale_trans.inverted()
-            )
-            width_px = bbox.width * self.figure.dpi
-        except Exception:
-            width_px = 800
-
-        lon_span = abs(x1 - x0)
-        if lon_span == 0 or width_px <= 0:
-            return
-
-        # Target: pixel density.
-        target_scale = 1.5
-        needed_2z = (target_scale * width_px * 360.0) / (256.0 * max(0.0001, lon_span))
-        zoom = int(math.log2(needed_2z)) if needed_2z > 0 else 0
-        zoom = max(0, min(zoom, 15))  # Changed max zoom to 15
-
-        # Check tile budget (now pushed down to Worker for uncached tile budgeting)
-        # We just send the target zoom and boundary.
-        self.job_counter += 1
-        self.current_job_id = self.job_counter
-        if self._network_error_message is None:
-            self.status_label.setText("Loading map…")
-            self.status_label.setStyleSheet(self._map_status_normal_style)
-            self.status_label.show()
-        self.worker.request_view(
-            self.current_job_id, zoom, float(x0), float(x1), float(y0), float(y1)
-        )
-
-    def on_network_error(self, message: str) -> None:
-        self._network_error_message = message
-        if "throttled" in message.lower():
-            display_message = (
-                "The map service is temporarily limiting requests. Retrying "
-                "automatically; you can still adjust the selected area."
-            )
-        elif "timed out" in message.lower():
-            display_message = (
-                "Map tiles are taking too long to load. Retrying automatically; "
-                "you can still adjust the selected area."
-            )
-        else:
-            display_message = (
-                "Map tiles are temporarily unavailable. Check your connection; "
-                "you can still adjust the selected area."
-            )
-        self.status_label.setText(display_message)
-        self.status_label.setStyleSheet(self._map_status_warning_style)
-        self.status_label.show()
-
-    def on_network_recovered(self) -> None:
-        self._network_error_message = None
-        self.status_label.hide()
-        self.retry_timer.stop()
-
-    def on_tiles_skipped(self) -> None:
-        """Called when some tiles were skipped due to network suspension. Schedule a retry."""
-        # Schedule a retry after the 15-second suspension period ends.
-        # We use 16 seconds to be safe. We always restart to sync with any back-off extension.
-        self.retry_timer.start(16000)
-
-    def on_view_ready(
-        self, job_id: int, composite, extent: tuple[float, float, float, float]
-    ) -> None:
-        if job_id < self.current_job_id:
-            return
-
-        for img in list(self.ax.images):
-            img.remove()
-
-        x_limits = self.ax.get_xlim()
-        y_limits = self.ax.get_ylim()
-        self.ax.imshow(
-            np.array(composite), extent=extent, origin="upper", alpha=1.0, zorder=1
-        )
-        self.ax.set_xlim(x_limits)
-        self.ax.set_ylim(y_limits)
-        center_lat = (y_limits[0] + y_limits[1]) / 2.0
-        self.ax.set_aspect(
-            1.0 / max(0.15, math.cos(math.radians(center_lat))),
-            adjustable="box",
-        )
-
-        self.update_overlays()
-        if self._network_error_message is None:
-            self.status_label.hide()
-        self.canvas.draw_idle()
-
     def update_overlays(self) -> None:
         display_lon = self._display_longitude()
         self.marker.set_data([display_lon], [self.lat])
@@ -3122,33 +3574,6 @@ class MapDialog(QDialog):
             source="coordinate_fields",
         )
 
-    def zoom_map(self, scale: float) -> None:
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
-        cx = (x0 + x1) / 2
-        cy = (y0 + y1) / 2
-        self._zoom_at(cx, cy, scale, 0.5, 0.5)
-
-    def _zoom_at(
-        self, mx: float, my: float, scale: float, relx: float, rely: float
-    ) -> None:
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
-        new_w = min(360.0, max(0.002, (x1 - x0) * scale))
-        new_h = min(
-            WEB_MERCATOR_MAX_LATITUDE * 2.0,
-            max(0.002, (y1 - y0) * scale),
-        )
-        new_x0 = mx - relx * new_w
-        new_x1 = new_x0 + new_w
-        new_y0 = my - rely * new_h
-        new_y1 = new_y0 + new_h
-        new_y0, new_y1 = clamp_latitude_limits(new_y0, new_y1)
-        self.ax.set_xlim(new_x0, new_x1)
-        self.ax.set_ylim(new_y0, new_y1)
-        self.canvas.draw_idle()
-        self.update_timer.start()
-
     def update_radius(self, value: float) -> None:
         if self._syncing_controls:
             return
@@ -3172,26 +3597,32 @@ class MapDialog(QDialog):
         self._stop_workers()
         super().reject()
 
-    def on_mouse_press(self, event: MouseEvent) -> None:
-        if (
-            event.inaxes != self.ax
-            or event.xdata is None
-            or event.ydata is None
-            or event.button not in (1, 3)
-        ):
-            return
+    def _on_map_click(self, lat: float, lon: float) -> None:
+        self._set_selected_center(lat, lon)
 
-        self._press_pixel = (float(event.x), float(event.y))
-        self._last_pan_pos = (float(event.xdata), float(event.ydata))
-        self._pan_start_limits = (self.ax.get_xlim(), self.ax.get_ylim())
-        if event.button == 1 and self._event_near_radius_handle(event):
-            self._drag_mode = "radius"
-            self.canvas.setCursor(Qt.CursorShape.SizeAllCursor)
-        elif event.button == 3:
-            self._drag_mode = "pan"
-            self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
-        else:
-            self._drag_mode = "pan_candidate"
+    def _begin_custom_drag(self, event: MouseEvent) -> str | None:
+        return "radius" if self._event_near_radius_handle(event) else None
+
+    def _custom_drag_move(self, drag_mode: str, event: MouseEvent) -> None:
+        if drag_mode != "radius":
+            return
+        cursor_lon = longitude_near_reference(float(event.xdata), self.lon)
+        new_radius = geodesic_distance_km(
+            self.lat, self.lon, float(event.ydata), cursor_lon
+        )
+        self.radius = max(MAP_RADIUS_MIN_KM, min(MAP_RADIUS_MAX_KM, new_radius))
+        self._selection_source = "radius_handle"
+        self._sync_selection_controls()
+        self.update_overlays()
+        self.canvas.draw_idle()
+
+    def _end_custom_drag(self, drag_mode: str) -> None:
+        if drag_mode != "radius":
+            return
+        viewport_changed = self.ensure_selection_visible()
+        self.canvas.draw_idle()
+        if viewport_changed:
+            self.update_timer.start()
 
     def _event_near_radius_handle(self, event: MouseEvent) -> bool:
         handle_x = np.asarray(self.radius_handle.get_xdata())
@@ -3204,93 +3635,820 @@ class MapDialog(QDialog):
             math.hypot(float(event.x) - pixel_x, float(event.y) - pixel_y) <= tolerance
         )
 
-    def on_mouse_release(self, event: MouseEvent) -> None:
-        drag_mode = self._drag_mode
-        self._drag_mode = None
-        self._press_pixel = None
-        self._last_pan_pos = None
-        self._pan_start_limits = None
-        self.canvas.setCursor(Qt.CursorShape.ArrowCursor)
+ABUNDANCE_TOP_CELLS = 25
+ABUNDANCE_GRID_OPTIONS = (("0.25°", 0.25), ("0.5°", 0.5), ("1°", 1.0), ("2°", 2.0))
+ABUNDANCE_DEFAULT_GRID_INDEX = 2
 
-        if drag_mode == "pan_candidate" and event.inaxes == self.ax:
-            if event.xdata is not None and event.ydata is not None:
-                self._set_selected_center(float(event.ydata), float(event.xdata))
-        elif drag_mode == "pan":
-            self.update_timer.start()
-        elif drag_mode == "radius":
-            viewport_changed = self.ensure_selection_visible()
-            self.canvas.draw_idle()
-            if viewport_changed:
-                self.update_timer.start()
 
-    def on_mouse_move(self, event: MouseEvent) -> None:
-        if (
-            self._drag_mode is None
-            or event.inaxes != self.ax
-            or event.xdata is None
-            or event.ydata is None
-        ):
-            return
+def abundance_cell_key(cell: Mapping[str, Any]) -> tuple[float, float, float]:
+    return (
+        round(float(cell["cell_lat"]), 6),
+        round(float(cell["cell_lon"]), 6),
+        float(cell["cell_deg"]),
+    )
 
-        if self._drag_mode == "pan_candidate":
-            if self._press_pixel is None:
-                return
-            movement = math.hypot(
-                float(event.x) - self._press_pixel[0],
-                float(event.y) - self._press_pixel[1],
+
+def rank_abundance_cells(
+    cells: list[dict[str, Any]], metric: str, min_count: int, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """Order cells by raw count, or by share among cells with enough records.
+
+    Share mode needs a minimum count because a cell with one observation of
+    the organism and two observations overall would otherwise outrank a
+    genuine hotspot.
+    """
+    if metric == "share":
+        ranked = [cell for cell in cells if cell["count"] >= min_count]
+        ranked.sort(key=lambda cell: (cell["share"], cell["count"]), reverse=True)
+    else:
+        ranked = sorted(cells, key=lambda cell: cell["count"], reverse=True)
+    return ranked[:limit] if limit is not None else ranked
+
+
+def abundance_grid_array(
+    cells: list[dict[str, Any]], cell_deg: float, metric: str
+) -> np.ndarray:
+    """Return a global lat x lon array (row 0 = south) of the chosen metric."""
+    rows = int(round(180.0 / cell_deg))
+    cols = int(round(360.0 / cell_deg))
+    grid = np.full((rows, cols), np.nan)
+    for cell in cells:
+        row = int(round((cell["cell_lat"] + 90.0) / cell_deg))
+        col = int(round((cell["cell_lon"] + 180.0) / cell_deg)) % cols
+        if 0 <= row < rows:
+            grid[row, col] = cell["share"] * 100.0 if metric == "share" else cell["count"]
+    return grid
+
+
+def abundance_cell_radius_km(cell: Mapping[str, Any]) -> float:
+    """Radius of a circle centred on a grid cell that covers the whole cell."""
+    cell_deg = float(cell["cell_deg"])
+    south = max(-90.0, float(cell["cell_lat"]))
+    north = min(90.0, south + cell_deg)
+    west = float(cell["cell_lon"])
+    center_lat = (south + north) / 2.0
+    center_lon = west + cell_deg / 2.0
+    corner_distance = max(
+        geodesic_distance_km(center_lat, center_lon, lat, lon)
+        for lat in (south, north)
+        for lon in (west, west + cell_deg)
+    )
+    return max(MAP_RADIUS_MIN_KM, min(MAP_RADIUS_MAX_KM, math.ceil(corner_distance)))
+
+
+def most_specific_standard_place(response: Any) -> str | None:
+    """Pick the finest-grained administrative place from a places/nearby reply."""
+    results = response.get("results") if isinstance(response, Mapping) else None
+    standard = results.get("standard") if isinstance(results, Mapping) else None
+    candidates = [
+        place
+        for place in standard or []
+        if isinstance(place, Mapping)
+        and place.get("admin_level") is not None
+        and (place.get("display_name") or place.get("name"))
+    ]
+    if not candidates:
+        return None
+    best = max(
+        candidates,
+        key=lambda place: (
+            place.get("admin_level"),
+            -(place.get("bbox_area") or 0.0),
+        ),
+    )
+    return str(best.get("display_name") or best.get("name"))
+
+
+class PlaceNameWorker(QThread):
+    """Look up readable names for abundance cells without blocking the UI."""
+
+    name_ready = pyqtSignal(object, str)
+
+    def __init__(
+        self,
+        requests_to_run: list[tuple[Any, float, float]],
+        http_cache_file: str | Path | None = None,
+    ) -> None:
+        super().__init__()
+        self.requests_to_run = requests_to_run
+        self.http_cache_file = (
+            str(http_cache_file) if http_cache_file is not None else ":memory:"
+        )
+
+    def cancel(self) -> None:
+        self.requestInterruption()
+
+    def run(self) -> None:
+        request_session = None
+        try:
+            request_session = pyinaturalist.ClientSession(
+                cache_file=self.http_cache_file,
+                max_retries=0,
+                timeout=8,
             )
-            if movement < QApplication.startDragDistance():
-                return
-            self._drag_mode = "pan"
-            self.canvas.setCursor(Qt.CursorShape.ClosedHandCursor)
+            for key, lat, lon in self.requests_to_run:
+                if self.isInterruptionRequested():
+                    return
+                delta = 0.005
+                response = pyinaturalist.get_places_nearby(
+                    nelat=lat + delta,
+                    nelng=lon + delta,
+                    swlat=lat - delta,
+                    swlng=lon - delta,
+                    per_page=30,
+                    session=request_session,
+                )
+                name = most_specific_standard_place(response)
+                if name and not self.isInterruptionRequested():
+                    self.name_ready.emit(key, name)
+        except Exception as error:
+            if not self.isInterruptionRequested():
+                logging.warning(
+                    "Abundance place-name lookup stopped: %s",
+                    place_search_error_diagnostic(error),
+                )
+        finally:
+            if request_session is not None:
+                request_session.close()
 
-        if self._drag_mode == "radius":
-            cursor_lon = longitude_near_reference(float(event.xdata), self.lon)
-            new_radius = geodesic_distance_km(
-                self.lat, self.lon, float(event.ydata), cursor_lon
+
+class AbundanceMapView(TileMapInteractionMixin, QWidget):
+    """World heatmap and ranked list showing where an organism is most observed."""
+
+    graph_requested = pyqtSignal(float, float, float)  # lat, lon, radius_km
+
+    _map_network_hint = "the ranked list is still available."
+
+    def __init__(self, main_window: "INatSeasonalVisualizer | None" = None) -> None:
+        super().__init__(main_window)
+        self._main_window = main_window
+        self._init_tile_map_state()
+        self.cells: list[dict[str, Any]] = []
+        self.ranked_cells: list[dict[str, Any]] = []
+        self.metric = "count"
+        self.min_count = 10
+        self.cell_deg = 1.0
+        self.context: dict[str, Any] = {}
+        self.place_names: dict[tuple[float, float, float], str] = {}
+        self._name_workers: list[PlaceNameWorker] = []
+        self._initial_view_pending = True
+        self._heatmap_images: list[Any] = []
+        self._colorbar = None
+        self._colorbar_ax = None
+        self._highlight = None
+        self.map_visible = True
+        if main_window is not None and hasattr(main_window, "settings"):
+            self.map_visible = main_window.settings.value(
+                "abundance_show_map", True, bool
             )
-            self.radius = max(MAP_RADIUS_MIN_KM, min(MAP_RADIUS_MAX_KM, new_radius))
-            self._selection_source = "radius_handle"
-            self._sync_selection_controls()
-            self.update_overlays()
-            self.canvas.draw_idle()
-            return
 
-        if (
-            self._drag_mode != "pan"
-            or self._press_pixel is None
-            or self._pan_start_limits is None
-        ):
-            return
-        (x0, x1), (y0, y1) = self._pan_start_limits
-        axes_box = self.ax.get_window_extent()
-        if axes_box.width <= 0 or axes_box.height <= 0:
-            return
-        dx = (float(event.x) - self._press_pixel[0]) * (x1 - x0) / axes_box.width
-        dy = (float(event.y) - self._press_pixel[1]) * (y1 - y0) / axes_box.height
-        self.ax.set_xlim(x0 - dx, x1 - dx)
-        new_y0 = y0 - dy
-        new_y1 = y1 - dy
-        new_y0, new_y1 = clamp_latitude_limits(new_y0, new_y1)
-        self.ax.set_ylim(new_y0, new_y1)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        map_layout = QVBoxLayout()
+        map_layout.setSpacing(6)
+        map_toolbar = QHBoxLayout()
+        map_toolbar.setSpacing(6)
+        self.map_title_label = QLabel(
+            "Choose an organism and season, then click Map abundance."
+        )
+        self.map_title_label.setObjectName("abundanceTitle")
+        self.map_title_label.setWordWrap(True)
+        map_toolbar.addWidget(self.map_title_label, stretch=1)
+        self.map_toggle_button = QPushButton()
+        self.map_toggle_button.setCheckable(True)
+        self.map_toggle_button.setChecked(not self.map_visible)
+        self.map_toggle_button.toggled.connect(
+            lambda hidden: self.set_map_visible(not hidden)
+        )
+        map_toolbar.addWidget(self.map_toggle_button)
+        self.fit_results_button = QPushButton("Fit results")
+        self.fit_results_button.setToolTip("Zoom to the top-ranked locations")
+        self.fit_results_button.clicked.connect(self.fit_results_and_reload)
+        map_toolbar.addWidget(self.fit_results_button)
+        zoom_in_btn = QPushButton("+")
+        zoom_in_btn.setToolTip("Zoom in")
+        zoom_in_btn.setFixedSize(34, 30)
+        zoom_in_btn.clicked.connect(lambda: self.zoom_map(1.0 / 1.5))
+        zoom_out_btn = QPushButton("-")
+        zoom_out_btn.setToolTip("Zoom out")
+        zoom_out_btn.setFixedSize(34, 30)
+        zoom_out_btn.clicked.connect(lambda: self.zoom_map(1.5))
+        map_toolbar.addWidget(zoom_in_btn)
+        map_toolbar.addWidget(zoom_out_btn)
+        map_layout.addLayout(map_toolbar)
+
+        self.figure, self.ax = plt.subplots()
+        self.figure.subplots_adjust(left=0, right=1, bottom=0, top=1)
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.canvas.setMinimumSize(0, 0)
+        map_layout.addWidget(self.canvas, stretch=1)
+
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.hide()
+        map_layout.addWidget(self.status_label)
+        layout.addLayout(map_layout, stretch=3)
+
+        panel = QFrame()
+        panel.setObjectName("abundancePanel")
+        panel.setMinimumWidth(260)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(8, 8, 8, 8)
+        panel_layout.setSpacing(8)
+        self.summary_label = QLabel("Top locations")
+        self.summary_label.setWordWrap(True)
+        panel_layout.addWidget(self.summary_label)
+
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["#", "Location", "Obs", "Share"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self._on_row_selected)
+        self.table.itemDoubleClicked.connect(lambda _item: self.request_graph())
+        panel_layout.addWidget(self.table, stretch=1)
+
+        self.graph_here_button = QPushButton("Graph seasonality here")
+        self.graph_here_button.setToolTip(
+            "Use the selected location as the center of a seasonal graph"
+        )
+        self.graph_here_button.setEnabled(False)
+        self.graph_here_button.clicked.connect(self.request_graph)
+        panel_layout.addWidget(self.graph_here_button)
+        layout.addWidget(panel, stretch=1)
+
+        self.apply_theme(self._is_dark())
+        self._start_tile_map(main_window.working_dir if main_window else os.getcwd())
+
+    def _is_dark(self) -> bool:
+        if self._main_window is not None and hasattr(self._main_window, "settings"):
+            theme = self._main_window.settings.value("theme", DEFAULT_THEME)
+            return normalize_theme(theme) == "dark"
+        return DEFAULT_THEME == "dark"
+
+    def apply_theme(self, dark: bool) -> None:
+        self._set_map_status_styles(dark)
+        if self._network_error_message is None:
+            self.status_label.setStyleSheet(self._map_status_normal_style)
+        self._init_map_axes(dark)
+        self._apply_map_visibility()
+
+    def set_map_visible(self, visible: bool) -> None:
+        """Show the OpenStreetMap base map, or only the heatmap on black."""
+        self.map_visible = visible
+        if self._main_window is not None and hasattr(self._main_window, "settings"):
+            self._main_window.settings.setValue("abundance_show_map", visible)
+        self.map_toggle_button.blockSignals(True)
+        self.map_toggle_button.setChecked(not visible)
+        self.map_toggle_button.blockSignals(False)
+        if not visible:
+            self.retry_timer.stop()
+            self.update_timer.stop()
+            self.status_label.hide()
+        self._apply_map_visibility()
+        if visible:
+            self.request_tiles_for_current_view()
+
+    def _apply_map_visibility(self) -> None:
+        visible = self.map_visible
+        self.map_toggle_button.setText("Hide map" if visible else "Show map")
+        self.map_toggle_button.setToolTip(
+            "Show only the observation cells on a black background"
+            if visible
+            else "Show the OpenStreetMap base map under the observation cells"
+        )
+        if visible:
+            self._init_map_axes(self._is_dark())
+        else:
+            self.figure.set_facecolor("black")
+            self.ax.set_facecolor("black")
+        if getattr(self, "_map_attribution", None) is not None:
+            self._map_attribution.set_visible(visible)
+        heatmap_ids = {id(image) for image in self._heatmap_images}
+        for image in self.ax.images:
+            if id(image) in heatmap_ids:
+                image.set_alpha(self._heatmap_alpha())
+            else:
+                image.set_visible(visible)
+        self._style_colorbar()
+        if self._highlight is not None:
+            self._highlight.set_edgecolor(self._highlight_color())
         self.canvas.draw_idle()
 
-    def on_scroll(self, event: MouseEvent) -> None:
-        if event.inaxes != self.ax:
+    def _heatmap_alpha(self) -> float:
+        return 0.72 if self.map_visible else 1.0
+
+    def _highlight_color(self) -> str:
+        return "#2f80ed" if self.map_visible else "#ffffff"
+
+    def _style_colorbar(self) -> None:
+        if self._colorbar is None or self._colorbar_ax is None:
             return
-        mx, my = event.xdata, event.ydata
-        if mx is None or my is None:
+        text_color = "#222222" if self.map_visible else "#dddddd"
+        if self._colorbar.solids is not None:
+            self._colorbar.solids.set_alpha(self._heatmap_alpha())
+        self._colorbar.ax.xaxis.label.set_color(text_color)
+        self._colorbar_ax.tick_params(colors=text_color)
+
+    def request_tiles_for_current_view(self) -> None:
+        if not self.map_visible:
             return
+        super().request_tiles_for_current_view()
 
-        scale = 1.0 / 1.5 if event.button == "up" else 1.5
+    def showEvent(self, event: QShowEvent | None) -> None:
+        super().showEvent(event)
+        if self._initial_view_pending:
+            self._initial_view_pending = False
+            QTimer.singleShot(0, self._initialize_initial_view)
 
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
-        w, h = x1 - x0, y1 - y0
+    def _initialize_initial_view(self) -> None:
+        if self.ranked_cells:
+            self.fit_results()
+        else:
+            self._set_view_limits(-170.0, 190.0, -60.0, 75.0)
+        self.request_tiles_for_current_view()
 
-        relx = (mx - x0) / w
-        rely = (my - y0) / h
-        self._zoom_at(float(mx), float(my), scale, relx, rely)
+    def shutdown(self) -> None:
+        for worker in self._name_workers:
+            worker.cancel()
+        for worker in self._name_workers:
+            worker.wait(2000)
+        self._stop_tile_worker()
+
+    def set_results(
+        self,
+        cells: list[dict[str, Any]],
+        cell_deg: float,
+        metric: str,
+        min_count: int,
+        context: dict[str, Any],
+    ) -> None:
+        self.cells = cells
+        self.cell_deg = cell_deg
+        self.context = context
+        self.metric = metric
+        self.min_count = min_count
+        self._rerank()
+        self.fit_results()
+        self.request_tiles_for_current_view()
+
+    def set_ranking(self, metric: str, min_count: int) -> None:
+        self.metric = metric
+        self.min_count = min_count
+        if self.cells:
+            self._rerank()
+
+    def _rerank(self) -> None:
+        self.ranked_cells = rank_abundance_cells(
+            self.cells, self.metric, self.min_count, ABUNDANCE_TOP_CELLS
+        )
+        self._draw_heatmap()
+        self._populate_table()
+        self._update_summary()
+        self._request_place_names()
+        self.canvas.draw_idle()
+
+    def _update_summary(self) -> None:
+        organism = self.context.get("organism", "")
+        season = self.context.get("season_label", "")
+        self.map_title_label.setText(
+            f"Where {organism} is observed, {season}" if organism else ""
+        )
+        total = sum(cell["count"] for cell in self.cells)
+        metric_text = (
+            f"share of all observations (cells with ≥ {self.min_count} obs)"
+            if self.metric == "share"
+            else "observation count"
+        )
+        self.summary_label.setText(
+            f"Top {len(self.ranked_cells)} of {len(self.cells):,} "
+            f"{self.cell_deg:g}° cells by {metric_text}. "
+            f"{total:,} observations in total."
+        )
+
+    def _draw_heatmap(self) -> None:
+        # Remove the colorbar's inset axes while its image still belongs to
+        # the map axes; Colorbar.remove() looks the image's axes up.
+        self._colorbar = None
+        if self._colorbar_ax is not None:
+            self._colorbar_ax.remove()
+            self._colorbar_ax = None
+        for image in self._heatmap_images:
+            image.remove()
+        self._heatmap_images = []
+        self._set_highlight(None)
+
+        if self.metric == "share":
+            visible = [c for c in self.cells if c["count"] >= self.min_count]
+        else:
+            visible = self.cells
+        if not visible:
+            return
+        grid = abundance_grid_array(visible, self.cell_deg, self.metric)
+        finite = grid[np.isfinite(grid)]
+        if self.metric == "share":
+            norm = Normalize(vmin=0.0, vmax=max(float(finite.max()), 1e-9))
+            label = "% of all observations"
+        else:
+            norm = LogNorm(vmin=1.0, vmax=max(float(finite.max()), 2.0))
+            label = "Observations"
+
+        x_limits = self.ax.get_xlim()
+        y_limits = self.ax.get_ylim()
+        for offset in (-360.0, 0.0, 360.0):
+            image = self.ax.imshow(
+                np.ma.masked_invalid(grid),
+                extent=(-180.0 + offset, 180.0 + offset, -90.0, 90.0),
+                origin="lower",
+                cmap="YlOrRd",
+                norm=norm,
+                alpha=self._heatmap_alpha(),
+                interpolation="nearest",
+                zorder=3,
+            )
+            self._heatmap_images.append(image)
+        self.ax.set_xlim(x_limits)
+        self.ax.set_ylim(y_limits)
+
+        self._colorbar_ax = self.ax.inset_axes((0.02, 0.05, 0.28, 0.025))
+        self._colorbar = self.figure.colorbar(
+            self._heatmap_images[1], cax=self._colorbar_ax, orientation="horizontal"
+        )
+        self._colorbar.set_label(label, fontsize=8)
+        self._colorbar_ax.tick_params(labelsize=7)
+        self._colorbar_ax.patch.set_alpha(0.0)
+        self._colorbar_ax.set_zorder(21)
+        self._style_colorbar()
+
+    def on_view_ready(
+        self, job_id: int, composite, extent: tuple[float, float, float, float]
+    ) -> None:
+        # The base implementation removes every image on the axes, which would
+        # include the heatmap, so keep the heatmap images out of that sweep.
+        if job_id < self.current_job_id or not self.map_visible:
+            return
+        heatmap_ids = {id(image) for image in self._heatmap_images}
+        for image in list(self.ax.images):
+            if id(image) not in heatmap_ids:
+                image.remove()
+        x_limits = self.ax.get_xlim()
+        y_limits = self.ax.get_ylim()
+        self.ax.imshow(
+            np.array(composite), extent=extent, origin="upper", alpha=1.0, zorder=1
+        )
+        self.ax.set_xlim(x_limits)
+        self.ax.set_ylim(y_limits)
+        center_lat = (y_limits[0] + y_limits[1]) / 2.0
+        self.ax.set_aspect(
+            1.0 / max(0.15, math.cos(math.radians(center_lat))),
+            adjustable="box",
+        )
+        if self._network_error_message is None:
+            self.status_label.hide()
+        self.canvas.draw_idle()
+
+    def _location_label(self, cell: Mapping[str, Any]) -> str:
+        name = self.place_names.get(abundance_cell_key(cell))
+        coordinates = f"{cell['centroid_lat']:.2f}, {cell['centroid_lon']:.2f}"
+        return f"{name} ({coordinates})" if name else coordinates
+
+    def _populate_table(self) -> None:
+        self.table.blockSignals(True)
+        self.table.clearSelection()
+        self.table.setRowCount(len(self.ranked_cells))
+        for row, cell in enumerate(self.ranked_cells):
+            values = (
+                str(row + 1),
+                self._location_label(cell),
+                f"{cell['count']:,}",
+                f"{cell['share'] * 100:.1f}%",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column != 1:
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                    )
+                item.setToolTip(
+                    f"{cell['count']:,} of {cell['total']:,} observations in this "
+                    f"{cell['cell_deg']:g}° cell during the season"
+                )
+                self.table.setItem(row, column, item)
+        self.table.blockSignals(False)
+        self.graph_here_button.setEnabled(False)
+
+    def _request_place_names(self) -> None:
+        pending = [
+            (
+                abundance_cell_key(cell),
+                float(cell["centroid_lat"]),
+                float(cell["centroid_lon"]),
+            )
+            for cell in self.ranked_cells
+            if abundance_cell_key(cell) not in self.place_names
+        ]
+        for worker in self._name_workers:
+            worker.cancel()
+        if not pending:
+            return
+        cache_file = getattr(self._main_window, "http_cache_file", None)
+        worker = PlaceNameWorker(pending, cache_file)
+        worker.name_ready.connect(self._on_place_name)
+        worker.finished.connect(lambda w=worker: self._forget_name_worker(w))
+        self._name_workers.append(worker)
+        worker.start()
+
+    def _forget_name_worker(self, worker: PlaceNameWorker) -> None:
+        if worker in self._name_workers:
+            self._name_workers.remove(worker)
+
+    def _on_place_name(self, key: tuple[float, float, float], name: str) -> None:
+        self.place_names[key] = name
+        for row, cell in enumerate(self.ranked_cells):
+            if abundance_cell_key(cell) == key:
+                item = self.table.item(row, 1)
+                if item is not None:
+                    item.setText(self._location_label(cell))
+
+    def selected_cell(self) -> dict[str, Any] | None:
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        row = rows[0].row()
+        return self.ranked_cells[row] if 0 <= row < len(self.ranked_cells) else None
+
+    def _on_row_selected(self) -> None:
+        cell = self.selected_cell()
+        self.graph_here_button.setEnabled(cell is not None)
+        self._set_highlight(cell)
+        if cell is None:
+            self.canvas.draw_idle()
+            return
+        span = max(self.cell_deg * 5.0, 2.0)
+        center_lat = cell["cell_lat"] + self.cell_deg / 2.0
+        center_lon = cell["cell_lon"] + self.cell_deg / 2.0
+        self._set_view_limits(
+            center_lon - span, center_lon + span, center_lat - span, center_lat + span
+        )
+        self.canvas.draw_idle()
+        self.update_timer.start()
+
+    def _set_highlight(self, cell: Mapping[str, Any] | None) -> None:
+        if self._highlight is not None:
+            self._highlight.remove()
+            self._highlight = None
+        if cell is None:
+            return
+        self._highlight = Rectangle(
+            (cell["cell_lon"], cell["cell_lat"]),
+            cell["cell_deg"],
+            cell["cell_deg"],
+            fill=False,
+            edgecolor=self._highlight_color(),
+            linewidth=2.5,
+            zorder=8,
+        )
+        self.ax.add_patch(self._highlight)
+
+    def fit_results(self) -> None:
+        if not self.ranked_cells:
+            return
+        lats = [c["cell_lat"] for c in self.ranked_cells]
+        lons = [c["cell_lon"] for c in self.ranked_cells]
+        pad = max(self.cell_deg * 2.0, 1.0)
+        self._set_view_limits(
+            min(lons) - pad,
+            max(lons) + self.cell_deg + pad,
+            min(lats) - pad,
+            max(lats) + self.cell_deg + pad,
+        )
+        self.canvas.draw_idle()
+
+    def fit_results_and_reload(self) -> None:
+        self.fit_results()
+        self.request_tiles_for_current_view()
+
+    def _on_map_click(self, lat: float, lon: float) -> None:
+        lon = normalize_longitude(lon)
+        for row, cell in enumerate(self.ranked_cells):
+            if (
+                cell["cell_lat"] <= lat < cell["cell_lat"] + cell["cell_deg"]
+                and cell["cell_lon"] <= lon < cell["cell_lon"] + cell["cell_deg"]
+            ):
+                self.table.selectRow(row)
+                return
+
+    def request_graph(self) -> None:
+        cell = self.selected_cell()
+        if cell is None:
+            return
+        self.graph_requested.emit(
+            round(cell["cell_lat"] + cell["cell_deg"] / 2.0, 4),
+            round(normalize_longitude(cell["cell_lon"] + cell["cell_deg"] / 2.0), 4),
+            float(abundance_cell_radius_km(cell)),
+        )
+
+
+MONTH_ABBREVIATIONS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
+MONTH_NAMES = (
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+)
+# Feb 29 stays selectable; observations on it only exist in leap years.
+DAYS_IN_MONTH = (31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31)
+SEASON_PRESETS: tuple[tuple[str, tuple[int, int], tuple[int, int]], ...] = (
+    ("Spring (Mar – May)", (3, 1), (5, 31)),
+    ("Summer (Jun – Aug)", (6, 1), (8, 31)),
+    ("Fall (Sep – Nov)", (9, 1), (11, 30)),
+    ("Winter (Dec – Feb)", (12, 1), (2, 29)),
+) + tuple(
+    (MONTH_NAMES[month - 1], (month, 1), (month, DAYS_IN_MONTH[month - 1]))
+    for month in range(1, 13)
+)
+SEASON_CUSTOM_TEXT = "Custom range"
+SEASON_AROUND_TODAY_TEXT = "Around today (± 2 weeks)"
+
+
+def season_day_of_year(month_day: tuple[int, int]) -> int:
+    """Day number of a month/day in a leap year (Jan 1 = 1, Dec 31 = 366)."""
+    month, day = month_day
+    return sum(DAYS_IN_MONTH[: month - 1]) + day
+
+
+def season_length_days(start: tuple[int, int], end: tuple[int, int]) -> int:
+    return (season_day_of_year(end) - season_day_of_year(start)) % 366 + 1
+
+
+def format_month_day(month_day: tuple[int, int]) -> str:
+    return f"{MONTH_ABBREVIATIONS[month_day[0] - 1]} {month_day[1]}"
+
+
+def around_date_season(
+    today: datetime, days: int = 14
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    start = today - pd.Timedelta(days=days)
+    end = today + pd.Timedelta(days=days)
+    return (start.month, start.day), (end.month, end.day)
+
+
+class SeasonRangeWidget(QWidget):
+    """Pick a month/day range, with presets, that may wrap past Dec 31."""
+
+    changed = pyqtSignal()
+
+    def __init__(
+        self,
+        start: tuple[int, int] = (10, 1),
+        end: tuple[int, int] = (11, 30),
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._updating = False
+        layout = QGridLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(4)
+        layout.setColumnStretch(1, 1)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem(SEASON_CUSTOM_TEXT)
+        self.preset_combo.addItem(SEASON_AROUND_TODAY_TEXT)
+        self.preset_combo.insertSeparator(self.preset_combo.count())
+        for index, (label, _start, _end) in enumerate(SEASON_PRESETS):
+            if index == 4:
+                self.preset_combo.insertSeparator(self.preset_combo.count())
+            self.preset_combo.addItem(label)
+        self.preset_combo.setToolTip("Quickly choose a common time of year")
+        self.preset_combo.currentTextChanged.connect(self._apply_preset)
+
+        self.start_month, self.start_day = self._month_day_pair()
+        self.end_month, self.end_day = self._month_day_pair()
+        self.summary_label = QLabel()
+        self.summary_label.setObjectName("seasonSummary")
+
+        layout.addWidget(QLabel("Season:"), 0, 0)
+        layout.addWidget(self.preset_combo, 0, 1, 1, 2)
+        layout.addWidget(QLabel("From"), 1, 0, Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(self.start_month, 1, 1)
+        layout.addWidget(self.start_day, 1, 2)
+        layout.addWidget(QLabel("To"), 2, 0, Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(self.end_month, 2, 1)
+        layout.addWidget(self.end_day, 2, 2)
+        layout.addWidget(self.summary_label, 3, 1, 1, 2)
+        self.set_range(start, end)
+
+    def _month_day_pair(self) -> tuple[QComboBox, QComboBox]:
+        month_combo = QComboBox()
+        month_combo.addItems(MONTH_ABBREVIATIONS)
+        month_combo.setMinimumContentsLength(3)
+        month_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        day_combo = QComboBox()
+        day_combo.setMinimumContentsLength(2)
+        day_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        day_combo.setMaxVisibleItems(16)
+        month_combo.currentIndexChanged.connect(
+            lambda _index, m=month_combo, d=day_combo: self._on_month_changed(m, d)
+        )
+        day_combo.currentIndexChanged.connect(self._on_fields_changed)
+        return month_combo, day_combo
+
+    @staticmethod
+    def _fill_days(month_combo: QComboBox, day_combo: QComboBox, day: int) -> None:
+        month = month_combo.currentIndex() + 1
+        count = DAYS_IN_MONTH[month - 1]
+        day_combo.blockSignals(True)
+        day_combo.clear()
+        day_combo.addItems([str(value) for value in range(1, count + 1)])
+        day_combo.setCurrentIndex(min(max(day, 1), count) - 1)
+        day_combo.blockSignals(False)
+
+    def _on_month_changed(self, month_combo: QComboBox, day_combo: QComboBox) -> None:
+        self._fill_days(month_combo, day_combo, day_combo.currentIndex() + 1)
+        self._on_fields_changed()
+
+    def _set_pair(
+        self, month_combo: QComboBox, day_combo: QComboBox, month_day: tuple[int, int]
+    ) -> None:
+        month, day = month_day
+        month_combo.blockSignals(True)
+        month_combo.setCurrentIndex(month - 1)
+        month_combo.blockSignals(False)
+        self._fill_days(month_combo, day_combo, day)
+
+    def set_range(self, start: tuple[int, int], end: tuple[int, int]) -> None:
+        self._updating = True
+        try:
+            self._set_pair(self.start_month, self.start_day, start)
+            self._set_pair(self.end_month, self.end_day, end)
+        finally:
+            self._updating = False
+        self._on_fields_changed()
+
+    def start(self) -> tuple[int, int]:
+        return (self.start_month.currentIndex() + 1, self.start_day.currentIndex() + 1)
+
+    def end(self) -> tuple[int, int]:
+        return (self.end_month.currentIndex() + 1, self.end_day.currentIndex() + 1)
+
+    def label(self) -> str:
+        return f"{format_month_day(self.start())} – {format_month_day(self.end())}"
+
+    def _apply_preset(self, text: str) -> None:
+        if self._updating:
+            return
+        if text == SEASON_AROUND_TODAY_TEXT:
+            start, end = around_date_season(datetime.now())
+        else:
+            match = next((p for p in SEASON_PRESETS if p[0] == text), None)
+            if match is None:
+                return
+            _label, start, end = match
+        self.set_range(start, end)
+        if text == SEASON_AROUND_TODAY_TEXT:
+            self._select_preset(SEASON_AROUND_TODAY_TEXT)
+
+    def _select_preset(self, text: str) -> None:
+        self._updating = True
+        try:
+            self.preset_combo.setCurrentText(text)
+        finally:
+            self._updating = False
+
+    def _on_fields_changed(self, _index: int | None = None) -> None:
+        if self._updating:
+            return
+        start, end = self.start(), self.end()
+        preset = next(
+            (label for label, p_start, p_end in SEASON_PRESETS
+             if (p_start, p_end) == (start, end)),
+            SEASON_CUSTOM_TEXT,
+        )
+        self._select_preset(preset)
+        days = season_length_days(start, end)
+        wraps = season_day_of_year(end) < season_day_of_year(start)
+        self.summary_label.setText(
+            f"{days} day{'s' if days != 1 else ''}"
+            + (" · crosses Jan 1" if wraps else "")
+        )
+        self.changed.emit()
 
 
 class EnhancedProgressWidget(QWidget):
@@ -3545,6 +4703,8 @@ class INatSeasonalVisualizer(QMainWindow):
         self.last_plot_args = None  # Initialize plot arguments cache
         self.api_search_worker = None
         self.local_search_worker = None
+        self.abundance_worker = None
+        self.abundance_view = None
         self.database_update_worker = None
         # In-memory cache for taxon IDs and descendants
         # Persisted to taxon_cache.json to minimize API calls and avoid recomputing descendants
@@ -4118,6 +5278,47 @@ class INatSeasonalVisualizer(QMainWindow):
         self.map_button.clicked.connect(self.open_map_dialog)
         self.map_button.setToolTip("Choose the graph center and radius on a map")
 
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems([SEASONAL_MODE_TEXT, ABUNDANCE_MODE_TEXT])
+        self.mode_combo.setToolTip(
+            "Seasonal graph: when is an organism seen at one place?\n"
+            "Abundance map: where is it seen most during part of the year?"
+        )
+        if not self.local_database_available:
+            abundance_item = self.mode_combo.model().item(1)
+            if abundance_item is not None:
+                abundance_item.setEnabled(False)
+                abundance_item.setToolTip(
+                    "Download observations.parquet to map abundance worldwide."
+                )
+
+        self.season_input = SeasonRangeWidget()
+        self.season_input.setToolTip(
+            "Time of year to map, matched in every year between Date From and "
+            "Date To. A range such as Nov 15 to Feb 10 crosses the new year."
+        )
+        self.grid_combo = QComboBox()
+        for label, _cell_deg in ABUNDANCE_GRID_OPTIONS:
+            self.grid_combo.addItem(label)
+        self.grid_combo.setCurrentIndex(ABUNDANCE_DEFAULT_GRID_INDEX)
+        self.grid_combo.setToolTip("Size of each map cell in degrees")
+        self.rank_combo = QComboBox()
+        self.rank_combo.addItems(["Observation count", "Share of all observations"])
+        self.rank_combo.setToolTip(
+            "Count favours places with many iNaturalist users. Share divides by "
+            "all observations in the cell during the season to correct for that."
+        )
+        self.min_obs_input = QSpinBox()
+        self.min_obs_input.setRange(1, 100000)
+        self.min_obs_input.setValue(10)
+        self.min_obs_input.setToolTip(
+            "When ranking by share, ignore cells with fewer observations of the "
+            "organism than this"
+        )
+        self.rank_combo.currentIndexChanged.connect(self._on_abundance_ranking_changed)
+        self.min_obs_input.valueChanged.connect(self._on_abundance_ranking_changed)
+
+        self.sidebar_layout.addRow("Mode:", self.mode_combo)
         self.sidebar_layout.addRow("Latitude:", self.lat_input)
         self.sidebar_layout.addRow("Longitude:", self.lon_input)
         self.sidebar_layout.addRow("Radius (km):", self.radius_input)
@@ -4126,6 +5327,11 @@ class INatSeasonalVisualizer(QMainWindow):
         self.sidebar_layout.addRow("Exclude:", self.exclude_input)
         self.sidebar_layout.addRow("Date From:", self.date_from)
         self.sidebar_layout.addRow("Date To:", self.date_to)
+        # Full-width row: the month/day pickers need more room than a field.
+        self.sidebar_layout.addRow(self.season_input)
+        self.sidebar_layout.addRow("Grid:", self.grid_combo)
+        self.sidebar_layout.addRow("Rank By:", self.rank_combo)
+        self.sidebar_layout.addRow("Min Obs:", self.min_obs_input)
         self.sidebar_layout.addRow("View:", self.view_combo)
         self.sidebar_layout.addRow("Graph Color:", self.color_input)
         self.sidebar_layout.addRow("Graph BG Color:", self.bg_color_input)
@@ -4143,6 +5349,14 @@ class INatSeasonalVisualizer(QMainWindow):
                 f"Use {LIVE_GRAPH_ACTION_TEXT} in the meantime."
             )
         self.sidebar_layout.addWidget(self.local_search_button)
+
+        self.abundance_button = QPushButton(ABUNDANCE_ACTION_TEXT)
+        self.abundance_button.clicked.connect(self.abundance_search)
+        self.abundance_button.setToolTip(
+            "Scan the local database for where the organism is observed most "
+            "during the chosen season"
+        )
+        self.sidebar_layout.addWidget(self.abundance_button)
 
         # Graph with live iNaturalist data button
         self.search_button = QPushButton(LIVE_GRAPH_ACTION_TEXT)
@@ -4197,7 +5411,11 @@ class INatSeasonalVisualizer(QMainWindow):
         try:
             self.figure, self.ax = plt.subplots()
             self.canvas = FigureCanvas(self.figure)
-            self.top_layout.addWidget(self.canvas, 3)
+            # The abundance map page is created on first use so its tile
+            # worker does not start (or touch the network) during startup.
+            self.view_stack = QStackedWidget()
+            self.view_stack.addWidget(self.canvas)
+            self.top_layout.addWidget(self.view_stack, 3)
 
             # Make sure the plot area can shrink instead of forcing the window wider
             self.canvas.setSizePolicy(
@@ -4227,9 +5445,75 @@ class INatSeasonalVisualizer(QMainWindow):
         # Apply initial theme
         self.apply_stylesheet()
 
+        self.mode_combo.currentIndexChanged.connect(self._apply_search_mode)
+        self._apply_search_mode()
+
+    def is_abundance_mode(self) -> bool:
+        return self.mode_combo.currentText() == ABUNDANCE_MODE_TEXT
+
+    def _apply_search_mode(self, _index: int | None = None) -> None:
+        """Show the sidebar rows and page that belong to the selected mode."""
+        abundance = self.is_abundance_mode()
+        for widget in (
+            self.lat_input,
+            self.lon_input,
+            self.radius_input,
+            self.map_button,
+            self.view_combo,
+        ):
+            self.sidebar_layout.setRowVisible(widget, not abundance)
+        for widget in (
+            self.season_input,
+            self.grid_combo,
+            self.rank_combo,
+            self.min_obs_input,
+        ):
+            self.sidebar_layout.setRowVisible(widget, abundance)
+        self.local_search_button.setVisible(not abundance)
+        self.search_button.setVisible(not abundance)
+        self.show_url_button.setVisible(not abundance)
+        self.abundance_button.setVisible(abundance)
+        self._update_min_obs_enabled()
+        if not hasattr(self, "view_stack"):
+            return
+        if abundance:
+            self.view_stack.setCurrentWidget(self._ensure_abundance_view())
+        else:
+            self.view_stack.setCurrentWidget(self.canvas)
+
+    def _ensure_abundance_view(self) -> "AbundanceMapView":
+        if self.abundance_view is None:
+            self.abundance_view = AbundanceMapView(self)
+            self.abundance_view.graph_requested.connect(self.graph_abundance_cell)
+            self.view_stack.addWidget(self.abundance_view)
+        return self.abundance_view
+
+    def _abundance_metric(self) -> str:
+        return "share" if self.rank_combo.currentIndex() == 1 else "count"
+
+    def _update_min_obs_enabled(self) -> None:
+        self.min_obs_input.setEnabled(self._abundance_metric() == "share")
+
+    def _on_abundance_ranking_changed(self, _value: int | None = None) -> None:
+        self._update_min_obs_enabled()
+        if self.abundance_view is not None:
+            self.abundance_view.set_ranking(
+                self._abundance_metric(), self.min_obs_input.value()
+            )
+
+    def graph_abundance_cell(self, lat: float, lon: float, radius: float) -> None:
+        """Switch to a seasonal graph centred on an abundance-map cell."""
+        self.lat_input.setText(f"{lat:.4f}")
+        self.lon_input.setText(f"{lon:.4f}")
+        self.radius_input.setText(f"{radius:g}")
+        self.mode_combo.setCurrentText(SEASONAL_MODE_TEXT)
+        self.local_search()
+
     def run_preferred_search(self) -> None:
         """Run a local search when available, otherwise use the online API."""
-        if self.local_database_available:
+        if self.is_abundance_mode():
+            self.abundance_search()
+        elif self.local_database_available:
             self.local_search()
         else:
             self.search_observations()
@@ -4505,6 +5789,8 @@ class INatSeasonalVisualizer(QMainWindow):
         """Toggle between dark and light mode for UI and graph."""
         self.settings.setValue("theme", mode)
         self.apply_stylesheet()
+        if self.abundance_view is not None:
+            self.abundance_view.apply_theme(normalize_theme(mode) == "dark")
 
     def choose_color(self) -> None:
         """Open a color dialog to choose the graph color."""
@@ -4581,6 +5867,24 @@ class INatSeasonalVisualizer(QMainWindow):
         )
         self.color_input.setText(self.settings.value("graph_color", "#1f77b4"))
         self.bg_color_input.setText(self.settings.value("graph_bg_color", ""))
+        saved_season = []
+        for key in ("abundance_season_from", "abundance_season_to"):
+            saved = QDate.fromString(
+                f"{ABUNDANCE_SEASON_YEAR}-{self.settings.value(key, '')}", "yyyy-MM-dd"
+            )
+            if saved.isValid():
+                saved_season.append((saved.month(), saved.day()))
+        if len(saved_season) == 2:
+            self.season_input.set_range(*saved_season)
+        grid_index = self.settings.value(
+            "abundance_grid_index", ABUNDANCE_DEFAULT_GRID_INDEX, int
+        )
+        if 0 <= grid_index < len(ABUNDANCE_GRID_OPTIONS):
+            self.grid_combo.setCurrentIndex(grid_index)
+        self.rank_combo.setCurrentIndex(
+            1 if self.settings.value("abundance_rank_by", "count") == "share" else 0
+        )
+        self.min_obs_input.setValue(self.settings.value("abundance_min_obs", 10, int))
 
     def save_settings(self) -> None:
         """Save current settings."""
@@ -4592,6 +5896,18 @@ class INatSeasonalVisualizer(QMainWindow):
             self.settings.setValue("graph_bg_color", self.bg_color_input.text())
             self.settings.setValue("app_font_size", self.app_font_size)
             self.settings.setValue("graph_font_size", self.graph_font_size)
+            self.settings.setValue(
+                "abundance_season_from",
+                "{:02d}-{:02d}".format(*self.season_input.start()),
+            )
+            self.settings.setValue(
+                "abundance_season_to", "{:02d}-{:02d}".format(*self.season_input.end())
+            )
+            self.settings.setValue(
+                "abundance_grid_index", self.grid_combo.currentIndex()
+            )
+            self.settings.setValue("abundance_rank_by", self._abundance_metric())
+            self.settings.setValue("abundance_min_obs", self.min_obs_input.value())
             QMessageBox.information(self, "Settings", "Settings saved successfully.")
         except ValueError as e:
             QMessageBox.warning(self, "Settings", f"Invalid input: {e!s}")
@@ -5095,33 +6411,9 @@ class INatSeasonalVisualizer(QMainWindow):
                 )
                 return
 
-            # Add taxon filter if organism is specified
-            taxon_ids = []
-            if organism:
-                taxon_id = self.get_taxon_id(organism)
-                if taxon_id:
-                    taxon_ids = self.get_descendant_taxon_ids(organism, taxon_id)
-                    if not taxon_ids:
-                        QMessageBox.warning(
-                            self,
-                            "Warning",
-                            f"No taxon IDs found for {organism}. Search may yield no results.",
-                        )
-                else:
-                    QMessageBox.warning(
-                        self,
-                        "Warning",
-                        f"Could not find taxon ID for {organism}. Search may yield no results.",
-                    )
-
-            # Add exclude filter
-            exclude_taxon_ids = []
-            if exclude:
-                exclude_taxon_id = self.get_taxon_id(exclude)
-                if exclude_taxon_id:
-                    exclude_taxon_ids = self.get_descendant_taxon_ids(
-                        exclude, exclude_taxon_id
-                    )
+            taxon_ids, exclude_taxon_ids = self._resolve_local_taxon_filters(
+                organism, exclude
+            )
 
             # Start database progress tracking with estimated progress
             self.enhanced_progress.db_tracker.start_operation("local database search")
@@ -5129,6 +6421,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.local_search_button.setEnabled(False)
             self.search_button.setEnabled(False)
             self.show_url_button.setEnabled(False)
+            self.mode_combo.setEnabled(False)
             self.cancel_search_button.setText("Cancel Search")
             self.cancel_search_button.setEnabled(True)
 
@@ -5177,12 +6470,192 @@ class INatSeasonalVisualizer(QMainWindow):
                 self.local_search_button.setEnabled(True)
                 self.search_button.setEnabled(True)
                 self.show_url_button.setEnabled(True)
+                self.mode_combo.setEnabled(True)
                 self.cancel_search_button.setEnabled(False)
                 self.cancel_search_button.setText("Cancel Search")
                 self.local_search_worker = None
             QMessageBox.critical(self, "Error", f"Local search failed: {e!s}")
             self.show_placeholder(f"Local search failed: {e!s}")
             logging.error(f"Local search failed: {e!s}")
+
+    def _resolve_local_taxon_filters(
+        self, organism: str, exclude: str
+    ) -> tuple[list[int], list[int]]:
+        """Expand the organism and exclude fields to descendant taxon IDs."""
+        taxon_ids = []
+        if organism:
+            taxon_id = self.get_taxon_id(organism)
+            if taxon_id:
+                taxon_ids = self.get_descendant_taxon_ids(organism, taxon_id)
+                if not taxon_ids:
+                    QMessageBox.warning(
+                        self,
+                        "Warning",
+                        f"No taxon IDs found for {organism}. Search may yield no results.",
+                    )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Warning",
+                    f"Could not find taxon ID for {organism}. Search may yield no results.",
+                )
+
+        exclude_taxon_ids = []
+        if exclude:
+            exclude_taxon_id = self.get_taxon_id(exclude)
+            if exclude_taxon_id:
+                exclude_taxon_ids = self.get_descendant_taxon_ids(
+                    exclude, exclude_taxon_id
+                )
+        return taxon_ids, exclude_taxon_ids
+
+    def _set_search_running(self, running: bool) -> None:
+        """Toggle the search buttons while a background search is active."""
+        self.local_search_button.setEnabled(
+            not running and self.local_database_available
+        )
+        self.abundance_button.setEnabled(not running and self.local_database_available)
+        self.search_button.setEnabled(not running)
+        self.show_url_button.setEnabled(not running)
+        self.mode_combo.setEnabled(not running)
+        self.cancel_search_button.setText("Cancel Search")
+        self.cancel_search_button.setEnabled(running)
+
+    def season_label(self) -> str:
+        return self.season_input.label()
+
+    def abundance_search(self) -> None:
+        """Map where the organism is observed most during the chosen season."""
+        if self.abundance_worker is not None and self.abundance_worker.isRunning():
+            self.status_bar.showMessage("Abundance search is already running...")
+            return
+        if not self.local_database_available or not os.path.exists(
+            self.observations_file
+        ):
+            QMessageBox.warning(
+                self,
+                "Local Database Required",
+                "Mapping abundance scans every observation worldwide, so it needs "
+                "the local observations.parquet database.",
+            )
+            return
+
+        organism = self.organism_input.text().strip()
+        if not organism:
+            QMessageBox.warning(
+                self, "Organism Required", "Enter an organism to map its abundance."
+            )
+            return
+
+        try:
+            exclude = self.exclude_input.text().strip()
+            date_from = self.date_from.text().strip()
+            date_to = self.date_to.text().strip()
+            season_start = self.season_input.start()
+            season_end = self.season_input.end()
+            cell_deg = ABUNDANCE_GRID_OPTIONS[self.grid_combo.currentIndex()][1]
+
+            taxon_ids, exclude_taxon_ids = self._resolve_local_taxon_filters(
+                organism, exclude
+            )
+            if not taxon_ids:
+                return
+
+            self._ensure_abundance_view()
+            self.enhanced_progress.db_tracker.start_operation("abundance map search")
+            self.status_bar.showMessage("Mapping abundance from local data...")
+            self._set_search_running(True)
+
+            worker = LocalAbundanceWorker(
+                self.observations_file,
+                date_from,
+                date_to,
+                season_start,
+                season_end,
+                cell_deg,
+                taxon_ids,
+                exclude_taxon_ids,
+            )
+            self.abundance_worker = worker
+            context = {
+                "organism": organism,
+                "date_from": date_from,
+                "date_to": date_to,
+                "season_label": self.season_label(),
+                "cell_deg": cell_deg,
+            }
+            worker.progress.connect(self._on_local_search_progress)
+            worker.search_finished.connect(
+                lambda cells, context=context: self._on_abundance_finished(
+                    cells, context
+                )
+            )
+            worker.search_failed.connect(self._on_abundance_failed)
+            worker.search_cancelled.connect(self._on_abundance_cancelled)
+            worker.finished.connect(self._on_abundance_worker_done)
+            worker.start()
+        except Exception as e:
+            self.enhanced_progress.hide_progress()
+            if self.abundance_worker is None or not self.abundance_worker.isRunning():
+                self._set_search_running(False)
+                self.abundance_worker = None
+            QMessageBox.critical(self, "Error", f"Abundance search failed: {e!s}")
+            logging.error("Abundance search failed: %s", e)
+
+    def _on_abundance_finished(
+        self, cells: list[dict[str, Any]], context: dict[str, Any]
+    ) -> None:
+        if self.abundance_worker is not None and self.abundance_worker.is_cancelled():
+            self._on_abundance_cancelled()
+            return
+        total = sum(cell["count"] for cell in cells)
+        self.enhanced_progress.db_tracker.estimated_total = total
+        self.enhanced_progress.db_tracker.finish_operation(
+            total, "Abundance search completed"
+        )
+        view = self._ensure_abundance_view()
+        view.set_results(
+            cells,
+            context["cell_deg"],
+            self._abundance_metric(),
+            self.min_obs_input.value(),
+            context,
+        )
+        if not cells:
+            self.status_bar.showMessage(
+                f"No observations of {context['organism']} found in that season."
+            )
+        else:
+            self.status_bar.showMessage(
+                f"Found {total:,} observations in {len(cells):,} map cells."
+            )
+        history_item = QListWidgetItem(
+            f"{context['organism']} | {context['season_label']} abundance (Local)"
+        )
+        history_item.setData(
+            Qt.ItemDataRole.UserRole, {"cells": cells, "context": context}
+        )
+        self.history_list.addItem(history_item)
+        self.info_bar.setText(
+            f"Source: Local abundance map, Organism: {context['organism']}, "
+            f"Season: {context['season_label']}, "
+            f"Dates: {context['date_from']} to {context['date_to']}, "
+            f"Grid: {context['cell_deg']:g}°, Cells: {len(cells):,}, "
+            f"Observations: {total:,}"
+        )
+
+    def _on_abundance_failed(self, error: str) -> None:
+        self.enhanced_progress.hide_progress()
+        QMessageBox.critical(self, "Error", f"Abundance search failed: {error}")
+        logging.error("Abundance search failed: %s", error)
+
+    def _on_abundance_cancelled(self) -> None:
+        self.enhanced_progress.finish_progress("Abundance search cancelled")
+        self.status_bar.showMessage("Abundance search cancelled.")
+
+    def _on_abundance_worker_done(self) -> None:
+        self._set_search_running(False)
+        self.abundance_worker = None
 
     def _on_local_search_progress(self, message: str) -> None:
         if message.startswith("Executing DuckDB query"):
@@ -5237,6 +6710,7 @@ class INatSeasonalVisualizer(QMainWindow):
         self.local_search_button.setEnabled(self.local_database_available)
         self.search_button.setEnabled(True)
         self.show_url_button.setEnabled(True)
+        self.mode_combo.setEnabled(True)
         self.cancel_search_button.setEnabled(False)
         self.cancel_search_button.setText("Cancel Search")
         self.local_search_worker = None
@@ -5248,14 +6722,18 @@ class INatSeasonalVisualizer(QMainWindow):
         # and a large result being plotted on the main thread.
         cancelling_api = self.api_search_worker is not None
         cancelling_local = self.local_search_worker is not None
-        if not cancelling_api and not cancelling_local:
+        cancelling_abundance = self.abundance_worker is not None
+        if not cancelling_api and not cancelling_local and not cancelling_abundance:
             self.cancel_search_button.setEnabled(False)
             self.status_bar.showMessage("No search is currently running.")
             return
 
         self.cancel_search_button.setText("Cancelling...")
         self.cancel_search_button.setEnabled(False)
-        if cancelling_local:
+        if cancelling_abundance:
+            self.abundance_worker.cancel()
+            message = "Cancelling abundance search..."
+        elif cancelling_local:
             self.local_search_worker.cancel()
             message = "Cancelling local search..."
         else:
@@ -5271,6 +6749,7 @@ class INatSeasonalVisualizer(QMainWindow):
         """Stop background workers before the window is destroyed."""
         for worker in (
             self.local_search_worker,
+            self.abundance_worker,
             self.api_search_worker,
             self.database_update_worker,
         ):
@@ -5282,6 +6761,8 @@ class INatSeasonalVisualizer(QMainWindow):
                 if not worker.wait(5000):
                     worker.terminate()
                     worker.wait()
+        if self.abundance_view is not None:
+            self.abundance_view.shutdown()
         super().closeEvent(a0)
 
     def search_observations(self) -> None:
@@ -5364,6 +6845,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.search_button.setEnabled(False)
             self.search_button.setText("Searching live iNat data...")
             self.show_url_button.setEnabled(False)
+            self.mode_combo.setEnabled(False)
             self.cancel_search_button.setText("Cancel Search")
             self.cancel_search_button.setEnabled(True)
             worker.start()
@@ -5374,6 +6856,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.search_button.setEnabled(True)
             self.search_button.setText(LIVE_GRAPH_ACTION_TEXT)
             self.show_url_button.setEnabled(True)
+            self.mode_combo.setEnabled(True)
             self.cancel_search_button.setEnabled(False)
             self.cancel_search_button.setText("Cancel Search")
             self.api_search_worker = None
@@ -5443,12 +6926,16 @@ class INatSeasonalVisualizer(QMainWindow):
         self.search_button.setEnabled(True)
         self.search_button.setText(LIVE_GRAPH_ACTION_TEXT)
         self.show_url_button.setEnabled(True)
+        self.mode_combo.setEnabled(True)
         self.cancel_search_button.setEnabled(False)
         self.cancel_search_button.setText("Cancel Search")
         self.api_search_worker = None
 
     def export_graph(self) -> None:
         """Export the current graph as an image with metadata."""
+        if self.is_abundance_mode():
+            self.export_abundance_map()
+            return
         if not self.canvas:
             QMessageBox.critical(
                 self, "Error", "No graph to export: Plot initialization failed."
@@ -5637,8 +7124,68 @@ class INatSeasonalVisualizer(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to export graph: {e!s}")
             logging.error(f"Export graph failed: {e!s}")
 
+    def export_abundance_data(self) -> None:
+        """Export the abundance map cells, ranked as currently shown, as CSV."""
+        view = self.abundance_view
+        if view is None or not view.cells:
+            QMessageBox.warning(self, "Error", "No abundance map data to export.")
+            return
+        file_dialog = QFileDialog(self, "Export Abundance Data", "", "CSV (*.csv)")
+        file_dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        if not file_dialog.exec():
+            return
+        filename = file_dialog.selectedFiles()[0]
+        try:
+            rows = []
+            for rank, cell in enumerate(
+                rank_abundance_cells(view.cells, view.metric, view.min_count), start=1
+            ):
+                rows.append(
+                    {
+                        "rank": rank,
+                        "place": view.place_names.get(abundance_cell_key(cell), ""),
+                        "cell_south_lat": cell["cell_lat"],
+                        "cell_west_lon": cell["cell_lon"],
+                        "cell_size_deg": cell["cell_deg"],
+                        "centroid_lat": round(cell["centroid_lat"], 4),
+                        "centroid_lon": round(cell["centroid_lon"], 4),
+                        "observations": cell["count"],
+                        "all_observations": cell["total"],
+                        "share": round(cell["share"], 6),
+                    }
+                )
+            pd.DataFrame(rows).to_csv(filename, index=False)
+            QMessageBox.information(self, "Success", f"Data exported to {filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export data: {e!s}")
+            logging.error("Export abundance data failed: %s", e)
+
+    def export_abundance_map(self) -> None:
+        """Save the abundance map as an image."""
+        view = self.abundance_view
+        if view is None or not view.cells:
+            QMessageBox.warning(self, "Error", "No abundance map to export.")
+            return
+        file_dialog = QFileDialog(
+            self, "Export Abundance Map", "", "PNG (*.png);;JPG (*.jpg)"
+        )
+        file_dialog.setDefaultSuffix("png")
+        file_dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        if not file_dialog.exec():
+            return
+        filename = file_dialog.selectedFiles()[0]
+        try:
+            view.figure.savefig(filename, dpi=200, facecolor=view.figure.get_facecolor())
+            QMessageBox.information(self, "Success", f"Map exported to {filename}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export map: {e!s}")
+            logging.error("Export abundance map failed: %s", e)
+
     def export_data(self) -> None:
         """Export observation data as CSV."""
+        if self.is_abundance_mode():
+            self.export_abundance_data()
+            return
         observations = self.history_list.property("data") or []
         if not observations:
             QMessageBox.warning(self, "Error", "No data to export.")
@@ -5684,6 +7231,24 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def load_history_item(self) -> None:
         """Load and replot a history item."""
+        current_item = self.history_list.currentItem()
+        abundance = (
+            current_item.data(Qt.ItemDataRole.UserRole)
+            if current_item is not None
+            else None
+        )
+        if isinstance(abundance, dict) and "cells" in abundance:
+            self.mode_combo.setCurrentText(ABUNDANCE_MODE_TEXT)
+            context = abundance["context"]
+            self._ensure_abundance_view().set_results(
+                abundance["cells"],
+                context["cell_deg"],
+                self._abundance_metric(),
+                self.min_obs_input.value(),
+                context,
+            )
+            return
+
         observations = self.history_list.property("data") or []
         if not observations:
             return

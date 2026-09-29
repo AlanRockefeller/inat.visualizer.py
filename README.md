@@ -1,16 +1,18 @@
 # iNaturalist Seasonal Visualizer
 
-# By Alan Rockefeller - July 20, 2026
+# By Alan Rockefeller - September 28, 2026
 
-Current source version: **1.0.8**. See [CHANGELOG.md](CHANGELOG.md) for release
+Current source version: **1.0.9**. See [CHANGELOG.md](CHANGELOG.md) for release
 details.
 
 A desktop GUI app for exploring **seasonal patterns in iNaturalist observations** within a geographic radius. Search by organism (anything from a genus/species to higher taxa like _Agaricales_), choose a date range, and plot observation frequency by **day**, **week**, or **month** of the year.
 
-The app supports two search modes:
+The app supports two search sources:
 
 - **Graph with local data (fast, offline-ish):** Queries a local `observations.parquet` file using DuckDB (recommended).
 - **Graph with live iNat data (online):** Queries the iNaturalist API via `pyinaturalist` (slower and rate-limited, but works without local data).
+
+It can also answer the reverse question. The **Abundance map** mode takes an organism and a time of year (for example Oct 1 – Nov 30) and maps **where in the world** it is observed most. It scans the whole local database in about a second, even for higher taxa like _Agaricales_.
 
 It also includes an **interactive map dialog** (OpenStreetMap tiles) to set coordinates and radius visually, plus export options for both graphs and data.
 
@@ -20,6 +22,7 @@ It also includes an **interactive map dialog** (OpenStreetMap tiles) to set coor
 
 - **Interactive GUI** (PyQt6 + Matplotlib) with a sidebar of search controls and a live plot.
 - **Local database mode** using DuckDB against `observations.parquet` for fast queries.
+- **Abundance map mode**: pick an organism and a time of year to see where in the world it is observed most, as a heatmap plus a ranked list of place names (local database).
 - **Taxonomy expansion** using `taxonomy.parquet` to include _all descendant taxa_ of a selected organism (recursive query).
 - **Taxon cache** (`taxon_cache.json`) to avoid repeated API lookups and repeated descendant expansion.
 - **Interactive map picker** for latitude/longitude + radius:
@@ -268,6 +271,39 @@ Logs go to:
    - **Graph with local data** (fast, when the optional database is installed)
    - **Graph with live iNat data** (online, rate-limited, and available without local data)
 
+### Abundance map mode (where is it most abundant?)
+
+Set **Mode** to **Abundance map** to find where an organism is observed most
+during part of the year. This mode needs the local `observations.parquet`
+database, because it counts every matching observation worldwide.
+
+1. Enter an **Organism** (required) and, optionally, an **Exclude** taxon.
+2. Choose the **Season**. Pick a preset (a single month, Spring/Summer/Fall/
+   Winter, or "Around today (± 2 weeks)"), or set the **From** and **To** month
+   and day menus directly. A range such as `Nov 15` – `Feb 10` crosses the new
+   year, and the line under the pickers shows how many days are selected.
+   **Date From** / **Date To** still limit which years are included.
+3. Pick a **Grid** cell size (0.25°–2°).
+4. Click **Map abundance (local data)**.
+
+The map colors each grid cell by how often the organism was observed there. The
+panel beside it lists the top 25 cells, labelled with iNaturalist place names
+when online.
+
+- **Rank By → Observation count** shows raw counts. These favour places with
+  many iNaturalist users.
+- **Rank By → Share of all observations** divides by every observation made in
+  that cell during the same season. This corrects for observer effort. Cells
+  with fewer than **Min Obs** observations of the organism are ignored so tiny
+  samples don't dominate.
+- **Hide map** removes the OpenStreetMap base map and shows only the observation
+  cells on a black background, which makes the pattern easier to see. Click
+  **Show map** to bring it back. The choice is remembered.
+- Click a row, or a colored cell on the map, to zoom there. Then use
+  **Graph seasonality here** (or double-click the row) to switch back to the
+  seasonal graph for a circle covering that cell.
+- **File → Export** saves the map image or the full ranked cell table as CSV.
+
 ---
 
 ## Taxon ID caching
@@ -310,11 +346,15 @@ SQLite space without deleting valid entries.
 
 ## Map tile caching
 
-The map dialog fetches OpenStreetMap tiles and caches them:
+The map dialog and the abundance map fetch OpenStreetMap tiles and cache them:
 
 - In RAM: LRU cache up to `MAX_CACHE_SIZE` tiles
 - On disk: `tile_cache/` inside the runtime data directory, with pruning to
   ~`200 MB`
+
+OpenStreetMap sometimes answers with its "Access blocked" placeholder image
+while still reporting success. The app recognizes that image, backs off as it
+would for an HTTP 403, and removes any copies that were cached earlier.
 
 ---
 
