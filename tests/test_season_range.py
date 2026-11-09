@@ -35,6 +35,12 @@ class SeasonHelperTests(unittest.TestCase):
     def test_format(self):
         self.assertEqual(format_month_day((11, 15)), "Nov 15")
 
+    def test_length_counts_days_on_a_leap_year_calendar(self):
+        # The widget's day count follows a leap-year calendar, so a window
+        # across the end of February is one day longer than in a common year.
+        self.assertEqual(season_length_days((2, 6), (3, 6)), 30)
+        self.assertEqual(season_length_days((6, 1), (6, 29)), 29)
+
 
 class SeasonRangeWidgetTests(unittest.TestCase):
     def test_presets_fields_and_day_lists_offscreen(self) -> None:
@@ -74,8 +80,16 @@ class SeasonRangeWidgetTests(unittest.TestCase):
             widget.set_range((6, 1), (8, 31))
             assert widget.preset_combo.currentText() == "Summer (Jun – Aug)"
 
+            # Freeze "today" so the check does not depend on the run date (a
+            # window across Feb 29 counts 30 days on the leap-year calendar).
+            from datetime import datetime
+            real_around = visualizer.around_date_season
+            visualizer.around_date_season = (
+                lambda today, days=14: real_around(datetime(2026, 6, 15), days)
+            )
             widget.preset_combo.setCurrentText(visualizer.SEASON_AROUND_TODAY_TEXT)
             assert widget.preset_combo.currentText() == visualizer.SEASON_AROUND_TODAY_TEXT
+            assert (widget.start(), widget.end()) == ((6, 1), (6, 29))
             assert visualizer.season_length_days(widget.start(), widget.end()) == 29
             """)
         env = os.environ.copy()

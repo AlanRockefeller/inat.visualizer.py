@@ -169,3 +169,74 @@ class DescendantTaxonTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RowQueryRequirementsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_row_query_requires_id_but_date_counts_do_not(self):
+        path = os.path.join(self.tmp.name, "observations.parquet")
+        frame = pd.DataFrame([obs(1, 10.0, 20.0, "2020-06-01")]).drop(columns=["id"])
+        frame["eventDate"] = pd.to_datetime(frame["eventDate"]).dt.date
+        frame.to_parquet(path, index=False)
+        with self.assertRaisesRegex(ValueError, "id"):
+            run_local_observation_query(path, "2000-01-01", "2030-01-01", 10.0, 20.0, 50)
+        counts = run_local_date_counts(path, "2000-01-01", "2030-01-01", 10.0, 20.0, 50)
+        self.assertEqual(int(counts["count"].sum()), 1)
+
+    def test_limit_caps_the_rows_returned(self):
+        path = write_observations(
+            self.tmp.name, [obs(i, 10.0, 20.0, "2020-06-01") for i in range(1, 6)]
+        )
+        rows, count = run_local_observation_query(
+            path, "2000-01-01", "2030-01-01", 10.0, 20.0, 50, estimate_count=False, limit=3
+        )
+        self.assertEqual((len(rows), count), (3, 3))
+
+
+class AbundanceQueryRobustnessTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_null_coordinates_are_skipped_and_plus_180_joins_minus_180(self):
+        from inat_core import run_local_abundance_query
+
+        rows = [
+            obs(1, -16.5, 180.0, "2020-06-01"),
+            obs(2, -16.5, -179.5, "2020-06-02"),
+            obs(3, None, None, "2020-06-03"),
+            obs(4, 10.0, 20.0, "2020-06-04"),
+        ]
+        path = write_observations(self.tmp.name, rows)
+        cells = run_local_abundance_query(
+            path, "2000-01-01", "2030-01-01", (6, 1), (6, 30), 1.0, [1]
+        )
+        by_lon = {cell["cell_lon"]: cell for cell in cells}
+        self.assertEqual(sorted(by_lon), [-180.0, 20.0])
+        self.assertEqual(by_lon[-180.0]["count"], 2)
+        self.assertAlmostEqual(by_lon[-180.0]["centroid_lon"], -179.75)
+
+    def test_cancellation_is_checked_while_building_cells(self):
+        from inat_core import SearchCancelled, run_local_abundance_query
+
+        path = write_observations(self.tmp.name, [obs(1, 10.0, 20.0, "2020-06-01")])
+        calls = {"n": 0}
+
+        def cancel_after_query():
+            calls["n"] += 1
+            return calls["n"] > 3
+
+        with self.assertRaises(SearchCancelled):
+            run_local_abundance_query(
+                path, "2000-01-01", "2030-01-01", (6, 1), (6, 30), 1.0, [1],
+                cancel_callback=cancel_after_query,
+            )
+
+
+class MissingRootTaxonTests(DescendantTaxonTests):
+    def test_children_of_a_missing_root_row_are_still_found(self):
+        path = self.write_taxonomy([{"id": 2, "parent_id": 1}, {"id": 3, "parent_id": 2}])
+        self.assertEqual(sorted(descendant_taxon_ids(path, 1)), [1, 2, 3])

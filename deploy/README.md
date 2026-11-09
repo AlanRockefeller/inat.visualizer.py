@@ -58,9 +58,11 @@ installs dependencies, restarts the service, and smoke-tests the public URL.
 ## Database updates
 
 `inat-visualizer-update.timer` rebuilds the Parquet files every Sunday morning
-with `update_database.py`. The new files are swapped in atomically, and the
-server clears its caches when their size or mtime changes, so no restart is
-needed. To run it now: `sudo systemctl start inat-visualizer-update` and follow
+with `update_database.py`. Each new file is swapped in atomically (taxonomy
+first, then observations, so a query in the second or so between the two swaps
+can pair the new taxonomy with the old observations), and the server clears its
+caches when their size or mtime changes, so no restart is needed. Results
+computed while a swap lands are not cached. To run it now: `sudo systemctl start inat-visualizer-update` and follow
 it with `journalctl -fu inat-visualizer-update`.
 
 ## Tile cache
@@ -87,6 +89,7 @@ it with `journalctl -fu inat-visualizer-update`.
 | `INAT_QUERY_TIMEOUT` | `90` | Seconds before a query is interrupted (HTTP 504) |
 | `INAT_MAX_CSV_ROWS` | `500000` | Largest CSV download |
 | `INAT_RESULT_CACHE_ENTRIES` | `256` | Cached query results |
+| `INAT_RESULT_CACHE_MB` | `64` | Budget for cached results, measured as JSON size |
 
 ## Running locally
 

@@ -22,6 +22,14 @@ REQUIRED_OBSERVATION_COLUMNS = (
     "decimallongitude",
     "taxonid",
 )
+# Queries that return individual rows also need the observation id.
+REQUIRED_ROW_COLUMNS = REQUIRED_OBSERVATION_COLUMNS + ("id",)
+# Longitude in [-180, 180): the data keeps +180 as a legal value, and a cell
+# or box starting at +180 would otherwise be counted apart from -180.
+NORMALIZED_LONGITUDE_SQL = (
+    "(CASE WHEN decimalLongitude >= 180 THEN decimalLongitude - 360 "
+    "ELSE decimalLongitude END)"
+)
 
 # Great-circle distance in km from (?, ?) = (lat, lon) placeholders, in the
 # order: lat, lat, lon. DuckDB-native math so large scans never call Python.
@@ -99,11 +107,13 @@ def radius_where_sql(
 
     The date and bounding-box predicates let DuckDB skip Parquet row groups
     from their min/max statistics. Callers append the exact great-circle test.
+    eventDate is cast to DATE so a timestamp column still includes the whole
+    final day; on a DATE column the cast is a no-op.
     """
     lat_min, lat_max, lon_min, lon_max = calculate_local_search_bounds(lat, lon, radius)
     lon_sql, lon_params = longitude_filter_sql(lon_min, lon_max)
     where = f"""
-            WHERE eventDate BETWEEN ? AND ?
+            WHERE CAST(eventDate AS DATE) BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
             AND decimalLatitude BETWEEN ? AND ?
             AND {lon_sql}
     """
@@ -147,19 +157,20 @@ def raise_if_search_cancelled(cancel_callback=None) -> None:
         raise SearchCancelled
 
 
-def check_observation_columns(con, escaped_path: str) -> None:
-    """Raise ValueError if observations.parquet lacks a column the queries use."""
+def check_observation_columns(
+    con, escaped_path: str, required: tuple[str, ...] = REQUIRED_OBSERVATION_COLUMNS
+) -> None:
+    """Raise ValueError if observations.parquet lacks a column the query uses."""
     schema = con.execute(f"DESCRIBE SELECT * FROM '{escaped_path}'").fetchall()
     column_names = [row[0].lower() for row in schema]
-    missing_columns = [
-        col for col in REQUIRED_OBSERVATION_COLUMNS if col not in column_names
-    ]
+    missing_columns = [col for col in required if col not in column_names]
     if missing_columns:
         raise ValueError(
             "Missing required columns in observations.parquet: "
             + ", ".join(missing_columns)
             + ". The file must include eventDate, decimalLatitude, "
-            "decimalLongitude, and taxonID."
+            "decimalLongitude, taxonID"
+            + (", and id." if "id" in required else ".")
         )
 
 
@@ -206,12 +217,14 @@ def run_local_observation_query(
     cancel_callback=None,
     connection_callback=None,
     estimate_count: bool = True,
+    limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Query observations.parquet for local observations.
 
     Returns the matching rows and a count. With ``estimate_count`` the count is
     a preliminary bounding-box count used for progress messages, which costs a
     second scan of the file; without it the count is simply the number of rows.
+    ``limit`` caps the number of rows fetched.
     """
     taxon_ids = taxon_ids or []
     exclude_taxon_ids = exclude_taxon_ids or []
@@ -226,7 +239,7 @@ def run_local_observation_query(
         raise_if_search_cancelled(cancel_callback)
         if progress_callback:
             progress_callback("Checking observations.parquet schema...")
-        check_observation_columns(con, escaped_path)
+        check_observation_columns(con, escaped_path, REQUIRED_ROW_COLUMNS)
         raise_if_search_cancelled(cancel_callback)
 
         filter_sql = taxon_filter_sql(con, taxon_ids, exclude_taxon_ids)
@@ -258,6 +271,9 @@ def run_local_observation_query(
             AND {HAVERSINE_KM_SQL} <= ?
         """
         query_params = where_params + [lat, lat, lon, radius]
+        if limit is not None:
+            query += " LIMIT ?"
+            query_params.append(int(limit))
         results = con.execute(query, query_params).fetchall()
         raise_if_search_cancelled(cancel_callback)
 
@@ -397,19 +413,22 @@ def run_local_abundance_query(
 
         if progress_callback:
             progress_callback("Scanning all observations for the selected season...")
+        lon_sql = NORMALIZED_LONGITUDE_SQL
         query = f"""
             SELECT
                 CAST(floor(CAST(decimalLatitude AS DOUBLE) / ?) AS BIGINT) AS lat_index,
-                CAST(floor(CAST(decimalLongitude AS DOUBLE) / ?) AS BIGINT) AS lon_index,
+                CAST(floor(CAST({lon_sql} AS DOUBLE) / ?) AS BIGINT) AS lon_index,
                 count(*) FILTER (WHERE {target_sql}) AS target_count,
                 count(*) AS total_count,
                 avg(CAST(decimalLatitude AS DOUBLE)) FILTER (WHERE {target_sql})
                     AS centroid_lat,
-                avg(CAST(decimalLongitude AS DOUBLE)) FILTER (WHERE {target_sql})
+                avg(CAST({lon_sql} AS DOUBLE)) FILTER (WHERE {target_sql})
                     AS centroid_lon
             FROM '{escaped_path}'
             WHERE CAST(eventDate AS DATE) BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
             AND {season_sql}
+            AND decimalLatitude IS NOT NULL
+            AND decimalLongitude IS NOT NULL
             GROUP BY lat_index, lon_index
             HAVING target_count > 0
         """
@@ -420,14 +439,16 @@ def run_local_abundance_query(
         if progress_callback:
             progress_callback("Processing results...")
         cells = []
-        for (
+        for index, (
             lat_index,
             lon_index,
             target_count,
             total_count,
             centroid_lat,
             centroid_lon,
-        ) in rows:
+        ) in enumerate(rows):
+            if index % 1000 == 0:
+                raise_if_search_cancelled(cancel_callback)
             cells.append(
                 {
                     "cell_lat": lat_index * cell_deg,
@@ -440,6 +461,7 @@ def run_local_abundance_query(
                     "centroid_lon": float(centroid_lon),
                 }
             )
+        raise_if_search_cancelled(cancel_callback)
         cells.sort(key=lambda cell: cell["count"], reverse=True)
         return cells
     finally:
@@ -521,6 +543,8 @@ def descendant_taxon_ids(
 ) -> list[int]:
     """Return ``taxon_id`` and every descendant ID listed in taxonomy.parquet.
 
+    The recursion is seeded with the requested ID itself rather than its
+    taxonomy row, so children are still found when the root row is missing.
     ``UNION`` rather than ``UNION ALL`` feeds only new IDs into the next
     round, so a parent cycle in a damaged taxonomy ends the recursion instead
     of running forever. The callbacks let the web server apply its connection
@@ -536,7 +560,7 @@ def descendant_taxon_ids(
         results = con.execute(
             """
             WITH RECURSIVE descendants AS (
-                SELECT id FROM taxonomy WHERE id = ?
+                SELECT CAST(? AS BIGINT) AS id
                 UNION
                 SELECT t.id FROM taxonomy t
                 JOIN descendants d ON t.parent_id = d.id
@@ -550,10 +574,7 @@ def descendant_taxon_ids(
         if connection_callback:
             connection_callback(None)
         con.close()
-    descendants = [row[0] for row in results]
-    if taxon_id not in descendants:
-        descendants.append(taxon_id)
-    return descendants
+    return [int(row[0]) for row in results]
 
 
 SEASONAL_BIN_COUNTS = {"daily": 366, "weekly": 52, "monthly": 12}

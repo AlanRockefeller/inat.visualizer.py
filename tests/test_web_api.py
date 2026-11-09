@@ -1,18 +1,26 @@
+import asyncio
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 import pandas as pd
 
+from inat_core import SearchCancelled
+
 try:
+    # Desktop-only environments do not install requirements-web.txt. Only the
+    # optional dependencies are probed here, so a failure inside webapp.server
+    # itself still fails the tests instead of skipping them.
+    import fastapi  # noqa: F401
+    import httpx  # noqa: F401
+except ImportError:
+    server = None
+else:
     from fastapi.testclient import TestClient
 
     from webapp import server
-except (ImportError, RuntimeError):
-    # Desktop-only environments do not install requirements-web.txt. Starlette
-    # raises RuntimeError rather than ImportError when httpx is missing.
-    server = None
 
 SF = (37.7749, -122.4194)
 NEW_YORK = (40.7128, -74.0060)
@@ -127,11 +135,17 @@ class WebApiTests(unittest.TestCase):
     def test_security_headers(self):
         response = self.client.get("/api/stats")
         self.assertEqual(response.headers["x-content-type-options"], "nosniff")
-        self.assertEqual(response.headers["referrer-policy"], "strict-origin-when-cross-origin")
+        self.assertEqual(
+            response.headers["referrer-policy"], "strict-origin-when-cross-origin"
+        )
 
     def test_seasonal_across_antimeridian(self):
-        fiji_side = {"id": 20, "lat": -16.5, "lon": 179.9, "taxonID": 3, "eventDate": "2020-06-01"}
-        far_side = {"id": 21, "lat": -16.5, "lon": -179.9, "taxonID": 3, "eventDate": "2020-06-02"}
+        fiji_side = {
+            "id": 20, "lat": -16.5, "lon": 179.9, "taxonID": 3, "eventDate": "2020-06-01"
+        }
+        far_side = {
+            "id": 21, "lat": -16.5, "lon": -179.9, "taxonID": 3, "eventDate": "2020-06-02"
+        }
         write_observations(self.observations, OBSERVATIONS + [fiji_side, far_side])
         body = self.seasonal(lat=-16.5, lon=179.95, radius=100).json()
         self.assertEqual(body["total"], 2)
@@ -145,10 +159,50 @@ class WebApiTests(unittest.TestCase):
         cache.put("key", "fresh", server.database_signature())
         self.assertEqual(cache.get("key"), "fresh")
 
+    def test_result_cache_is_bounded_by_bytes(self):
+        cache = server.LruCache(10, max_bytes=100, size_of=server.json_size)
+        signature = server.database_signature()
+        cache.put("big", {"cells": list(range(200))}, signature)
+        self.assertIsNone(cache.get("big"))
+        for index in range(6):
+            cache.put(index, {"cells": [index] * 5}, signature)  # about 20 bytes each
+        self.assertLessEqual(cache.total_bytes, 100)
+        self.assertIsNone(cache.get(0))  # evicted to stay within the budget
+        self.assertIsNotNone(cache.get(5))
+
+    def test_busy_server_returns_503_instead_of_queueing_forever(self):
+        with (
+            patch.object(server, "query_semaphore", asyncio.Semaphore(0)),
+            patch.object(server, "QUERY_TIMEOUT_SECONDS", 0.2),
+        ):
+            response = self.seasonal()
+        self.assertEqual(response.status_code, 503)
+
+    def test_timeout_interrupts_the_query_and_frees_the_slot(self):
+        observed = {"cancelled": False}
+
+        def slow_query(cancel_callback=None, connection_callback=None, **_kwargs):
+            while not cancel_callback():
+                time.sleep(0.01)
+            observed["cancelled"] = True
+            raise SearchCancelled
+
+        semaphore = asyncio.Semaphore(1)
+        with (
+            patch.object(server, "run_local_date_counts", slow_query),
+            patch.object(server, "query_semaphore", semaphore),
+            patch.object(server, "QUERY_TIMEOUT_SECONDS", 0.2),
+        ):
+            response = self.seasonal()
+        self.assertEqual(response.status_code, 504)
+        self.assertTrue(observed["cancelled"])
+        self.assertEqual(semaphore._value, 1)
+
     def test_descendants_of_cyclic_taxonomy_terminate(self):
-        pd.DataFrame([{"id": 1, "parent_id": 3}, {"id": 2, "parent_id": 1}, {"id": 3, "parent_id": 2}]).astype(
-            {"parent_id": "Int32"}
-        ).to_parquet(self.taxonomy, index=False)
+        cyclic = [{"id": 1, "parent_id": 3}, {"id": 2, "parent_id": 1}, {"id": 3, "parent_id": 2}]
+        pd.DataFrame(cyclic).astype({"parent_id": "Int32"}).to_parquet(
+            self.taxonomy, index=False
+        )
         body = self.seasonal(taxon_id=1).json()
         self.assertEqual(body["taxa_included"], 3)
 

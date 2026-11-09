@@ -1108,11 +1108,11 @@ def fetch_all_observation_pages(
                     return all_results, None
                 if page * per_page >= INATURALIST_MAX_SEARCH_RESULTS:
                     message = (
-                        f"iNaturalist only pages through the most recent "
-                        f"{INATURALIST_MAX_SEARCH_RESULTS:,} observations of a search, "
-                        f"but {total_results:,} matched. The graph shows those "
-                        f"{len(all_results):,}; narrow the date range or radius to "
-                        "see them all."
+                        "iNaturalist only pages through the most recent "
+                        f"{INATURALIST_MAX_SEARCH_RESULTS:,} observations of a "
+                        f"search, but {total_results:,} matched. The graph shows "
+                        f"those {len(all_results):,}; narrow the date range or "
+                        "radius to see them all."
                     )
                     logging.warning(message)
                     if warning_callback:

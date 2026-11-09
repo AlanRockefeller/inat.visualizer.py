@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import io
+import json
 import logging
 import os
 import re
@@ -58,6 +59,10 @@ DUCKDB_TEMP_DIR = os.environ.get(
     "INAT_DUCKDB_TEMP_DIR", os.path.join(tempfile.gettempdir(), "inat-visualizer-duckdb")
 )
 RESULT_CACHE_ENTRIES = int(os.environ.get("INAT_RESULT_CACHE_ENTRIES", "256"))
+# Budget for cached results, measured as the size of their JSON. Broad
+# abundance searches at 0.25 degrees return tens of thousands of cells, so an
+# entry count alone would not bound memory.
+RESULT_CACHE_MB = float(os.environ.get("INAT_RESULT_CACHE_MB", "64"))
 MAX_CSV_ROWS = int(os.environ.get("INAT_MAX_CSV_ROWS", "500000"))
 MAX_TAXON_FILTERS = 10
 # How often a running query checks whether the browser has gone away.
@@ -113,11 +118,24 @@ app.add_middleware(SecurityHeadersMiddleware)
 
 
 class LruCache:
-    """Small thread-safe LRU cache that empties when the database files change."""
+    """Small thread-safe LRU cache that empties when the database files change.
 
-    def __init__(self, max_entries: int) -> None:
+    ``max_bytes`` bounds the total of ``size_of(value)`` over the entries; a
+    value larger than the whole budget is not cached at all.
+    """
+
+    def __init__(
+        self,
+        max_entries: int,
+        max_bytes: int | None = None,
+        size_of: Callable[[Any], int] | None = None,
+    ) -> None:
         self.max_entries = max_entries
+        self.max_bytes = max_bytes
+        self._size_of = size_of
         self._items: OrderedDict[Any, Any] = OrderedDict()
+        self._sizes: dict[Any, int] = {}
+        self._total_bytes = 0
         self._signature: tuple | None = None
         self._lock = threading.Lock()
 
@@ -125,7 +143,17 @@ class LruCache:
         signature = database_signature()
         if signature != self._signature:
             self._items.clear()
+            self._sizes.clear()
+            self._total_bytes = 0
             self._signature = signature
+
+    def _evict(self, key: Any) -> None:
+        del self._items[key]
+        self._total_bytes -= self._sizes.pop(key, 0)
+
+    @property
+    def total_bytes(self) -> int:
+        return self._total_bytes
 
     def get(self, key: Any) -> Any:
         with self._lock:
@@ -147,10 +175,18 @@ class LruCache:
             self._check_signature()
             if signature is not None and signature != self._signature:
                 return
+            size = self._size_of(value) if self._size_of else 0
+            if self.max_bytes is not None and size > self.max_bytes:
+                return
+            if key in self._items:
+                self._evict(key)
             self._items[key] = value
-            self._items.move_to_end(key)
-            while len(self._items) > self.max_entries:
-                self._items.popitem(last=False)
+            self._sizes[key] = size
+            self._total_bytes += size
+            while len(self._items) > self.max_entries or (
+                self.max_bytes is not None and self._total_bytes > self.max_bytes
+            ):
+                self._evict(next(iter(self._items)))
 
 
 def database_signature() -> tuple:
@@ -165,8 +201,14 @@ def database_signature() -> tuple:
     return tuple(signature)
 
 
+def json_size(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":")))
+
+
 descendant_cache = LruCache(2048)
-result_cache = LruCache(RESULT_CACHE_ENTRIES)
+result_cache = LruCache(
+    RESULT_CACHE_ENTRIES, max_bytes=int(RESULT_CACHE_MB * 1024 * 1024), size_of=json_size
+)
 query_semaphore: asyncio.Semaphore | None = None
 
 
@@ -196,9 +238,10 @@ async def run_limited_query(
     """Run a DuckDB query in a thread with concurrency, memory and time limits.
 
     Starlette keeps running a handler after the browser has given up, so the
-    query is also watched for a client disconnect. On timeout or disconnect
-    the DuckDB connection is interrupted, and the concurrency slot is only
-    released once the thread has really stopped.
+    request is watched for a client disconnect both while it waits for a slot
+    and while the query runs. On timeout or disconnect the DuckDB connection
+    is interrupted, and the concurrency slot is only released once the thread
+    has really stopped.
     """
     state: dict[str, Any] = {"connection": None, "cancelled": False}
     lock = threading.Lock()
@@ -216,7 +259,28 @@ async def run_limited_query(
                 state["connection"].interrupt()
         await asyncio.gather(task, return_exceptions=True)
 
-    async with get_query_semaphore():
+    async def disconnected() -> bool:
+        return request is not None and await request.is_disconnected()
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + QUERY_TIMEOUT_SECONDS
+    semaphore = get_query_semaphore()
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise HTTPException(503, "The server is busy. Please try again in a moment.")
+        try:
+            await asyncio.wait_for(
+                semaphore.acquire(), min(remaining, DISCONNECT_POLL_SECONDS)
+            )
+            break
+        except asyncio.TimeoutError:
+            if await disconnected():
+                raise HTTPException(499, "The client closed the request") from None
+
+    try:
+        if await disconnected():
+            raise HTTPException(499, "The client closed the request")
         task = asyncio.ensure_future(
             asyncio.to_thread(
                 function,
@@ -225,8 +289,6 @@ async def run_limited_query(
                 **kwargs,
             )
         )
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + QUERY_TIMEOUT_SECONDS
         try:
             while True:
                 remaining = deadline - loop.time()
@@ -241,7 +303,7 @@ async def run_limited_query(
                 )
                 if done:
                     return task.result()
-                if request is not None and await request.is_disconnected():
+                if await disconnected():
                     await stop(task)
                     raise HTTPException(499, "The client closed the request")
         except asyncio.CancelledError:
@@ -251,6 +313,8 @@ async def run_limited_query(
             raise HTTPException(
                 503, "The server ran out of memory for this query. Try a narrower search."
             ) from None
+    finally:
+        semaphore.release()
 
 
 async def expand_taxa(
@@ -361,11 +425,13 @@ async def seasonal(
     validate_date_range(date_from, date_to)
     validate_taxon_list("taxon_id", taxon_id)
     validate_taxon_list("exclude_taxon_id", exclude_taxon_id)
+    # Round to about a metre so the cache key and the query use the same values.
+    lat, lon, radius = round(lat, 5), round(lon, 5), round(radius, 3)
     key = (
         "seasonal",
-        round(lat, 5),
-        round(lon, 5),
-        round(radius, 3),
+        lat,
+        lon,
+        radius,
         date_from,
         date_to,
         tuple(sorted(taxon_id)),
@@ -428,7 +494,15 @@ async def seasonal(
         taxon_ids=taxon_ids,
         exclude_taxon_ids=exclude_ids,
         estimate_count=False,
+        limit=MAX_CSV_ROWS + 1,
     )
+    if len(observations) > MAX_CSV_ROWS:
+        # The database may have changed since the cached total was computed.
+        raise HTTPException(
+            413,
+            f"More than {MAX_CSV_ROWS:,} observations match, which is over the CSV "
+            "limit. Narrow the search to download the data.",
+        )
     body = await asyncio.to_thread(observations_csv, observations)
     return Response(
         body,

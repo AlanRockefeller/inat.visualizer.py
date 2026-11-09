@@ -126,7 +126,7 @@ function attachAutocomplete(input, list, { search, render, onPick }) {
 
   const run = debounce(async () => {
     const query = input.value.trim();
-    if (query.length < 2) { close(); return; }
+    if (query.length < 2) return;
     const id = ++requestId;
     try {
       const results = await search(query);
@@ -141,7 +141,13 @@ function attachAutocomplete(input, list, { search, render, onPick }) {
     }
   }, 250);
 
-  input.addEventListener("input", run);
+  input.addEventListener("input", () => {
+    // Any edit invalidates in-flight results, so a reply to an earlier query
+    // cannot reopen the list under text the user has since changed.
+    requestId++;
+    if (input.value.trim().length < 2) close();
+    run();
+  });
   input.addEventListener("keydown", (event) => {
     if (list.hidden) return;
     if (event.key === "ArrowDown") { event.preventDefault(); highlight(Math.min(items.length - 1, active + 1)); }
@@ -658,7 +664,8 @@ function drawHeatmap() {
   const visible = metric === "share"
     ? result.data.cells.filter((c) => c.count >= minCount) : result.data.cells;
   const values = visible.map((c) => (metric === "share" ? c.share * 100 : c.count));
-  const max = values.length ? Math.max(...values) : 1;
+  // Not Math.max(...values): a broad taxon at 0.25° can exceed the argument limit.
+  const max = values.length ? values.reduce((a, b) => (b > a ? b : a), -Infinity) : 1;
   const logMax = Math.log(Math.max(max, 2));
   visible.forEach((cell, i) => {
     const t = metric === "share" ? values[i] / Math.max(max, 1e-9) : Math.log(Math.max(values[i], 1)) / logMax;
@@ -685,7 +692,7 @@ function renderRanking() {
   state.ranked = rankCells(result.data.cells, metric, minCount, TOP_CELLS);
   const tbody = $("ranking").querySelector("tbody");
   tbody.innerHTML = state.ranked.map((cell, i) => `
-    <tr data-index="${i}" aria-selected="${state.selectedCell === cell}"
+    <tr data-index="${i}" tabindex="0" aria-selected="${state.selectedCell === cell}"
         title="${fmt(cell.count)} of ${fmt(cell.total)} observations in this ${cell.cell_deg}° cell during the season">
       <td class="num">${i + 1}</td>
       <td data-key="${cellKey(cell)}">${escapeHtml(locationLabel(cell))}</td>
@@ -706,6 +713,16 @@ $("ranking").addEventListener("click", (event) => {
 });
 $("ranking").addEventListener("dblclick", (event) => {
   if (event.target.closest("tr[data-index]")) graphSelectedCell();
+});
+$("ranking").addEventListener("keydown", (event) => {
+  // Rows are focusable so keyboard users can pick a cell: Enter or Space
+  // selects it, and Enter on the selected row opens its seasonal graph.
+  const row = event.target.closest("tr[data-index]");
+  if (!row || (event.key !== "Enter" && event.key !== " ")) return;
+  event.preventDefault();
+  const cell = state.ranked[Number(row.dataset.index)];
+  if (event.key === "Enter" && state.selectedCell === cell) graphSelectedCell();
+  else selectCell(cell, { pan: true });
 });
 
 function selectCell(cell, { pan }) {
@@ -910,12 +927,16 @@ window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () 
   if (highlightRect) highlightRect.setStyle({ color: selectionColor() });
 });
 
+let dateToEdited = false;
+$("date-to").addEventListener("input", () => { dateToEdited = true; });
+
 async function loadStats() {
   try {
     const stats = await fetchJson("api/stats");
     const newest = stats.newest_date ? ` · newest ${stats.newest_date}` : "";
     $("stats").textContent = `${fmt(stats.total_observations)} observations${newest} · updated ${stats.updated} · v${stats.version}`;
-    $("date-to").value = stats.newest_date || $("date-to").value;
+    // Default "To" to the newest observation unless the user already changed it.
+    if (stats.newest_date && !dateToEdited) $("date-to").value = stats.newest_date;
   } catch (error) {
     $("stats").textContent = `Database unavailable: ${error.message}`;
   }
