@@ -137,15 +137,16 @@ function attachAutocomplete(input, list, { search, render, onPick }) {
       list.hidden = results.length === 0;
       active = -1;
     } catch (_) {
-      close();
+      if (id === requestId) close();
     }
   }, 250);
 
   input.addEventListener("input", () => {
-    // Any edit invalidates in-flight results, so a reply to an earlier query
-    // cannot reopen the list under text the user has since changed.
+    // Any edit hides the current suggestions and invalidates in-flight
+    // results, so nothing from an earlier query can be picked or reopen the
+    // list under text the user has since changed.
     requestId++;
-    if (input.value.trim().length < 2) close();
+    close();
     run();
   });
   input.addEventListener("keydown", (event) => {
@@ -978,8 +979,9 @@ updateSelectionOverlay();
 
 const hasPermalink = readUrl();
 loadStats().then(() => {
-  // A permalink's own date range wins over the newest-date default.
+  // A permalink's own date range wins over the newest-date default, but not
+  // over an edit the user made while the stats were loading.
   const p = new URLSearchParams(location.search);
-  if (p.get("to")) $("date-to").value = p.get("to");
+  if (p.get("to") && !dateToEdited) $("date-to").value = p.get("to");
   if (hasPermalink) $("search-form").requestSubmit();
 });

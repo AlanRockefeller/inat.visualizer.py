@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Update the web visualizer on the server and smoke-test it.
-#   deploy/deploy.sh [ssh-host]        (default host: dikarya.us)
+#   deploy/deploy.sh [ssh-host] [public-url]
+#   defaults: dikarya.us  https://dikarya.us/visualizer
 # Deploys whatever is pushed on the branch the server checkout tracks, installs
 # any systemd or nginx files that changed in deploy/, reloads what they affect,
-# restarts the service and checks it answers.
+# restarts the service and checks it answers at the public URL.
 set -euo pipefail
 
 HOST="${1:-dikarya.us}"
+URL="${2:-https://dikarya.us/visualizer}"
 APP_DIR=/opt/inat-visualizer
-URL="https://dikarya.us/visualizer"
 
 ssh "$HOST" "APP_DIR=$APP_DIR bash -s" <<'REMOTE'
 set -euo pipefail
@@ -20,15 +21,22 @@ sudo -u inatviz .venv-web/bin/pip install -q -r requirements-web.txt
 # files (see deploy/README.md for where they live), so install the ones that
 # changed and reload the daemon that reads them.
 units_changed=0
-nginx_changed=0
+backups=()
 while read -r source installed; do
   if ! sudo cmp -s "$source" "$installed"; then
     echo "Installing $installed from $source"
-    sudo install -m 644 "$source" "$installed"
     case "$installed" in
       /etc/systemd/*) units_changed=1 ;;
-      /etc/nginx/*) nginx_changed=1 ;;
+      /etc/nginx/*)
+        # Keep the previous copy so a snippet that fails `nginx -t` can be
+        # put back instead of waiting to break the next nginx restart.
+        if sudo test -e "$installed"; then
+          sudo cp -p "$installed" "$installed.deploy-previous"
+          backups+=("$installed")
+        fi
+        ;;
     esac
+    sudo install -m 644 "$source" "$installed"
   fi
 done <<'FILES'
 deploy/inat-visualizer.service /etc/systemd/system/inat-visualizer.service
@@ -41,10 +49,20 @@ if [ "$units_changed" -eq 1 ]; then
   sudo systemctl daemon-reload
   sudo systemctl restart inat-visualizer-update.timer
 fi
-if [ "$nginx_changed" -eq 1 ]; then
-  sudo nginx -t
-  sudo systemctl reload nginx
+# Validate and reload nginx on every run, not only when a file changed here:
+# a previous run may have installed a file without managing to reload it.
+if ! sudo nginx -t; then
+  for installed in "${backups[@]}"; do
+    echo "Restoring $installed" >&2
+    sudo mv "$installed.deploy-previous" "$installed"
+  done
+  echo "ERROR: nginx rejected the configuration; previous nginx files restored." >&2
+  exit 1
 fi
+for installed in "${backups[@]}"; do
+  sudo rm -f "$installed.deploy-previous"
+done
+sudo systemctl reload nginx
 
 sudo systemctl restart inat-visualizer
 healthy=0

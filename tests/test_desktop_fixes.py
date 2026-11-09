@@ -201,6 +201,47 @@ class ResultCapTests(unittest.TestCase):
         self.assertEqual(warnings, [])
 
 
+class GraphAbundanceCellTests(unittest.TestCase):
+    def test_uses_the_maps_search_context_not_the_form(self):
+        harness = SimpleNamespace(
+            abundance_view=SimpleNamespace(
+                context={
+                    "organism": "Amanita",
+                    "exclude": "Amanita muscaria",
+                    "date_from": "2010-01-01",
+                    "date_to": "2020-12-31",
+                }
+            ),
+            organism_input=FakeLineEdit(),
+            exclude_input=FakeLineEdit(),
+            date_from=FakeLineEdit(),
+            date_to=FakeLineEdit(),
+            lat_input=FakeLineEdit(),
+            lon_input=FakeLineEdit(),
+            radius_input=FakeLineEdit(),
+            mode_combo=MagicMock(),
+            local_search=MagicMock(),
+        )
+        harness.organism_input.setText("Boletus")  # edited after the map was made
+
+        INatSeasonalVisualizer.graph_abundance_cell(harness, 37.5, -122.5, 56.0)
+
+        self.assertEqual(harness.organism_input.text(), "Amanita")
+        self.assertEqual(harness.exclude_input.text(), "Amanita muscaria")
+        self.assertEqual(
+            (harness.date_from.text(), harness.date_to.text()),
+            ("2010-01-01", "2020-12-31"),
+        )
+        self.assertEqual(
+            (harness.lat_input.text(), harness.lon_input.text()),
+            ("37.5000", "-122.5000"),
+        )
+        harness.mode_combo.setCurrentText.assert_called_once_with(
+            visualizer.SEASONAL_MODE_TEXT
+        )
+        harness.local_search.assert_called_once_with()
+
+
 class HistoryTests(unittest.TestCase):
     def make_harness(self):
         return SimpleNamespace(

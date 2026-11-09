@@ -5182,7 +5182,18 @@ class INatSeasonalVisualizer(QMainWindow):
             )
 
     def graph_abundance_cell(self, lat: float, lon: float, radius: float) -> None:
-        """Switch to a seasonal graph centred on an abundance-map cell."""
+        """Switch to a seasonal graph centred on an abundance-map cell.
+
+        The graph uses the organism, exclusion and dates the map was built
+        with, not whatever the form holds now (it may have been edited, or the
+        map may come from a history item).
+        """
+        context = getattr(self.abundance_view, "context", None) or {}
+        if context:
+            self.organism_input.setText(context.get("organism", ""))
+            self.exclude_input.setText(context.get("exclude", ""))
+            self.date_from.setText(context.get("date_from", self.date_from.text()))
+            self.date_to.setText(context.get("date_to", self.date_to.text()))
         self.lat_input.setText(f"{lat:.4f}")
         self.lon_input.setText(f"{lon:.4f}")
         self.radius_input.setText(f"{radius:g}")
@@ -6255,6 +6266,7 @@ class INatSeasonalVisualizer(QMainWindow):
             self.abundance_worker = worker
             context = {
                 "organism": organism,
+                "exclude": exclude,
                 "date_from": date_from,
                 "date_to": date_to,
                 "season_label": self.season_label(),
