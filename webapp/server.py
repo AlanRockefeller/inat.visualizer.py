@@ -348,7 +348,12 @@ def validate_date_range(date_from: str, date_to: str) -> None:
 
 
 def parse_month_day(value: str) -> tuple[int, int]:
+    """Parse ``MM-DD``; the pattern alone admits impossible dates such as 02-30."""
     month, day = (int(part) for part in value.split("-"))
+    try:
+        dt.date(2024, month, day)  # a leap year, so Feb 29 is accepted
+    except ValueError:
+        raise HTTPException(422, f"{value} is not a valid month and day") from None
     return month, day
 
 
@@ -529,6 +534,7 @@ async def abundance(
     validate_taxon_list("exclude_taxon_id", exclude_taxon_id)
     if cell_deg not in ABUNDANCE_CELL_SIZES:
         raise HTTPException(422, f"cell_deg must be one of {ABUNDANCE_CELL_SIZES}")
+    season = (parse_month_day(season_start), parse_month_day(season_end))
     key = (
         "abundance",
         tuple(sorted(taxon_id)),
@@ -550,8 +556,8 @@ async def abundance(
             parquet_path=str(OBSERVATIONS_FILE),
             date_from=date_from,
             date_to=date_to,
-            season_start=parse_month_day(season_start),
-            season_end=parse_month_day(season_end),
+            season_start=season[0],
+            season_end=season[1],
             cell_deg=cell_deg,
             taxon_ids=taxon_ids,
             exclude_taxon_ids=exclude_ids,

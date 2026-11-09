@@ -1,6 +1,8 @@
 # Web version dependencies (FastAPI server only, no PyQt6/matplotlib).
 # Install with: pip install -r requirements-web.txt
-fastapi>=0.110
+# FastAPI 0.115.6+ pulls in Starlette 0.41.3+, whose TestClient works with
+# httpx 0.28; older pairs raise TypeError when the tests build the client.
+fastapi>=0.115.6
 uvicorn[standard]>=0.29
 duckdb>=1.0.0
 pandas>=2.2

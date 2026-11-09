@@ -243,6 +243,8 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(self.abundance().status_code, 422)  # taxon_id is required
         self.assertEqual(self.abundance(taxon_id=1, cell_deg=3).status_code, 422)
         self.assertEqual(self.abundance(taxon_id=1, season_start="13-01").status_code, 422)
+        self.assertEqual(self.abundance(taxon_id=1, season_end="02-30").status_code, 422)
+        self.assertEqual(self.abundance(taxon_id=1, season_end="02-29").status_code, 200)
 
     def test_results_refresh_when_database_file_changes(self):
         self.assertEqual(self.seasonal().json()["total"], 3)

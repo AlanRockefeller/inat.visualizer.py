@@ -53,7 +53,9 @@ The existing TLS certificate for dikarya.us already covers the `/visualizer/` pa
 ## Updating the code
 
 Push your changes, then run `deploy/deploy.sh` from your workstation. It pulls,
-installs dependencies, restarts the service, and smoke-tests the public URL.
+installs dependencies, installs any changed files from `deploy/` into
+`/etc/systemd/system` and `/etc/nginx` (reloading systemd and nginx as needed),
+restarts the service, and smoke-tests the public URL.
 
 ## Database updates
 

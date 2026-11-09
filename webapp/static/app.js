@@ -162,9 +162,9 @@ function attachAutocomplete(input, list, { search, render, onPick }) {
   input.addEventListener("blur", () => setTimeout(close, 150));
 }
 
-async function searchTaxa(query) {
+async function searchTaxa(query, signal) {
   const url = `${INAT_API}/taxa/autocomplete?per_page=8&q=${encodeURIComponent(query)}`;
-  return (await fetchJson(url)).results || [];
+  return (await fetchJson(url, { signal })).results || [];
 }
 
 function taxonLabel(taxon) {
@@ -199,11 +199,16 @@ function setupTaxonPicker(field) {
 }
 
 // Like the desktop app: typed text that was never picked resolves to iNat's best match.
-async function resolveTaxon(field) {
+// The lookup shares the search's abort signal, and a result is dropped if the
+// field was edited meanwhile, so a stale reply cannot restore the old taxon.
+async function resolveTaxon(field, signal) {
   const text = $(field).value.trim();
   if (!text) { state.taxa[field] = null; return null; }
   if (state.taxa[field]) return state.taxa[field];
-  const [best] = await searchTaxa(text);
+  const [best] = await searchTaxa(text, signal);
+  if ($(field).value.trim() !== text) {
+    throw new Error(`The ${field} field changed during the lookup. Run the search again.`);
+  }
   if (!best) throw new Error(`No iNaturalist taxon matches "${text}".`);
   state.taxa[field] = { id: best.id, label: taxonLabel(best) };
   $(field).value = state.taxa[field].label;
@@ -281,13 +286,16 @@ function updateSelectionOverlay() {
   const lon = Number($("lon").value);
   const radius = Number($("radius").value);
   if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(radius)) return;
-  searchCircle.setLatLng([lat, lon]).setRadius(radius * 1000);
-  centerMarker.setLatLng([lat, lon]);
-  radiusHandle.setLatLng(eastPoint(lat, lon, radius));
+  // Web Mercator stops at 85.05°; only the drawing is clamped, the search keeps
+  // its true latitude so a polar abundance cell still graphs its own area.
+  const shownLat = clamp(lat, -85.0511, 85.0511);
+  searchCircle.setLatLng([shownLat, lon]).setRadius(radius * 1000);
+  centerMarker.setLatLng([shownLat, lon]);
+  radiusHandle.setLatLng(eastPoint(shownLat, lon, radius));
 }
 
 function setCenter(lat, lon) {
-  $("lat").value = clamp(lat, -85.0511, 85.0511).toFixed(4);
+  $("lat").value = clamp(lat, -90, 90).toFixed(4);
   $("lon").value = normalizeLon(lon).toFixed(4);
   updateSelectionOverlay();
 }
@@ -323,7 +331,11 @@ function setMode(mode) {
   state.mode = mode;
   document.querySelectorAll(".segmented button").forEach((b) =>
     b.setAttribute("aria-selected", b.dataset.mode === mode));
-  document.querySelectorAll("[data-show]").forEach((el) => { el.hidden = el.dataset.show !== mode; });
+  document.querySelectorAll("[data-show]").forEach((el) => {
+    el.hidden = el.dataset.show !== mode;
+    // A disabled fieldset keeps its hidden controls out of form validation.
+    if (el instanceof HTMLFieldSetElement) el.disabled = el.hidden;
+  });
   $("run").textContent = mode === "seasonal" ? "Graph" : "Map abundance";
   $("organism-hint").textContent = mode === "seasonal"
     ? "Leave empty for all organisms." : "Required for the abundance map.";
@@ -535,8 +547,8 @@ function seasonalQuery(request, extra = {}) {
 }
 
 async function runSeasonal(signal) {
-  const organism = await resolveTaxon("organism");
-  const exclude = await resolveTaxon("exclude");
+  const organism = await resolveTaxon("organism", signal);
+  const exclude = await resolveTaxon("exclude", signal);
   const request = {
     lat: Number($("lat").value),
     lon: Number($("lon").value),
@@ -788,14 +800,15 @@ async function requestPlaceNames() {
 }
 
 async function runAbundance(signal) {
-  const organism = await resolveTaxon("organism");
+  const organism = await resolveTaxon("organism", signal);
   if (!organism) throw new Error("Choose an organism to map where it is observed most.");
-  const exclude = await resolveTaxon("exclude");
+  const exclude = await resolveTaxon("exclude", signal);
   const [start, end] = seasonRange();
   const request = {
     taxonId: organism.id,
     organismLabel: organism.label,
     excludeId: exclude?.id,
+    excludeLabel: exclude?.label,
     seasonStart: monthDayString(start),
     seasonEnd: monthDayString(end),
     dateFrom: $("date-from").value,
@@ -842,22 +855,30 @@ $("min-obs").addEventListener("change", onRankingChanged);
 /* ---------- permalinks ---------- */
 
 function writeUrl() {
+  // Serialize the search that produced the result on screen rather than the
+  // form, which may have been edited since, plus the current display settings.
+  const result = state.mode === "seasonal" ? state.seasonal : state.abundance;
+  if (!result) return;
+  const request = result.request;
   const p = new URLSearchParams({ mode: state.mode });
-  for (const field of ["organism", "exclude"]) {
-    const taxon = state.taxa[field];
-    if (taxon) { p.set(field, taxon.id); p.set(`${field}_name`, taxon.label); }
+  if (request.taxonId) {
+    p.set("organism", request.taxonId);
+    p.set("organism_name", request.organismLabel || `Taxon ${request.taxonId}`);
   }
-  p.set("from", $("date-from").value);
-  p.set("to", $("date-to").value);
+  if (request.excludeId) {
+    p.set("exclude", request.excludeId);
+    p.set("exclude_name", request.excludeLabel || `Taxon ${request.excludeId}`);
+  }
+  p.set("from", request.dateFrom);
+  p.set("to", request.dateTo);
   if (state.mode === "seasonal") {
-    p.set("lat", $("lat").value);
-    p.set("lon", $("lon").value);
-    p.set("radius", $("radius").value);
+    p.set("lat", request.lat);
+    p.set("lon", request.lon);
+    p.set("radius", request.radius);
     p.set("view", $("view").value);
   } else {
-    const [start, end] = seasonRange();
-    p.set("season", `${monthDayString(start)}_${monthDayString(end)}`);
-    p.set("cell", $("cell-deg").value);
+    p.set("season", `${request.seasonStart}_${request.seasonEnd}`);
+    p.set("cell", request.cellDeg);
     p.set("metric", $("metric").value);
     p.set("min", $("min-obs").value);
   }
