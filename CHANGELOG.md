@@ -2,6 +2,46 @@
 
 All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **Web version** at https://dikarya.us/visualizer/: a FastAPI server
+  (`webapp/`) and a Leaflet/Chart.js page offering the seasonal graph and the
+  abundance map from the local database. The DuckDB queries moved into
+  `inat_core.py`, which the desktop app and the server share. `deploy/` holds
+  the systemd units, nginx snippet, weekly database-update timer and deploy
+  script.
+- A GitHub Actions workflow now runs the test suite on every push and pull
+  request.
+
+### Fixed
+
+- **Saving settings no longer breaks the next launch.** Coordinates saved as
+  numbers came back from QSettings as floats, which the text fields rejected
+  during startup.
+- **Export Data** works again for local searches and now writes the taxon ID
+  of live iNaturalist records (previously always empty).
+- **Export Graph** keeps its metadata block for all-organisms searches and
+  honours the PNG choice instead of forcing `.jpg`.
+- **Searches near the antimeridian** (Fiji, the Aleutians, Chukotka) no
+  longer miss observations on the other side of 180° longitude, and a search
+  circle that contains a pole now covers every longitude.
+- Choosing a graph colour recolours the current graph instead of starting a
+  new live iNaturalist search. Changing the font size no longer adds a
+  duplicate history entry.
+- Clicking an older history item shows that search's own graph; previously it
+  replotted the newest observations under the old label. The ten most recent
+  seasonal searches keep their observations in memory.
+- Live searches that match more than 10,000 observations now plot the
+  observations iNaturalist returns and warn, instead of failing outright.
+- Web: cancelling in the browser now stops the query on the server and frees
+  its slot; daily bins follow a leap-year calendar so chart labels match the
+  dates; taxonomy expansion runs under the same memory, time and concurrency
+  limits as other queries and survives a parent cycle; results computed while
+  the weekly database swap lands are not cached; CSV downloads scan the file
+  once.
+
 ## [1.0.9] - 2026-09-28
 
 ### Added

@@ -6,7 +6,7 @@ import pandas as pd
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from visualizer import (
+from inat_core import (
     SearchCancelled,
     run_local_abundance_query,
     run_local_observation_query,

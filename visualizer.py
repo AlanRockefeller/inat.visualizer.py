@@ -34,6 +34,23 @@ from urllib.parse import urlencode, urlparse
 
 from inat_visualizer_version import __version__
 from startup_config import APP_DATA_DIRECTORY_NAME
+from inat_core import (
+    EARTH_RADIUS_KM,
+    MAP_RADIUS_MAX_KM,
+    MAP_RADIUS_MIN_KM,
+    SearchCancelled,
+    abundance_cell_key,
+    abundance_cell_radius_km,
+    calendar_aligned_week_numbers,
+    descendant_taxon_ids,
+    geodesic_distance_km,
+    most_specific_standard_place,
+    normalize_longitude,
+    raise_if_search_cancelled,
+    rank_abundance_cells,
+    run_local_abundance_query,
+    run_local_observation_query,
+)
 
 # --- third-party ---
 import duckdb
@@ -158,6 +175,8 @@ LIVE_GRAPH_ACTION_TEXT = "Graph with live iNat data"
 ABUNDANCE_ACTION_TEXT = "Map abundance (local data)"
 SEASONAL_MODE_TEXT = "Seasonal graph"
 ABUNDANCE_MODE_TEXT = "Abundance map"
+# Seasonal history items newer than this keep their observations in memory.
+HISTORY_RESULTS_RETAINED = 10
 ABUNDANCE_SEASON_YEAR = 2024
 SPLASH_WINDOW_FLAGS = Qt.WindowType.SplashScreen | Qt.WindowType.FramelessWindowHint
 DATABASE_FILE_INFO: dict[str, dict[str, Any]] = {
@@ -612,6 +631,8 @@ def database_download_choice_message(
 # --- Constants for MapDialog ---
 INATURALIST_OBSERVATIONS_URL = "https://api.inaturalist.org/v1/observations"
 INATURALIST_GET_QUERY_LIMIT = 1800
+# The observations API rejects pages once page * per_page passes this number.
+INATURALIST_MAX_SEARCH_RESULTS = 10000
 OBSERVATION_TAXON_FILTER_KEYS = ("taxon_id", "not_in_taxon_id")
 HTTP_ERROR_BODY_LOG_LIMIT = 500
 MAX_TILES_PER_REQUEST = 100
@@ -620,9 +641,6 @@ TILE_CACHE_DIR_NAME = "tile_cache"
 MAX_DISK_CACHE_SIZE_MB = 200
 PLACE_SEARCH_RESULT_LIMIT = 8
 WEB_MERCATOR_MAX_LATITUDE = 85.05112878
-EARTH_RADIUS_KM = 6371.0
-MAP_RADIUS_MIN_KM = 1.0
-MAP_RADIUS_MAX_KM = 1000.0
 _LOG_PRIVACY_KEY = os.urandom(16)
 
 
@@ -682,11 +700,6 @@ def place_search_error_diagnostic(error: BaseException) -> str:
     return ", ".join(details)
 
 
-def normalize_longitude(lon: float) -> float:
-    """Return a longitude in the conventional [-180, 180) range."""
-    return (float(lon) + 180.0) % 360.0 - 180.0
-
-
 def clamp_latitude_limits(south: float, north: float) -> tuple[float, float]:
     """Shift latitude limits inside the Web Mercator drawable range."""
     if south < -WEB_MERCATOR_MAX_LATITUDE:
@@ -701,18 +714,6 @@ def clamp_latitude_limits(south: float, north: float) -> tuple[float, float]:
 def longitude_near_reference(lon: float, reference: float) -> float:
     """Unwrap ``lon`` to the world copy nearest ``reference``."""
     return float(reference) + ((float(lon) - float(reference) + 180.0) % 360.0) - 180.0
-
-
-def geodesic_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Calculate the great-circle distance between two coordinates."""
-    lat1_rad, lon1_rad, lat2_rad, lon2_rad = map(math.radians, (lat1, lon1, lat2, lon2))
-    dlat = lat2_rad - lat1_rad
-    dlon = lon2_rad - lon1_rad
-    a = (
-        math.sin(dlat / 2.0) ** 2
-        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2.0) ** 2
-    )
-    return EARTH_RADIUS_KM * 2.0 * math.asin(min(1.0, math.sqrt(a)))
 
 
 def geodesic_destination(
@@ -956,45 +957,6 @@ def place_result_view_limits(
     return center_lon - half_lon, center_lon + half_lon, south, north
 
 
-def calculate_local_search_bounds(
-    lat: float, lon: float, radius: float
-) -> tuple[float, float, float, float]:
-    """Calculate a latitude/longitude bounding box around a radius in km."""
-    lat_rad = math.radians(lat)
-    earth_radius_km = EARTH_RADIUS_KM
-    lat_diff = radius / earth_radius_km
-
-    cos_lat = math.cos(lat_rad)
-    if abs(cos_lat) < 1e-12:
-        lon_diff = math.pi
-    else:
-        asin_arg = math.sin(lat_diff) / cos_lat
-        asin_arg = max(-1.0, min(1.0, asin_arg))
-        lon_diff = math.asin(asin_arg)
-
-    lat_min = max(-90.0, lat - math.degrees(lat_diff))
-    lat_max = min(90.0, lat + math.degrees(lat_diff))
-    lon_min = lon - math.degrees(lon_diff)
-    lon_max = lon + math.degrees(lon_diff)
-    return lat_min, lat_max, lon_min, lon_max
-
-
-def calendar_aligned_week_numbers(dates: pd.Series) -> pd.Series:
-    """Return 1-52 week bins with ISO year-boundary dates kept by month.
-
-    ISO week 53 straddles December and January, while some late-December dates
-    belong to ISO week 1 and some early-January dates belong to ISO week 52.
-    Seasonal plots use a fixed 52-bin calendar, so put January boundary dates
-    in week 1 and December boundary dates in week 52 instead of dropping them
-    or displaying them at the opposite end of the year.
-    """
-    weeks = dates.dt.isocalendar().week.astype("int64")
-    months = dates.dt.month
-    january_boundary = (months == 1) & weeks.isin((52, 53))
-    december_boundary = (months == 12) & weeks.isin((1, 53))
-    return weeks.mask(january_boundary, 1).mask(december_boundary, 52)
-
-
 def http_error_details(error: HTTPError) -> tuple[int | None, str | None]:
     """Return an HTTP status and bounded single-line response-body excerpt."""
     response = error.response
@@ -1075,15 +1037,6 @@ def fetch_observations_page(
     return pyinaturalist.get_observations(session=request_session, **params)
 
 
-class SearchCancelled(Exception):
-    """Raised inside a worker when the user cancels a search."""
-
-
-def raise_if_search_cancelled(cancel_callback=None) -> None:
-    if cancel_callback and cancel_callback():
-        raise SearchCancelled
-
-
 def wait_for_search_delay(seconds: float, cancel_callback=None) -> None:
     """Wait for a retry or rate-limit delay while checking for cancellation."""
     deadline = time.monotonic() + seconds
@@ -1101,12 +1054,15 @@ def fetch_all_observation_pages(
     api_call_callback=None,
     cancel_callback=None,
     request_session=None,
+    warning_callback=None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Fetch every observation page without interacting with Qt widgets.
 
     Keeping the network and retry loop UI-independent allows live searches to
     run in a worker thread while the main Qt event loop continues repainting
-    the window and responding to Windows messages.
+    the window and responding to Windows messages. ``warning_callback``
+    receives a message when the search matched more observations than the
+    API will page through, in which case the fetched part is still returned.
     """
     all_results = []
     page = 1
@@ -1149,6 +1105,18 @@ def fetch_all_observation_pages(
                     )
 
                 if len(all_results) >= total_results or not results:
+                    return all_results, None
+                if page * per_page >= INATURALIST_MAX_SEARCH_RESULTS:
+                    message = (
+                        f"iNaturalist only pages through the most recent "
+                        f"{INATURALIST_MAX_SEARCH_RESULTS:,} observations of a search, "
+                        f"but {total_results:,} matched. The graph shows those "
+                        f"{len(all_results):,}; narrow the date range or radius to "
+                        "see them all."
+                    )
+                    logging.warning(message)
+                    if warning_callback:
+                        warning_callback(message)
                     return all_results, None
 
                 page += 1
@@ -1215,6 +1183,39 @@ def fetch_all_observation_pages(
                 "INATURALIST_APP_SECRET in your environment."
             )
             return all_results, error_msg
+
+
+def observation_export_rows(
+    observations: list[dict[str, Any]], source: str
+) -> list[dict[str, Any]]:
+    """Flatten observations for CSV export.
+
+    Local rows carry plain ``decimalLatitude``/``decimalLongitude``/``taxonID``
+    columns. iNaturalist API records put the position in GeoJSON order
+    ``[lon, lat]`` and the taxon in a nested ``taxon`` object.
+    """
+    rows = []
+    for obs in observations:
+        if source == "Local":
+            latitude = obs.get("decimalLatitude")
+            longitude = obs.get("decimalLongitude")
+            date = obs.get("eventDate")
+            taxon_id = obs.get("taxonID")
+        else:
+            coordinates = (obs.get("geojson") or {}).get("coordinates") or [None, None]
+            longitude, latitude = coordinates[0], coordinates[1]
+            date = obs.get("observed_on")
+            taxon_id = (obs.get("taxon") or {}).get("id")
+        rows.append(
+            {
+                "id": obs.get("id"),
+                "latitude": latitude,
+                "longitude": longitude,
+                "date": date,
+                "taxonID": taxon_id,
+            }
+        )
+    return rows
 
 
 # OpenStreetMap sometimes answers a blocked client with this "403 Access
@@ -2122,6 +2123,7 @@ class ApiSearchWorker(QThread):
                 api_call_callback=self._record_observation_page,
                 cancel_callback=self.is_cancelled,
                 request_session=self.request_session,
+                warning_callback=warnings.append,
             )
             self._observation_count = len(observations)
             raise_if_search_cancelled(self.is_cancelled)
@@ -2224,264 +2226,6 @@ class LocalSearchWorker(QThread):
             else:
                 logging.error("Local search worker failed: %s", e)
                 self.search_failed.emit(str(e))
-
-
-REQUIRED_OBSERVATION_COLUMNS = (
-    "eventdate",
-    "decimallatitude",
-    "decimallongitude",
-    "taxonid",
-)
-
-
-def check_observation_columns(con, escaped_path: str) -> None:
-    """Raise ValueError if observations.parquet lacks a column the queries use."""
-    schema = con.execute(f"DESCRIBE SELECT * FROM '{escaped_path}'").fetchall()
-    column_names = [row[0].lower() for row in schema]
-    missing_columns = [
-        col for col in REQUIRED_OBSERVATION_COLUMNS if col not in column_names
-    ]
-    if missing_columns:
-        raise ValueError(
-            "Missing required columns in observations.parquet: "
-            + ", ".join(missing_columns)
-            + ". The file must include eventDate, decimalLatitude, "
-            "decimalLongitude, and taxonID."
-        )
-
-
-def register_taxon_filter(con, table_name: str, taxon_ids: list[int]) -> str:
-    """Load taxon IDs into a temp table and return an ``IN (SELECT ...)`` operand.
-
-    Higher taxa such as Agaricales expand to tens of thousands of descendant
-    IDs. DuckDB evaluates a literal ``IN (1, 2, ...)`` list of that size very
-    slowly (minutes over the full database), while a temp-table subquery is
-    planned as a hash semi-join and stays under a second.
-    """
-    con.execute(
-        f"CREATE OR REPLACE TEMP TABLE {table_name} AS "
-        "SELECT DISTINCT unnest(?::BIGINT[]) AS id",
-        [[int(taxon_id) for taxon_id in taxon_ids]],
-    )
-    return f"(SELECT id FROM {table_name})"
-
-
-def taxon_filter_sql(
-    con, taxon_ids: list[int], exclude_taxon_ids: list[int]
-) -> str:
-    """Return SQL predicates (each starting with AND) for include/exclude taxa."""
-    filter_sql = ""
-    if taxon_ids:
-        include = register_taxon_filter(con, "include_taxa", taxon_ids)
-        filter_sql += f" AND taxonID IN {include}"
-    if exclude_taxon_ids:
-        exclude = register_taxon_filter(con, "exclude_taxa", exclude_taxon_ids)
-        filter_sql += f" AND taxonID NOT IN {exclude}"
-    return filter_sql
-
-
-def run_local_observation_query(
-    parquet_path: str,
-    date_from: str,
-    date_to: str,
-    lat: float,
-    lon: float,
-    radius: float,
-    taxon_ids: list[int] | None = None,
-    exclude_taxon_ids: list[int] | None = None,
-    progress_callback=None,
-    cancel_callback=None,
-    connection_callback=None,
-) -> tuple[list[dict[str, Any]], int]:
-    """Query observations.parquet for local observations."""
-    taxon_ids = taxon_ids or []
-    exclude_taxon_ids = exclude_taxon_ids or []
-    escaped_path = parquet_path.replace("'", "''")
-    lat_min, lat_max, lon_min, lon_max = calculate_local_search_bounds(lat, lon, radius)
-    con = None
-    try:
-        raise_if_search_cancelled(cancel_callback)
-        con = duckdb.connect()
-        if connection_callback:
-            connection_callback(con)
-        raise_if_search_cancelled(cancel_callback)
-        if progress_callback:
-            progress_callback("Checking observations.parquet schema...")
-        check_observation_columns(con, escaped_path)
-        raise_if_search_cancelled(cancel_callback)
-
-        base_where = """
-            WHERE eventDate BETWEEN ? AND ?
-            AND decimalLatitude BETWEEN ? AND ?
-            AND decimalLongitude BETWEEN ? AND ?
-        """
-        filter_sql = taxon_filter_sql(con, taxon_ids, exclude_taxon_ids)
-
-        bbox_params = [date_from, date_to, lat_min, lat_max, lon_min, lon_max]
-        if progress_callback:
-            progress_callback("Estimating result count...")
-        count_query = f"SELECT COUNT(*) FROM '{escaped_path}' {base_where} {filter_sql}"
-        _count_row = con.execute(count_query, bbox_params).fetchone()
-        raise_if_search_cancelled(cancel_callback)
-        estimated_count = _count_row[0] if _count_row else 0
-
-        if progress_callback:
-            progress_callback(
-                f"Executing DuckDB query (estimated {estimated_count:,} candidates)..."
-            )
-
-        # Use DuckDB-native math instead of a Python UDF so large scans do not
-        # call back into Python once per row.
-        query = f"""
-            SELECT id, decimalLatitude, decimalLongitude, eventDate, taxonID
-            FROM '{escaped_path}'
-            {base_where}
-            {filter_sql}
-            AND 2 * 6371 * asin(
-                sqrt(
-                    pow(sin(radians(decimalLatitude - ?) / 2), 2)
-                    + cos(radians(?)) * cos(radians(decimalLatitude))
-                    * pow(sin(radians(decimalLongitude - ?) / 2), 2)
-                )
-            ) <= ?
-        """
-        query_params = bbox_params + [lat, lat, lon, radius]
-        results = con.execute(query, query_params).fetchall()
-        raise_if_search_cancelled(cancel_callback)
-
-        if progress_callback:
-            progress_callback("Processing results...")
-        observations = []
-        for index, row in enumerate(results):
-            if index % 1000 == 0:
-                raise_if_search_cancelled(cancel_callback)
-            observations.append(
-                {
-                    "id": row[0],
-                    "decimalLatitude": row[1],
-                    "decimalLongitude": row[2],
-                    "eventDate": row[3],
-                    "taxonID": row[4],
-                }
-            )
-        raise_if_search_cancelled(cancel_callback)
-        return observations, estimated_count
-    finally:
-        if connection_callback:
-            connection_callback(None)
-        if con is not None:
-            con.close()
-
-
-def season_filter_sql(
-    season_start: tuple[int, int], season_end: tuple[int, int]
-) -> tuple[str, list[int]]:
-    """Return a month-day predicate and params; ranges past Dec 31 wrap to Jan."""
-    start = season_start[0] * 100 + season_start[1]
-    end = season_end[0] * 100 + season_end[1]
-    month_day = "(month(CAST(eventDate AS DATE)) * 100 + day(CAST(eventDate AS DATE)))"
-    if start <= end:
-        return f"{month_day} BETWEEN ? AND ?", [start, end]
-    return f"({month_day} >= ? OR {month_day} <= ?)", [start, end]
-
-
-def run_local_abundance_query(
-    parquet_path: str,
-    date_from: str,
-    date_to: str,
-    season_start: tuple[int, int],
-    season_end: tuple[int, int],
-    cell_deg: float,
-    taxon_ids: list[int],
-    exclude_taxon_ids: list[int] | None = None,
-    progress_callback=None,
-    cancel_callback=None,
-    connection_callback=None,
-) -> list[dict[str, Any]]:
-    """Count a taxon's observations per grid cell worldwide for a season.
-
-    Each returned cell also carries the total number of observations of any
-    organism in that cell and season, so callers can rank by raw count or by
-    share of all observations (which corrects for how many observers live in
-    an area) without re-running the query.
-    """
-    if not taxon_ids:
-        raise ValueError("An organism is required to map where it is most abundant.")
-    if cell_deg <= 0:
-        raise ValueError("Grid cell size must be positive.")
-    exclude_taxon_ids = exclude_taxon_ids or []
-    escaped_path = parquet_path.replace("'", "''")
-    con = None
-    try:
-        raise_if_search_cancelled(cancel_callback)
-        con = duckdb.connect()
-        if connection_callback:
-            connection_callback(con)
-        if progress_callback:
-            progress_callback("Checking observations.parquet schema...")
-        check_observation_columns(con, escaped_path)
-        raise_if_search_cancelled(cancel_callback)
-
-        include = register_taxon_filter(con, "include_taxa", taxon_ids)
-        target_sql = f"taxonID IN {include}"
-        if exclude_taxon_ids:
-            exclude = register_taxon_filter(con, "exclude_taxa", exclude_taxon_ids)
-            target_sql += f" AND taxonID NOT IN {exclude}"
-        season_sql, season_params = season_filter_sql(season_start, season_end)
-        raise_if_search_cancelled(cancel_callback)
-
-        if progress_callback:
-            progress_callback("Scanning all observations for the selected season...")
-        query = f"""
-            SELECT
-                CAST(floor(CAST(decimalLatitude AS DOUBLE) / ?) AS BIGINT) AS lat_index,
-                CAST(floor(CAST(decimalLongitude AS DOUBLE) / ?) AS BIGINT) AS lon_index,
-                count(*) FILTER (WHERE {target_sql}) AS target_count,
-                count(*) AS total_count,
-                avg(CAST(decimalLatitude AS DOUBLE)) FILTER (WHERE {target_sql})
-                    AS centroid_lat,
-                avg(CAST(decimalLongitude AS DOUBLE)) FILTER (WHERE {target_sql})
-                    AS centroid_lon
-            FROM '{escaped_path}'
-            WHERE CAST(eventDate AS DATE) BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
-            AND {season_sql}
-            GROUP BY lat_index, lon_index
-            HAVING target_count > 0
-        """
-        params = [cell_deg, cell_deg, date_from, date_to, *season_params]
-        rows = con.execute(query, params).fetchall()
-        raise_if_search_cancelled(cancel_callback)
-
-        if progress_callback:
-            progress_callback("Processing results...")
-        cells = []
-        for (
-            lat_index,
-            lon_index,
-            target_count,
-            total_count,
-            centroid_lat,
-            centroid_lon,
-        ) in rows:
-            cells.append(
-                {
-                    "cell_lat": lat_index * cell_deg,
-                    "cell_lon": lon_index * cell_deg,
-                    "cell_deg": cell_deg,
-                    "count": int(target_count),
-                    "total": int(total_count),
-                    "share": target_count / total_count if total_count else 0.0,
-                    "centroid_lat": float(centroid_lat),
-                    "centroid_lon": float(centroid_lon),
-                }
-            )
-        cells.sort(key=lambda cell: cell["count"], reverse=True)
-        return cells
-    finally:
-        if connection_callback:
-            connection_callback(None)
-        if con is not None:
-            con.close()
 
 
 class LocalAbundanceWorker(QThread):
@@ -3640,31 +3384,6 @@ ABUNDANCE_GRID_OPTIONS = (("0.25°", 0.25), ("0.5°", 0.5), ("1°", 1.0), ("2°"
 ABUNDANCE_DEFAULT_GRID_INDEX = 2
 
 
-def abundance_cell_key(cell: Mapping[str, Any]) -> tuple[float, float, float]:
-    return (
-        round(float(cell["cell_lat"]), 6),
-        round(float(cell["cell_lon"]), 6),
-        float(cell["cell_deg"]),
-    )
-
-
-def rank_abundance_cells(
-    cells: list[dict[str, Any]], metric: str, min_count: int, limit: int | None = None
-) -> list[dict[str, Any]]:
-    """Order cells by raw count, or by share among cells with enough records.
-
-    Share mode needs a minimum count because a cell with one observation of
-    the organism and two observations overall would otherwise outrank a
-    genuine hotspot.
-    """
-    if metric == "share":
-        ranked = [cell for cell in cells if cell["count"] >= min_count]
-        ranked.sort(key=lambda cell: (cell["share"], cell["count"]), reverse=True)
-    else:
-        ranked = sorted(cells, key=lambda cell: cell["count"], reverse=True)
-    return ranked[:limit] if limit is not None else ranked
-
-
 def abundance_grid_array(
     cells: list[dict[str, Any]], cell_deg: float, metric: str
 ) -> np.ndarray:
@@ -3678,45 +3397,6 @@ def abundance_grid_array(
         if 0 <= row < rows:
             grid[row, col] = cell["share"] * 100.0 if metric == "share" else cell["count"]
     return grid
-
-
-def abundance_cell_radius_km(cell: Mapping[str, Any]) -> float:
-    """Radius of a circle centred on a grid cell that covers the whole cell."""
-    cell_deg = float(cell["cell_deg"])
-    south = max(-90.0, float(cell["cell_lat"]))
-    north = min(90.0, south + cell_deg)
-    west = float(cell["cell_lon"])
-    center_lat = (south + north) / 2.0
-    center_lon = west + cell_deg / 2.0
-    corner_distance = max(
-        geodesic_distance_km(center_lat, center_lon, lat, lon)
-        for lat in (south, north)
-        for lon in (west, west + cell_deg)
-    )
-    return max(MAP_RADIUS_MIN_KM, min(MAP_RADIUS_MAX_KM, math.ceil(corner_distance)))
-
-
-def most_specific_standard_place(response: Any) -> str | None:
-    """Pick the finest-grained administrative place from a places/nearby reply."""
-    results = response.get("results") if isinstance(response, Mapping) else None
-    standard = results.get("standard") if isinstance(results, Mapping) else None
-    candidates = [
-        place
-        for place in standard or []
-        if isinstance(place, Mapping)
-        and place.get("admin_level") is not None
-        and (place.get("display_name") or place.get("name"))
-    ]
-    if not candidates:
-        return None
-    best = max(
-        candidates,
-        key=lambda place: (
-            place.get("admin_level"),
-            -(place.get("bbox_area") or 0.0),
-        ),
-    )
-    return str(best.get("display_name") or best.get("name"))
 
 
 class PlaceNameWorker(QThread):
@@ -5670,7 +5350,7 @@ class INatSeasonalVisualizer(QMainWindow):
 
             # Replot if data exists
             if hasattr(self, "last_plot_args") and self.last_plot_args:
-                self.plot_observations(**self.last_plot_args)
+                self.plot_observations(**self.last_plot_args, record_history=False)
                 if getattr(self, "figure", None):
                     try:
                         self.figure.tight_layout()
@@ -5800,9 +5480,9 @@ class INatSeasonalVisualizer(QMainWindow):
         if color.isValid():
             self.color_input.setText(color.name())
             self.settings.setValue("graph_color", color.name())
-            # Redraw graph if data is loaded
-            if self.history_list.property("data"):
-                self.search_observations()  # Re-run last search to update color
+            # Redraw the current graph in the new colour without searching again
+            if self.last_plot_args:
+                self.plot_observations(**self.last_plot_args, record_history=False)
 
     def choose_bg_color(self) -> None:
         """Open a color dialog to choose the graph background color."""
@@ -5860,10 +5540,12 @@ class INatSeasonalVisualizer(QMainWindow):
 
     def load_settings(self) -> None:
         """Load saved settings."""
-        self.lat_input.setText(self.settings.value("latitude", self.default_lat))
-        self.lon_input.setText(self.settings.value("longitude", self.default_lon))
+        # QSettings returns floats for values that were saved as floats, and
+        # setText accepts only strings.
+        self.lat_input.setText(str(self.settings.value("latitude", self.default_lat)))
+        self.lon_input.setText(str(self.settings.value("longitude", self.default_lon)))
         self.radius_input.setText(
-            self.settings.value("radius", str(self.default_radius))
+            str(self.settings.value("radius", self.default_radius))
         )
         self.color_input.setText(self.settings.value("graph_color", "#1f77b4"))
         self.bg_color_input.setText(self.settings.value("graph_bg_color", ""))
@@ -5953,6 +5635,7 @@ class INatSeasonalVisualizer(QMainWindow):
                 progress_callback=report_progress,
                 api_call_callback=count_api_call,
                 request_session=request_session,
+                warning_callback=self.status_bar.showMessage,
             )
         finally:
             maintain_http_cache(
@@ -6041,30 +5724,13 @@ class INatSeasonalVisualizer(QMainWindow):
             return file_taxons
 
         # Query taxonomy.parquet
-        con = None
         try:
             if not os.path.exists(self.taxonomy_file):
                 raise FileNotFoundError(
                     f"taxonomy.parquet not found in {self.working_dir}"
                 )
 
-            con = duckdb.connect()
-            sql = """
-                WITH RECURSIVE descendants AS (
-                    SELECT id FROM taxonomy WHERE id = ?
-                    UNION ALL
-                    SELECT t.id FROM taxonomy t
-                    JOIN descendants d ON t.parent_id = d.id
-                )
-                SELECT id FROM descendants
-            """
-            con.execute(f"CREATE VIEW taxonomy AS SELECT * FROM '{self.taxonomy_file}'")
-            results = con.execute(sql, [taxon_id]).fetchall()
-            descendants = [row[0] for row in results]
-
-            # Include the parent taxon ID
-            if taxon_id not in descendants:
-                descendants.append(taxon_id)
+            descendants = descendant_taxon_ids(self.taxonomy_file, taxon_id)
 
             self.taxon_cache[cache_key] = descendants
             self.save_taxon_cache()
@@ -6099,9 +5765,6 @@ class INatSeasonalVisualizer(QMainWindow):
             else:
                 logging.info(f"Aborting descendant taxon ID fetch for {query}")
                 return []
-        finally:
-            if con is not None:
-                con.close()
 
     def fetch_taxon_ids(self) -> None:
         """Manually fetch taxon IDs for the current organism and save to cache."""
@@ -6223,8 +5886,13 @@ class INatSeasonalVisualizer(QMainWindow):
         date_to: str,
         view: str,
         source: str = "API",
+        record_history: bool = True,
     ) -> bool:
-        """Plot observations (from API or local)."""
+        """Plot observations (from API or local).
+
+        ``record_history`` is False when redrawing an existing graph (colour or
+        font change, history replay) so the history list gets no new entry.
+        """
         # Save arguments for replotting (e.g., when font size changes)
         self.last_plot_args = {
             "observations": observations,
@@ -6267,7 +5935,7 @@ class INatSeasonalVisualizer(QMainWindow):
         df = pd.DataFrame(dates, columns=["date"])  # type: ignore[call-overload]
 
         if view == "daily":
-            df["group"] = df["date"].dt.dayofyear
+            df["group"] = df["date"].dt.day_of_year
             bins = 366  # Account for leap years
             labels = [f"Day {i}" for i in range(1, 367)]
             tick_interval = 30
@@ -6358,10 +6026,18 @@ class INatSeasonalVisualizer(QMainWindow):
             self.canvas.draw_idle()
         QTimer.singleShot(0, self.clamp_to_screen)
 
-        # Update history
-        history_item = f"{organism or 'All'} | {date_from} to {date_to} ({source})"
-        self.history_list.addItem(history_item)
+        # Update history. Each item keeps the arguments it was plotted with so
+        # clicking it later shows that graph, not the latest data.
         self.history_list.setProperty("data", observations)
+        if record_history:
+            history_item = QListWidgetItem(
+                f"{organism or 'All'} | {date_from} to {date_to} ({source})"
+            )
+            history_item.setData(
+                Qt.ItemDataRole.UserRole, {"plot_args": dict(self.last_plot_args)}
+            )
+            self.history_list.addItem(history_item)
+            self._trim_history_results()
 
         # Update info bar with observation count and descendant taxa
         observation_count = len(observations)
@@ -6943,28 +6619,22 @@ class INatSeasonalVisualizer(QMainWindow):
             return
 
         try:
-            # Get current parameters
-            try:
-                lat = float(self.lat_input.text().strip())
-                lon = float(self.lon_input.text().strip())
-            except ValueError:
-                QMessageBox.warning(
-                    self,
-                    "Warning",
-                    "Invalid latitude or longitude. Using default values for export.",
-                )
-                lat = float(self.default_lat)
-                lon = float(self.default_lon)
-
-            radius = float(self.radius_input.text())
-            organism = self.organism_input.text().strip() or "All Organisms"
-            date_from = self.date_from.text()
-            date_to = self.date_to.text()
-            view = self.view_combo.currentText().lower()
-            source = (
-                "Local" if self.info_bar.text().startswith("Source: Local") else "API"
-            )
-            observation_count = len(self.history_list.property("data") or [])
+            # Describe the graph on screen rather than the form, whose values
+            # may have changed since the graph or a history item was plotted.
+            plot_args = self.last_plot_args or {}
+            observations = plot_args.get("observations") or []
+            if not observations:
+                QMessageBox.warning(self, "Error", "No data to export.")
+                return
+            lat = float(plot_args["lat"])
+            lon = float(plot_args["lon"])
+            radius = float(plot_args["radius"])
+            organism = plot_args["organism"] or "All Organisms"
+            date_from = plot_args["date_from"]
+            date_to = plot_args["date_to"]
+            view = plot_args["view"]
+            source = plot_args["source"]
+            observation_count = len(observations)
             descendant_count = 0
             if organism != "All Organisms":
                 cache_key = f"{organism}_descendants"
@@ -6981,21 +6651,21 @@ class INatSeasonalVisualizer(QMainWindow):
                 return
 
             filename = file_dialog.selectedFiles()[0]
-            # Ensure .jpg extension
+            # Match the extension to the chosen format instead of forcing .jpg
+            # onto PNG exports.
             file_path = Path(filename)
-            if file_path.suffix.lower() not in [".jpg", ".jpeg"]:
-                filename = str(file_path.with_suffix(".jpg"))
+            suffix = file_path.suffix.lower()
+            if suffix not in (".jpg", ".jpeg", ".png"):
+                chosen_filter = file_dialog.selectedNameFilter().lower()
+                suffix = ".png" if "png" in chosen_filter else ".jpg"
+                file_path = file_path.with_suffix(suffix)
+            filename = str(file_path)
+            image_format = "png" if suffix == ".png" else "jpg"
 
             # Create a new figure for export to avoid modifying the UI graph
             export_fig, export_ax = plt.subplots(figsize=(10, 6))
 
             # Recompute plot data (replicate plot_observations logic)
-            observations = self.history_list.property("data") or []
-            if not observations:
-                plt.close(export_fig)
-                QMessageBox.warning(self, "Error", "No data to export.")
-                return
-
             dates = []
             for obs in observations:
                 date_str = obs.get("eventDate" if source == "Local" else "observed_on")
@@ -7014,7 +6684,7 @@ class INatSeasonalVisualizer(QMainWindow):
             df = pd.DataFrame(dates, columns=["date"])  # type: ignore[call-overload]
 
             if view == "daily":
-                df["group"] = df["date"].dt.dayofyear
+                df["group"] = df["date"].dt.day_of_year
                 bins = 366
                 labels = [f"Day {i}" for i in range(1, 367)]
                 tick_positions = range(0, bins, 30)
@@ -7098,11 +6768,10 @@ class INatSeasonalVisualizer(QMainWindow):
                 f"Radius: {radius} km\n"
                 f"Organism: {organism}\n"
                 f"Dates: {date_from} to {date_to}\n"
-                f"Observations: {observation_count}\n"
-                f"Descendant Taxa: {descendant_count}"
-                if descendant_count > 0
-                else ""
+                f"Observations: {observation_count}"
             )
+            if descendant_count > 0:
+                metadata += f"\nDescendant Taxa: {descendant_count}"
             export_fig.text(
                 0.02,
                 0.02,
@@ -7115,7 +6784,7 @@ class INatSeasonalVisualizer(QMainWindow):
             # Render and save
             export_fig.tight_layout(rect=(0, 0.1, 1, 0.95))  # Adjust for metadata
             export_fig.canvas.draw()
-            export_fig.savefig(filename, format="jpg", dpi=300)
+            export_fig.savefig(filename, format=image_format, dpi=300)
             plt.close(export_fig)
 
             QMessageBox.information(self, "Success", f"Graph exported to {filename}")
@@ -7186,7 +6855,8 @@ class INatSeasonalVisualizer(QMainWindow):
         if self.is_abundance_mode():
             self.export_abundance_data()
             return
-        observations = self.history_list.property("data") or []
+        plot_args = self.last_plot_args or {}
+        observations = plot_args.get("observations") or []
         if not observations:
             QMessageBox.warning(self, "Error", "No data to export.")
             return
@@ -7198,30 +6868,10 @@ class INatSeasonalVisualizer(QMainWindow):
                 return
 
             filename = file_dialog.selectedFiles()[0]
-            source = (
-                "Local" if self.info_bar.text().startswith("Source: Local") else "API"
+            df = pd.DataFrame(
+                observation_export_rows(observations, plot_args.get("source", "API"))
             )
-            data = []
-            for obs in observations:
-                data.append(
-                    {
-                        "id": obs.get("id"),
-                        "latitude": obs.get(
-                            "decimalLatitude" if source == "Local" else "geojson", {}
-                        ).get("coordinates", [None, None])[1],
-                        "longitude": obs.get(
-                            "decimalLongitude" if source == "Local" else "geojson", {}
-                        ).get("coordinates", [None, None])[0],
-                        "date": obs.get(
-                            "eventDate" if source == "Local" else "observed_on"
-                        ),
-                        "taxonID": obs.get(
-                            "taxonID" if source == "Local" else "taxon_id"
-                        ),
-                    }
-                )
 
-            df = pd.DataFrame(data)
             df.to_csv(filename, index=False)
             QMessageBox.information(self, "Success", f"Data exported to {filename}")
 
@@ -7229,19 +6879,41 @@ class INatSeasonalVisualizer(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to export data: {e!s}")
             logging.error(f"Export data failed: {e!s}")
 
+    def _trim_history_results(self) -> None:
+        """Keep observation lists only for the newest seasonal history items.
+
+        A list can hold hundreds of thousands of rows, so older entries keep
+        their label and search parameters but drop the data. Abundance items
+        store a few thousand cells and keep them.
+        """
+        retained = 0
+        for index in range(self.history_list.count() - 1, -1, -1):
+            item = self.history_list.item(index)
+            data = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if not isinstance(data, dict) or "plot_args" not in data:
+                continue
+            if data["plot_args"].get("observations") is None:
+                continue
+            retained += 1
+            if retained > HISTORY_RESULTS_RETAINED:
+                data["plot_args"]["observations"] = None
+                item.setData(Qt.ItemDataRole.UserRole, data)
+
     def load_history_item(self) -> None:
-        """Load and replot a history item."""
+        """Show the graph or map that a history item recorded."""
         current_item = self.history_list.currentItem()
-        abundance = (
+        data = (
             current_item.data(Qt.ItemDataRole.UserRole)
             if current_item is not None
             else None
         )
-        if isinstance(abundance, dict) and "cells" in abundance:
+        if not isinstance(data, dict):
+            return
+        if "cells" in data:
             self.mode_combo.setCurrentText(ABUNDANCE_MODE_TEXT)
-            context = abundance["context"]
+            context = data["context"]
             self._ensure_abundance_view().set_results(
-                abundance["cells"],
+                data["cells"],
                 context["cell_deg"],
                 self._abundance_metric(),
                 self.min_obs_input.value(),
@@ -7249,42 +6921,23 @@ class INatSeasonalVisualizer(QMainWindow):
             )
             return
 
-        observations = self.history_list.property("data") or []
-        if not observations:
+        plot_args = data.get("plot_args")
+        if not plot_args:
             return
-
+        if plot_args.get("observations") is None:
+            QMessageBox.information(
+                self,
+                "History",
+                "The observations for this search are no longer kept in memory. "
+                "Run the search again to see its graph.",
+            )
+            return
         try:
-            try:
-                lat = float(self.lat_input.text().strip())
-                lon = float(self.lon_input.text().strip())
-            except ValueError:
-                lat = float(self.default_lat)
-                lon = float(self.default_lon)
-
-            radius = float(self.radius_input.text())
-            organism = self.organism_input.text().strip() or "All Organisms"
-            date_from = self.date_from.text()
-            date_to = self.date_to.text()
-            view = self.view_combo.currentText().lower()
-            _item = self.history_list.currentItem()
-            source = (
-                "Local"
-                if _item is not None and _item.text().endswith("(Local)")
-                else "API"
-            )
-
-            self.plot_observations(
-                observations,
-                lat,
-                lon,
-                radius,
-                organism,
-                date_from,
-                date_to,
-                view,
-                source,
-            )
-
+            # The item carries the observations and parameters it was plotted
+            # with, so it shows its own graph rather than the latest data
+            # under whatever the form holds now.
+            self.mode_combo.setCurrentText(SEASONAL_MODE_TEXT)
+            self.plot_observations(**plot_args, record_history=False)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to load history item: {e!s}")
             logging.error(f"Load history item failed: {e!s}")

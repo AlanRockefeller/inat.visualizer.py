@@ -1,0 +1,10 @@
+# Web version dependencies (FastAPI server only, no PyQt6/matplotlib).
+# Install with: pip install -r requirements-web.txt
+fastapi>=0.110
+uvicorn[standard]>=0.29
+duckdb>=1.0.0
+pandas>=2.2
+numpy>=1.26
+pyarrow>=17.0
+# fastapi.testclient (tests/test_web_api.py) needs httpx.
+httpx>=0.27

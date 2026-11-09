@@ -97,6 +97,7 @@ class MapDialogWorkflowTests(unittest.TestCase):
             import io
             import logging
             import math
+            import time
             from types import SimpleNamespace
             from PyQt6.QtWidgets import QApplication, QPushButton
             import visualizer
@@ -137,7 +138,13 @@ class MapDialogWorkflowTests(unittest.TestCase):
             dialog = visualizer.MapDialog(None, 37.7749, -122.4194, 10.5)
             assert dialog.worker.requests == []
             dialog.show()
-            app.processEvents()
+            # The first tile request is issued from a zero-delay timer started
+            # in showEvent. Newer Qt releases need more than one event-loop
+            # pass before that timer fires, so pump events until it does.
+            deadline = time.monotonic() + 5.0
+            while not dialog.worker.requests and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
             assert dialog.worker.requests
 
             assert dialog.windowTitle() == "Choose Search Area"

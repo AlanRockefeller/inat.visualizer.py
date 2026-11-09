@@ -1,0 +1,25 @@
+# Rebuilds observations.parquet and taxonomy.parquet from iNaturalist's DwC-A
+# exports. Triggered weekly by inat-visualizer-update.timer; run by hand with
+#   sudo systemctl start inat-visualizer-update
+# The web service notices the new files by size/mtime and clears its caches,
+# so it does not need a restart.
+[Unit]
+Description=Update iNaturalist Seasonal Visualizer database
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=inatviz
+Group=inatviz
+WorkingDirectory=/srv/inat-visualizer/data
+ExecStart=/opt/inat-visualizer/.venv-web/bin/python /opt/inat-visualizer/update_database.py \
+    --output-dir /srv/inat-visualizer/data
+Nice=10
+IOSchedulingClass=idle
+MemoryMax=6G
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/inat-visualizer/data
