@@ -1,0 +1,43 @@
+# systemd unit for the web visualizer. Install:
+#   sudo cp deploy/inat-visualizer.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now inat-visualizer
+[Unit]
+Description=iNaturalist Seasonal Visualizer (web)
+After=network.target
+
+[Service]
+Type=simple
+User=inatviz
+Group=inatviz
+WorkingDirectory=/opt/inat-visualizer
+Environment=INAT_DATA_DIR=/srv/inat-visualizer/data
+Environment=INAT_MAX_CONCURRENT_QUERIES=2
+Environment=INAT_DUCKDB_MEMORY=3GB
+Environment=INAT_DUCKDB_THREADS=4
+Environment=INAT_QUERY_TIMEOUT=90
+ExecStart=/opt/inat-visualizer/.venv-web/bin/uvicorn webapp.server:app \
+    --host 127.0.0.1 --port 8765 --workers 1 \
+    --root-path /visualizer --proxy-headers --forwarded-allow-ips 127.0.0.1 \
+    --no-server-header
+Restart=on-failure
+RestartSec=3
+
+# Two queries at 3 GB each plus Python. DuckDB spills anything larger to
+# PrivateTmp; the kernel page cache for the parquet file does not count here.
+MemoryMax=8G
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadOnlyPaths=/srv/inat-visualizer/data /opt/inat-visualizer
+
+[Install]
+WantedBy=multi-user.target

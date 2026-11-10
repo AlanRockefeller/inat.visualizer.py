@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iNat Seasonal Visualizer</title>
+<meta name="description" content="Explore when and where organisms are observed on iNaturalist: seasonal graphs within a radius, and worldwide abundance maps for any time of year.">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"
+      integrity="sha384-c6Rcwz4e4CITMbu/NBmnNS8yN2sC3cUElMEMfP3vqqKFp7GOYaaBBCqmaWBjmkjb" crossorigin="anonymous">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>iNat Seasonal Visualizer</h1>
+  <p class="stats" id="stats">Loading database…</p>
+</header>
+
+<div class="layout">
+  <form class="sidebar" id="search-form" autocomplete="off">
+    <div class="segmented" role="tablist" aria-label="Mode">
+      <button type="button" role="tab" data-mode="seasonal" aria-selected="true">Seasonal graph</button>
+      <button type="button" role="tab" data-mode="abundance" aria-selected="false">Abundance map</button>
+    </div>
+
+    <fieldset>
+      <label for="organism">Organism</label>
+      <div class="taxon-picker" data-field="organism">
+        <input id="organism" type="search" placeholder="e.g. Agaricales, Amanita muscaria">
+        <ul class="suggestions" role="listbox" hidden></ul>
+      </div>
+      <p class="hint" id="organism-hint">Leave empty for all organisms.</p>
+
+      <label for="exclude">Exclude</label>
+      <div class="taxon-picker" data-field="exclude">
+        <input id="exclude" type="search" placeholder="Optional taxon to leave out">
+        <ul class="suggestions" role="listbox" hidden></ul>
+      </div>
+
+      <div class="row">
+        <div><label for="date-from">From</label><input id="date-from" type="date" required></div>
+        <div><label for="date-to">To</label><input id="date-to" type="date" required></div>
+      </div>
+    </fieldset>
+
+    <fieldset data-show="seasonal">
+      <label for="place">Place</label>
+      <div class="place-picker">
+        <input id="place" type="search" placeholder="Search for a place, or click the map">
+        <ul class="suggestions" role="listbox" hidden></ul>
+      </div>
+      <div class="row three">
+        <div><label for="lat">Latitude</label><input id="lat" type="number" step="0.0001" min="-90" max="90" required></div>
+        <div><label for="lon">Longitude</label><input id="lon" type="number" step="0.0001" min="-180" max="180" required></div>
+        <div><label for="radius">Radius km</label><input id="radius" type="number" step="1" min="1" max="1000" required></div>
+      </div>
+      <label for="view">Group by</label>
+      <select id="view">
+        <option value="daily">Day of year</option>
+        <option value="weekly" selected>Week</option>
+        <option value="monthly">Month</option>
+      </select>
+    </fieldset>
+
+    <fieldset data-show="abundance" hidden>
+      <label for="season-preset">Time of year</label>
+      <select id="season-preset"></select>
+      <div class="row">
+        <div>
+          <label for="season-start-month">Start</label>
+          <div class="month-day">
+            <select id="season-start-month" aria-label="Start month"></select>
+            <select id="season-start-day" aria-label="Start day"></select>
+          </div>
+        </div>
+        <div>
+          <label for="season-end-month">End</label>
+          <div class="month-day">
+            <select id="season-end-month" aria-label="End month"></select>
+            <select id="season-end-day" aria-label="End day"></select>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label for="cell-deg">Grid cell</label>
+          <select id="cell-deg">
+            <option value="0.25">0.25°</option>
+            <option value="0.5">0.5°</option>
+            <option value="1" selected>1°</option>
+            <option value="2">2°</option>
+          </select>
+        </div>
+        <div>
+          <label for="metric">Rank by</label>
+          <select id="metric">
+            <option value="count" selected>Observations</option>
+            <option value="share">% of all observations</option>
+          </select>
+        </div>
+      </div>
+      <label for="min-obs">Minimum observations per cell</label>
+      <input id="min-obs" type="number" min="1" max="100000" value="10" disabled>
+      <p class="hint">Share ranking skips cells with fewer observations, so a cell with one sighting can't top the list.</p>
+    </fieldset>
+
+    <div class="actions">
+      <button type="submit" class="primary" id="run">Graph</button>
+      <button type="button" id="cancel" hidden>Cancel</button>
+    </div>
+    <p class="status" id="status" role="status" aria-live="polite"></p>
+  </form>
+
+  <main class="content">
+    <div id="map" class="map" aria-label="Map"></div>
+
+    <section class="panel" data-show="seasonal" id="chart-panel">
+      <div class="panel-head">
+        <h2 id="chart-title">Search to see when an organism is observed.</h2>
+        <div class="panel-actions">
+          <button type="button" id="download-png" disabled>PNG</button>
+          <button type="button" id="download-csv" disabled>CSV</button>
+        </div>
+      </div>
+      <p class="summary" id="chart-summary"></p>
+      <div class="chart-wrap"><canvas id="chart" role="img" aria-label="Observations by time of year"></canvas></div>
+    </section>
+
+    <section class="panel" data-show="abundance" id="abundance-panel" hidden>
+      <div class="panel-head">
+        <h2 id="abundance-title">Pick an organism and a time of year to see where it is observed most.</h2>
+        <div class="panel-actions">
+          <button type="button" id="graph-cell" disabled>Graph this area</button>
+        </div>
+      </div>
+      <p class="summary" id="abundance-summary"></p>
+      <div class="legend" id="legend" hidden>
+        <span id="legend-min"></span><span class="ramp"></span><span id="legend-max"></span>
+        <span class="legend-label" id="legend-label"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="ranking">
+          <thead><tr><th class="num">#</th><th>Location</th><th class="num">Obs</th><th class="num">Share</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer class="footer">
+  Observation data from <a href="https://www.inaturalist.org/" rel="noopener">iNaturalist</a> (research-grade, via GBIF export).
+  Desktop app and source on <a href="https://github.com/AlanRockefeller/inat.visualizer.py" rel="noopener">GitHub</a>.
+</footer>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"
+        integrity="sha384-NElt3Op+9NBMCYaef5HxeJmU4Xeard/Lku8ek6hoPTvYkQPh3zLIrJP7KiRocsxO" crossorigin="anonymous"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
+        integrity="sha384-bs/nf9FbdNouRbMiFcrcZfLXYPKiPaGVGplVbv7dLGECccEXDW+S3zjqSKR5ZEaD" crossorigin="anonymous"></script>
+<script src="app.js"></script>
+</body>
+</html>

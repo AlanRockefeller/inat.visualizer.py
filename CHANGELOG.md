@@ -2,6 +2,72 @@
 
 All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **Web version** at https://dikarya.us/visualizer/: a FastAPI server
+  (`webapp/`) and a Leaflet/Chart.js page offering the seasonal graph and the
+  abundance map from the local database. The DuckDB queries moved into
+  `inat_core.py`, which the desktop app and the server share. `deploy/` holds
+  the systemd units, nginx snippet, weekly database-update timer and deploy
+  script.
+- A GitHub Actions workflow now runs the test suite on every push and pull
+  request.
+
+### Fixed
+
+- **Saving settings no longer breaks the next launch.** Coordinates saved as
+  numbers came back from QSettings as floats, which the text fields rejected
+  during startup.
+- **Export Data** works again for local searches and now writes the taxon ID
+  of live iNaturalist records (previously always empty).
+- **Export Graph** keeps its metadata block for all-organisms searches and
+  honours the PNG choice instead of forcing `.jpg`.
+- **Searches near the antimeridian** (Fiji, the Aleutians, Chukotka) no
+  longer miss observations on the other side of 180° longitude, and a search
+  circle that contains a pole now covers every longitude.
+- Choosing a graph colour recolours the current graph instead of starting a
+  new live iNaturalist search. Changing the font size no longer adds a
+  duplicate history entry.
+- Clicking an older history item shows that search's own graph; previously it
+  replotted the newest observations under the old label. The ten most recent
+  seasonal searches keep their observations in memory.
+- Live searches that match more than 10,000 observations now plot the
+  observations iNaturalist returns and warn, instead of failing outright.
+- Web: cancelling in the browser now stops the query on the server and frees
+  its slot; daily bins follow a leap-year calendar so chart labels match the
+  dates; taxonomy expansion runs under the same memory, time and concurrency
+  limits as other queries and survives a parent cycle; results computed while
+  the weekly database swap lands are not cached; CSV downloads scan the file
+  once.
+
+## [1.0.9] - 2026-09-28
+
+### Added
+
+- **Abundance map mode:** pick an organism and a time of year (the season can
+  wrap across the new year) to see where in the world it is observed most. It
+  shows a heatmap on an OpenStreetMap base map and a ranked top-25 list with
+  place names. Ranking is by raw count or by share of all observations in the
+  area, which corrects for observer effort. **Graph seasonality here** jumps
+  from a hotspot to its seasonal graph. Requires the local database.
+  A **Hide map** button shows just the observation cells on a black
+  background, and a season picker offers presets (months, seasons, around
+  today) plus plain month/day menus.
+
+### Fixed
+
+- Local searches for higher taxa with many descendants (such as Agaricales,
+  about 30,000 taxon IDs) are now roughly 100× faster. Taxon filters are loaded
+  into a DuckDB temporary table instead of a huge literal `IN (...)` list.
+- Map tiles now line up with the search circle and heatmap at continental and
+  world zoom levels. Web-Mercator tiles are resampled to the map's
+  latitude/longitude axes.
+- Recognize OpenStreetMap's "Access blocked" placeholder tile, which is served
+  with a success status. It is no longer cached or shown as map content, and
+  previously cached copies are removed.
+
 ## [1.0.8] - 2026-07-20
 
 ### Changed
