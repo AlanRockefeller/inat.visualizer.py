@@ -6,7 +6,7 @@ All notable changes to the iNaturalist Seasonal Visualizer are documented here.
 
 ### Added
 
-- **Web version** at https://dikarya.us/visualizer/: a FastAPI server
+- **Web version** at https://visualizer.dikarya.us/: a FastAPI server
   (`webapp/`) and a Leaflet/Chart.js page offering the seasonal graph and the
   abundance map from the local database. The DuckDB queries moved into
   `inat_core.py`, which the desktop app and the server share. `deploy/` holds

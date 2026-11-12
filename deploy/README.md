@@ -1,84 +1,89 @@
 # Deploying the web version to dikarya.us
 
 The web app is a FastAPI server (`webapp/server.py`) behind nginx at
-`https://dikarya.us/visualizer/`. It runs the same DuckDB queries as the desktop
+`https://visualizer.dikarya.us/`. It runs the same DuckDB queries as the desktop
 app against `observations.parquet` and `taxonomy.parquet`. The browser looks up
 taxon and place names directly from `api.inaturalist.org`. nginx caches
 OpenStreetMap tiles on disk as they are requested.
 
 ```
-browser ──https──> nginx ─┬─ /visualizer/        → uvicorn 127.0.0.1:8765 (static page)
-                          ├─ /visualizer/api/    → uvicorn (rate limited)
-                          └─ /visualizer/tiles/  → tile.openstreetmap.org (disk cache)
+browser ──https──> nginx ─┬─ /        → uvicorn 127.0.0.1:8765 (static page)
+                          ├─ /api/    → uvicorn (rate limited)
+                          └─ /tiles/  → tile.openstreetmap.org (disk cache)
 ```
 
-## One-time setup (on the server)
+| Repository file | Installed as |
+|---|---|
+| `deploy/inat-visualizer.service` | `/etc/systemd/system/inat-visualizer.service` |
+| `deploy/inat-visualizer-update.service` | `/etc/systemd/system/inat-visualizer-update.service` |
+| `deploy/inat-visualizer-update.timer` | `/etc/systemd/system/inat-visualizer-update.timer` (not enabled) |
+| `deploy/nginx-visualizer.conf` | `/etc/nginx/sites-enabled/visualizer.dikarya.us.conf` |
+
+The server's `nginx.conf` includes `sites-enabled/*` but not `conf.d/`, so the
+vhost file also carries the http-level tile cache and rate-limit zones.
+
+## One-time setup
+
+DNS for `visualizer.dikarya.us` must point at the server. Then, from a
+workstation that has the two Parquet files:
 
 ```bash
-# 1. System user, code, and Python environment
-sudo apt install -y python3-venv git
-sudo useradd --system --home /opt/inat-visualizer --shell /usr/sbin/nologin inatviz
-sudo mkdir -p /opt/inat-visualizer /srv/inat-visualizer/data
-sudo chown inatviz: /opt/inat-visualizer /srv/inat-visualizer/data
-sudo -u inatviz git clone https://github.com/AlanRockefeller/inat.visualizer.py /opt/inat-visualizer
-cd /opt/inat-visualizer
-sudo -u inatviz python3 -m venv .venv-web
-sudo -u inatviz .venv-web/bin/pip install -r requirements-web.txt
-
-# 2. Data. Either copy the existing files from your workstation:
-#      rsync -P observations.parquet taxonomy.parquet dikarya.us:/tmp/
-#      sudo mv /tmp/*.parquet /srv/inat-visualizer/data/ && sudo chown inatviz: /srv/inat-visualizer/data/*
-#    or build them on the server (downloads several GB from iNaturalist):
-sudo -u inatviz .venv-web/bin/python update_database.py --output-dir /srv/inat-visualizer/data
-
-# 3. Services
-sudo cp deploy/inat-visualizer.service deploy/inat-visualizer-update.service \
-        deploy/inat-visualizer-update.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now inat-visualizer inat-visualizer-update.timer
-curl -s http://127.0.0.1:8765/api/stats
-
-# 4. nginx
-sudo cp deploy/nginx-visualizer-http.conf /etc/nginx/conf.d/inat-visualizer.conf
-sudo cp deploy/nginx-visualizer.conf /etc/nginx/snippets/inat-visualizer.conf
-sudo mkdir -p /var/cache/nginx/osm-tiles && sudo chown www-data: /var/cache/nginx/osm-tiles
-#    Add this line inside the existing dikarya.us `server { listen 443 ssl; ... }` block
-#    (e.g. /etc/nginx/sites-enabled/dikarya.us):
-#        include snippets/inat-visualizer.conf;
-sudo nginx -t && sudo systemctl reload nginx
+rsync -P observations.parquet taxonomy.parquet dikarya.us:inatviz-data/
+scp deploy/setup.sh dikarya.us:inatviz-setup.sh
+ssh -t dikarya.us sudo bash inatviz-setup.sh --data ~/inatviz-data
 ```
 
-The existing TLS certificate for dikarya.us already covers the `/visualizer/` path.
+`setup.sh` creates the `inatviz` user, clones the repository into
+`/opt/inat-visualizer` (`--branch` picks the branch, default `main`), builds the
+Python environment, installs the data into `/srv/inat-visualizer/data`, installs
+and starts the service, obtains a Let's Encrypt certificate through the shared
+`/var/www/letsencrypt` webroot, installs the vhost and smoke-tests the site. It
+can be run again; finished steps are skipped. The Parquet copies in
+`~/inatviz-data` can be deleted afterwards.
 
 ## Updating the code
 
-Push your changes, then run `deploy/deploy.sh` from your workstation. It pulls,
-installs dependencies, installs any changed files from `deploy/` into
-`/etc/systemd/system` and `/etc/nginx` (reloading systemd and nginx as needed),
-restarts the service, and smoke-tests the public URL.
+Push your changes to the branch the server checkout tracks, then run
+`deploy/deploy.sh` from your workstation. sudo asks for your password once. The
+script pulls, installs dependencies, installs any changed files from `deploy/`
+(table above), tests and reloads nginx, restarts the service, and smoke-tests
+the public URL. If nginx rejects a changed vhost, the previous file is put back.
 
 ## Database updates
 
-`inat-visualizer-update.timer` rebuilds the Parquet files every Sunday morning
-with `update_database.py`. Each new file is swapped in atomically (taxonomy
-first, then observations, so a query in the second or so between the two swaps
-can pair the new taxonomy with the old observations), and the server clears its
-caches when their size or mtime changes, so no restart is needed. Results
-computed while a swap lands are not cached. To run it now: `sudo systemctl start inat-visualizer-update` and follow
-it with `journalctl -fu inat-visualizer-update`.
+`inat-visualizer-update.timer` would rebuild the Parquet files every Sunday with
+`update_database.py`, but it is **left disabled on dikarya.us**: the
+observations archive is about 30 GB and its extracted CSV is larger still, more
+than the shared disk has free. Rebuild on a workstation instead and copy the
+results in:
+
+```bash
+python update_database.py
+rsync -P observations.parquet taxonomy.parquet dikarya.us:inatviz-data/
+ssh -t dikarya.us 'for f in taxonomy observations; do
+  sudo install -o inatviz -g inatviz -m 644 ~/inatviz-data/$f.parquet /srv/inat-visualizer/data/$f.parquet.new &&
+  sudo mv /srv/inat-visualizer/data/$f.parquet.new /srv/inat-visualizer/data/$f.parquet; done'
+```
+
+Each `mv` is atomic (taxonomy first, then observations, so a query in the
+second or so between the two can pair the new taxonomy with the old
+observations), and the server clears its caches when the files' size or mtime
+changes, so no restart is needed. On a server with enough disk, enable the
+timer with `sudo systemctl enable --now inat-visualizer-update.timer`; follow a
+run with `journalctl -fu inat-visualizer-update`.
 
 ## Tile cache
 
 - Tiles are cached **on demand only**. Do not bulk-download or pre-seed tiles:
   the [OSM tile usage policy](https://operations.osmfoundation.org/policies/tiles/)
   forbids it and OSM blocks servers that do it.
-- The cache is capped by `max_size` (30 GB) in
-  `/etc/nginx/conf.d/inat-visualizer.conf`. Tiles unused for 90 days are
+- The cache is capped by `max_size` (5 GB) in
+  `/etc/nginx/sites-enabled/visualizer.dikarya.us.conf`. Tiles unused for 90 days are
   evicted. Expired tiles are refreshed with conditional requests, which are
   cheap `304 Not Modified` replies when nothing changed.
 - Check the size with `du -sh /var/cache/nginx/osm-tiles`. To see whether a
   tile came from the cache, run
-  `curl -sI https://dikarya.us/visualizer/tiles/3/1/3.png | grep -i x-cache`.
+  `curl -sI https://visualizer.dikarya.us/tiles/3/1/3.png | grep -i x-cache`.
 
 ## Tuning (environment variables in the service unit)
 
@@ -87,7 +92,7 @@ it with `journalctl -fu inat-visualizer-update`.
 | `INAT_DATA_DIR` | `.` | Directory holding the two Parquet files |
 | `INAT_MAX_CONCURRENT_QUERIES` | `2` | DuckDB queries running at once; others wait |
 | `INAT_DUCKDB_MEMORY` | `4GB` (unit sets `3GB`) | DuckDB memory limit per query |
-| `INAT_DUCKDB_THREADS` | `4` | DuckDB threads per query |
+| `INAT_DUCKDB_THREADS` | `4` (unit sets `2`) | DuckDB threads per query |
 | `INAT_QUERY_TIMEOUT` | `90` | Seconds before a query is interrupted (HTTP 504) |
 | `INAT_MAX_CSV_ROWS` | `500000` | Largest CSV download |
 | `INAT_RESULT_CACHE_ENTRIES` | `256` | Cached query results |

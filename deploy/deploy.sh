@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Update the web visualizer on the server and smoke-test it.
 #   deploy/deploy.sh [ssh-host] [public-url]
-#   defaults: dikarya.us  https://dikarya.us/visualizer
+#   defaults: dikarya.us  https://visualizer.dikarya.us
+# First install: deploy/setup.sh.
 # Deploys whatever is pushed on the branch the server checkout tracks, installs
 # any systemd or nginx files that changed in deploy/, reloads what they affect,
 # restarts the service and checks it answers at the public URL.
@@ -12,7 +13,7 @@ APP_DIR=/opt/inat-visualizer
 if [ -n "${2:-}" ]; then
   URL="$2"
 elif [ "$HOST" = "dikarya.us" ]; then
-  URL="https://dikarya.us/visualizer"
+  URL="https://visualizer.dikarya.us"
 else
   # Smoke-testing dikarya.us would say nothing about a deployment elsewhere.
   echo "usage: deploy/deploy.sh [ssh-host] [public-url]" >&2
@@ -20,8 +21,11 @@ else
   exit 2
 fi
 
-ssh "$HOST" "APP_DIR=$APP_DIR bash -s" <<'REMOTE'
+# Passed as an argument rather than on stdin so `ssh -t` gives sudo a terminal
+# to ask for the password (once; sudo caches it for the rest of the run).
+remote_script=$(cat <<'REMOTE'
 set -euo pipefail
+sudo -v
 cd "$APP_DIR"
 sudo -u inatviz git pull --ff-only
 sudo -u inatviz .venv-web/bin/pip install -q -r requirements-web.txt
@@ -30,8 +34,10 @@ sudo -u inatviz .venv-web/bin/pip install -q -r requirements-web.txt
 # files (see deploy/README.md for where they live), so install the ones that
 # changed and reload the daemon that reads them.
 units_changed=0
-replaced=()   # nginx files replaced this run; the previous copy sits beside them
+replaced=()   # nginx files replaced this run; the previous copy is in $backups
 added=()      # nginx files that did not exist before this run
+# Not beside the originals: nginx loads every file in sites-enabled.
+backups=$(mktemp -d)
 while read -r source installed; do
   if ! sudo cmp -s "$source" "$installed"; then
     echo "Installing $installed from $source"
@@ -41,7 +47,7 @@ while read -r source installed; do
         # Remember what was there so a file that fails `nginx -t` or the
         # reload can be undone instead of breaking the next nginx restart.
         if sudo test -e "$installed"; then
-          sudo cp -p "$installed" "$installed.deploy-previous"
+          sudo cp -p "$installed" "$backups/$(basename "$installed")"
           replaced+=("$installed")
         else
           added+=("$installed")
@@ -54,17 +60,18 @@ done <<'FILES'
 deploy/inat-visualizer.service /etc/systemd/system/inat-visualizer.service
 deploy/inat-visualizer-update.service /etc/systemd/system/inat-visualizer-update.service
 deploy/inat-visualizer-update.timer /etc/systemd/system/inat-visualizer-update.timer
-deploy/nginx-visualizer-http.conf /etc/nginx/conf.d/inat-visualizer.conf
-deploy/nginx-visualizer.conf /etc/nginx/snippets/inat-visualizer.conf
+deploy/nginx-visualizer.conf /etc/nginx/sites-enabled/visualizer.dikarya.us.conf
 FILES
 if [ "$units_changed" -eq 1 ]; then
   sudo systemctl daemon-reload
-  sudo systemctl restart inat-visualizer-update.timer
+  # try-restart: the timer is left disabled where the disk cannot hold the
+  # rebuild (see deploy/README.md), and a deployment must not start it.
+  sudo systemctl try-restart inat-visualizer-update.timer
 fi
 undo_nginx_files() {
   for installed in "${replaced[@]}"; do
     echo "Restoring $installed" >&2
-    sudo mv "$installed.deploy-previous" "$installed"
+    sudo mv "$backups/$(basename "$installed")" "$installed"
   done
   for installed in "${added[@]}"; do
     echo "Removing $installed" >&2
@@ -83,9 +90,7 @@ if ! sudo systemctl reload nginx; then
   echo "ERROR: nginx did not reload; the nginx files are back as they were." >&2
   exit 1
 fi
-for installed in "${replaced[@]}"; do
-  sudo rm -f "$installed.deploy-previous"
-done
+sudo rm -rf "$backups"
 
 sudo systemctl restart inat-visualizer
 healthy=0
@@ -102,6 +107,8 @@ if [ "$healthy" -ne 1 ]; then
   exit 1
 fi
 REMOTE
+)
+ssh -t "$HOST" "APP_DIR=$APP_DIR bash -c $(printf '%q' "$remote_script")"
 
 echo "Checking $URL ..."
 curl -fsS "$URL/api/stats"

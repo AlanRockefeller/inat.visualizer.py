@@ -13,11 +13,11 @@ WorkingDirectory=/opt/inat-visualizer
 Environment=INAT_DATA_DIR=/srv/inat-visualizer/data
 Environment=INAT_MAX_CONCURRENT_QUERIES=2
 Environment=INAT_DUCKDB_MEMORY=3GB
-Environment=INAT_DUCKDB_THREADS=4
+Environment=INAT_DUCKDB_THREADS=2
 Environment=INAT_QUERY_TIMEOUT=90
 ExecStart=/opt/inat-visualizer/.venv-web/bin/uvicorn webapp.server:app \
     --host 127.0.0.1 --port 8765 --workers 1 \
-    --root-path /visualizer --proxy-headers --forwarded-allow-ips 127.0.0.1 \
+    --proxy-headers --forwarded-allow-ips 127.0.0.1 \
     --no-server-header
 Restart=on-failure
 RestartSec=3
