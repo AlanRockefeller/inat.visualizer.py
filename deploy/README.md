@@ -30,7 +30,7 @@ workstation that has the two Parquet files:
 ```bash
 rsync -P observations.parquet taxonomy.parquet dikarya.us:inatviz-data/
 scp deploy/setup.sh dikarya.us:inatviz-setup.sh
-ssh -t dikarya.us sudo bash inatviz-setup.sh --data ~/inatviz-data
+ssh -t dikarya.us 'sudo bash inatviz-setup.sh --data "$HOME/inatviz-data"'
 ```
 
 `setup.sh` creates the `inatviz` user, clones the repository into
