@@ -119,6 +119,10 @@ fi
 [ -n "$backup" ] && rm -f "$backup"
 
 echo "== Check"
-curl -fsS "https://$DOMAIN/api/stats"; echo
-curl -fsS -o /dev/null -D - "https://$DOMAIN/tiles/2/1/1.png" | grep -i '^x-cache-status' || true
+# Through the local nginx with the real name and certificate: the server sits
+# behind NAT and cannot reach its own public address.
+local_tls=(--resolve "$DOMAIN:443:127.0.0.1")
+curl -fsS "${local_tls[@]}" "https://$DOMAIN/api/stats"; echo
+curl -fsS "${local_tls[@]}" -o /dev/null -D - "https://$DOMAIN/tiles/2/1/1.png" |
+  grep -i '^x-cache-status' || true
 echo "Done: https://$DOMAIN/"
