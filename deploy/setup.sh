@@ -36,8 +36,18 @@ mkdir -p "$APP_DIR" "$DATA_DIR"
 chown inatviz: "$APP_DIR" "$DATA_DIR"
 if [ ! -d "$APP_DIR/.git" ]; then
   sudo -u inatviz git clone --branch "$BRANCH" "$REPO" "$APP_DIR"
+else
+  sudo -u inatviz git -C "$APP_DIR" pull --ff-only
 fi
 cd "$APP_DIR"
+# A branch from before the subdomain layout has no setup.sh and an nginx file
+# that is not a vhost; installing its units and nginx file would fail late.
+if [ ! -f deploy/setup.sh ] || ! grep -q "server_name $DOMAIN;" deploy/nginx-visualizer.conf; then
+  echo "The $(sudo -u inatviz git rev-parse --abbrev-ref HEAD) checkout in $APP_DIR predates the" \
+       "$DOMAIN layout. Merge it into that branch, or switch the checkout:" >&2
+  echo "  sudo -u inatviz git -C $APP_DIR switch BRANCH" >&2
+  exit 1
+fi
 [ -x .venv-web/bin/python ] || sudo -u inatviz python3 -m venv .venv-web
 sudo -u inatviz .venv-web/bin/pip install -q -r requirements-web.txt
 
