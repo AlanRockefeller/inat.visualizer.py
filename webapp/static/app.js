@@ -591,7 +591,9 @@ async function runSeasonal(signal) {
   $("download-png").disabled = data.total === 0;
   $("download-csv").disabled = data.total === 0;
   renderChart();
-  if (data.total) setMapVisible(false);
+  // Only while still on the seasonal view: the mode can change mid-search, and
+  // an empty result keeps the map out so the area can be adjusted.
+  if (state.mode === "seasonal") setMapVisible(!data.total);
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   setStatus(data.total ? `Done in ${seconds}s.` : "No observations match this search.");
 }
