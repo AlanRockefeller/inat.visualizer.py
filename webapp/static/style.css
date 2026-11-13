@@ -11,8 +11,8 @@
   --accent-soft: #e2efe4;
   --danger: #a3302a;
   --grid: #e6e9e3;
-  --bar: #2f6f3e;
-  --bar-hover: #1f4f2b;
+  --bar: #1f77b4;
+  --bar-hover: #185f90;
   --selection: #1565c0;
   --radius: 8px;
   --tile-filter: none;
@@ -33,8 +33,8 @@
     --accent-soft: #263a2a;
     --danger: #f08a82;
     --grid: #2d352d;
-    --bar: #7cc48a;
-    --bar-hover: #a6dcb0;
+    --bar: #1f77b4;
+    --bar-hover: #4c95c8;
     --selection: #64b5f6;
     --tile-filter: brightness(0.8) contrast(1.05);
     color-scheme: dark;
