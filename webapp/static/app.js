@@ -604,7 +604,7 @@ function downloadPng() {
   ctx.fillText($("chart-title").textContent, pad * scale, 24 * scale);
   ctx.fillStyle = cssVar("--text-2");
   ctx.font = `${12 * scale}px ${getComputedStyle(document.body).fontFamily}`;
-  ctx.fillText(`${$("chart-summary").textContent} Source: iNaturalist via dikarya.us/visualizer`,
+  ctx.fillText(`${$("chart-summary").textContent} Source: iNaturalist via visualizer.dikarya.us`,
     pad * scale, 42 * scale);
   ctx.drawImage(source, pad * scale, titleHeight * scale);
   out.toBlob((blob) => downloadBlob(blob, "inat-seasonal.png"), "image/png");

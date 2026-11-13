@@ -52,7 +52,7 @@ It also includes an **interactive map dialog** (OpenStreetMap tiles) to set coor
 ## Web version
 
 A browser version of the two local-database modes, the seasonal graph and the
-abundance map, runs at **https://dikarya.us/visualizer/**. It is a FastAPI server
+abundance map, runs at **https://visualizer.dikarya.us/**. It is a FastAPI server
 (`webapp/server.py`) that shares its DuckDB queries with the desktop app through
 `inat_core.py`. The page itself is plain HTML/JS using Leaflet and Chart.js.
 [deploy/README.md](deploy/README.md) covers server setup: systemd, nginx, the
