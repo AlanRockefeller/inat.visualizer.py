@@ -192,6 +192,10 @@ button.primary { background: var(--accent); color: var(--accent-ink); border-col
 .summary { margin: 0; color: var(--text-2); font-size: 13px; }
 
 .chart-wrap { position: relative; height: 34vh; min-height: 240px; }
+/* With the map hidden, the graph takes the rest of the column. A zero flex
+   basis keeps Chart.js's canvas from feeding back into the container size. */
+.content.map-hidden #chart-panel { flex: 1 1 0; }
+.content.map-hidden .chart-wrap { flex: 1 1 0; height: auto; }
 
 .legend { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-2); }
 .legend .ramp {
@@ -222,5 +226,8 @@ tbody tr[aria-selected="true"] { background: var(--accent-soft); box-shadow: ins
   .sidebar { border-right: 0; border-bottom: 1px solid var(--border); }
   .map { height: 55vh; }
   .chart-wrap { height: 300px; }
+  /* The single-column layout has no fixed height to fill. */
+  .content.map-hidden #chart-panel { flex: none; }
+  .content.map-hidden .chart-wrap { flex: none; height: 70vh; }
   .panel-head { flex-direction: column; }
 }
