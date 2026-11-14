@@ -326,6 +326,24 @@ radiusHandle.on("dragend", updateSelectionOverlay);
   fitSelection();
 }));
 
+/* ---------- map visibility ---------- */
+
+// The seasonal graph hides the map once it has results (the map is only
+// needed to pick the area); the button brings it back.
+function setMapVisible(visible) {
+  const mapEl = $("map");
+  if (mapEl.hidden === !visible) return;
+  mapEl.hidden = !visible;
+  $("map-toggle").textContent = visible ? "Hide map" : "Show map";
+  $("map-toggle").setAttribute("aria-expanded", String(visible));
+  if (visible) {
+    // Leaflet cannot measure a hidden container, so size and fit on reveal.
+    map.invalidateSize();
+    if (state.mode === "seasonal") fitSelection();
+  }
+}
+$("map-toggle").addEventListener("click", () => setMapVisible($("map").hidden));
+
 /* ---------- mode switching ---------- */
 
 function setMode(mode) {
@@ -337,6 +355,7 @@ function setMode(mode) {
     // A disabled fieldset keeps its hidden controls out of form validation.
     if (el instanceof HTMLFieldSetElement) el.disabled = el.hidden;
   });
+  setMapVisible(true);
   $("run").textContent = mode === "seasonal" ? "Graph" : "Map abundance";
   $("organism-hint").textContent = mode === "seasonal"
     ? "Leave empty for all organisms." : "Required for the abundance map.";
@@ -572,6 +591,9 @@ async function runSeasonal(signal) {
   $("download-png").disabled = data.total === 0;
   $("download-csv").disabled = data.total === 0;
   renderChart();
+  // Only while still on the seasonal view: the mode can change mid-search, and
+  // an empty result keeps the map out so the area can be adjusted.
+  if (state.mode === "seasonal") setMapVisible(!data.total);
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
   setStatus(data.total ? `Done in ${seconds}s.` : "No observations match this search.");
 }
