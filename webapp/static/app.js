@@ -334,6 +334,7 @@ function setMapVisible(visible) {
   const mapEl = $("map");
   if (mapEl.hidden === !visible) return;
   mapEl.hidden = !visible;
+  mapEl.parentElement.classList.toggle("map-hidden", !visible);
   $("map-toggle").textContent = visible ? "Hide map" : "Show map";
   $("map-toggle").setAttribute("aria-expanded", String(visible));
   if (visible) {
