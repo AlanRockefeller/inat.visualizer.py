@@ -655,6 +655,8 @@ def region_polygons(geometry: Mapping[str, Any]) -> list:
                     or not -90 <= point[1] <= 90
                 ):
                     raise RegionError("A region position is not a valid [lon, lat].")
+            if ring[0][:2] != ring[-1][:2]:
+                raise RegionError("A region ring must end where it starts.")
             vertices += len(ring)
     if vertices > REGION_MAX_VERTICES:
         raise RegionError(
@@ -697,7 +699,11 @@ def load_spatial_extension(con) -> None:
 
 
 def region_points_sql(
-    geometry: Mapping[str, Any], date_from: str, date_to: str, filter_sql: str
+    geometry: Mapping[str, Any],
+    date_from: str,
+    date_to: str,
+    filter_sql: str,
+    with_id: bool = False,
 ) -> tuple[str, list[Any]]:
     """Return CTEs ``box`` (candidate rows) and ``inside`` (coordinates in the region).
 
@@ -709,7 +715,7 @@ def region_points_sql(
     sql = f"""
         WITH region AS (SELECT ST_GeomFromGeoJSON(?) AS geom),
         box AS (
-            SELECT id, decimalLatitude, decimalLongitude, eventDate, taxonID
+            SELECT {"id, " if with_id else ""}decimalLatitude, decimalLongitude, eventDate, taxonID
             FROM {{source}}
             WHERE CAST(eventDate AS DATE) BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
             AND decimalLatitude BETWEEN ? AND ?
@@ -754,7 +760,10 @@ def _region_query(
         check_observation_columns(con, escaped_path, required_columns)
         filter_sql = taxon_filter_sql(con, taxon_ids or [], exclude_taxon_ids or [])
         raise_if_search_cancelled(cancel_callback)
-        ctes, params = region_points_sql(geometry, date_from, date_to, filter_sql)
+        ctes, params = region_points_sql(
+            geometry, date_from, date_to, filter_sql,
+            with_id=required_columns is REQUIRED_ROW_COLUMNS,
+        )
         query = ctes.replace("{source}", f"'{escaped_path}'") + select_sql
         con.execute(query, params + (tail_params or []))
         result = fetch(con)

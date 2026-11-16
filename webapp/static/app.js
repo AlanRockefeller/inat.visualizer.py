@@ -48,6 +48,7 @@ const state = {
   taxa: { exclude: null }, // {id, label}
   organisms: [], // [{id, label}], compared as separate series; empty = all organisms
   place: null, // {id, name, geometry, lat, lon} while a named region is the search area
+  placeLoading: null, // promise for the place being picked, awaited by Graph
   lastRadius: 10, // restored when leaving region mode without a typed radius
   seasonal: null, // last /api/seasonal response + its request
   abundance: null, // last /api/abundance response + its request
@@ -293,24 +294,28 @@ function setupPlacePicker() {
       return results.filter((r) => r.type === "Place" && r.record?.location).map((r) => r.record);
     },
     render: (place) => escapeHtml(place.display_name || place.name),
-    onPick: async (place) => {
-      const [lat, lon] = place.location.split(",").map(Number);
-      input.value = place.display_name || place.name;
-      // Prefer the place's outline; fall back to a circle when it has none.
-      if (await selectRegion(place.id, input.value, [lat, lon])) return;
-      clearRegion();
-      setCenter(lat, lon);
-      const coords = place.bounding_box_geojson?.coordinates?.flat(3);
-      if (coords && coords.length >= 4) {
-        const lons = coords.filter((_, i) => i % 2 === 0);
-        const lats = coords.filter((_, i) => i % 2 === 1);
-        map.fitBounds([[Math.min(...lats), Math.min(...lons)], [Math.max(...lats), Math.max(...lons)]],
-          { padding: [20, 20], maxZoom: 12 });
-      } else {
-        map.setView([lat, lon], 10);
-      }
-    },
+    onPick: (place) => { state.placeLoading = pickPlace(place); },
   });
+}
+
+// Graph waits on this, so a search never runs with the previous area while
+// a newly picked place's outline is still loading.
+async function pickPlace(place) {
+  const [lat, lon] = place.location.split(",").map(Number);
+  $("place").value = place.display_name || place.name;
+  // Prefer the place's outline; fall back to a circle when it has none.
+  if (await selectRegion(place.id, $("place").value, [lat, lon])) return;
+  clearRegion();
+  setCenter(lat, lon);
+  const coords = place.bounding_box_geojson?.coordinates?.flat(3);
+  if (coords && coords.length >= 4) {
+    const lons = coords.filter((_, i) => i % 2 === 0);
+    const lats = coords.filter((_, i) => i % 2 === 1);
+    map.fitBounds([[Math.min(...lats), Math.min(...lons)], [Math.max(...lats), Math.max(...lons)]],
+      { padding: [20, 20], maxZoom: 12 });
+  } else {
+    map.setView([lat, lon], 10);
+  }
 }
 
 /* ---------- map ---------- */
@@ -396,7 +401,8 @@ radiusHandle.on("dragend", updateSelectionOverlay);
 // A typed radius or coordinate means a circle again, centred on the region's
 // middle unless the coordinates were edited too.
 ["lat", "lon", "radius"].forEach((id) => $(id).addEventListener("change", () => {
-  if (state.place && (id !== "radius" || $("radius").value !== "")) clearRegion();
+  // Also cancels an outline still loading, so it cannot replace this edit.
+  if (id !== "radius" || $("radius").value !== "") clearRegion();
   if (id === "radius" && $("radius").value) state.lastRadius = Number($("radius").value);
   updateSelectionOverlay();
   fitSelection();
@@ -433,6 +439,7 @@ async function selectRegion(id, name, center) {
     setStatus("Loading the outline of " + name + "…", "busy");
     place = await fetchPlace(id);
   } catch (error) {
+    if (request !== regionRequest) return true; // a later pick or edit won
     setStatus(`Could not load the outline of ${name}: ${error.message}`, "error");
     return false;
   }
@@ -818,6 +825,10 @@ async function checkResponse(response, format) {
 }
 
 async function runSeasonal(signal) {
+  if (state.placeLoading) {
+    setStatus("Waiting for the place outline…", "busy");
+    await state.placeLoading;
+  }
   const organisms = await resolveOrganisms(signal);
   const exclude = await resolveTaxon("exclude", signal);
   const area = state.place

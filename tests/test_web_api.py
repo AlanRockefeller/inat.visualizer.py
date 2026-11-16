@@ -319,6 +319,8 @@ class WebApiTests(unittest.TestCase):
         off_world = {"type": "Polygon", "coordinates": [[[0, 0], [200, 0], [0, 1], [0, 0]]]}
         self.assertEqual(self.region(off_world).status_code, 422)
         self.assertEqual(self.region(date_from="2022-02-30").status_code, 422)
+        unclosed = {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [1, 1], [0, 1]]]}
+        self.assertEqual(self.region(unclosed).status_code, 422)
 
     def test_region_without_spatial_extension_returns_503(self):
         from inat_core import SpatialUnavailable
