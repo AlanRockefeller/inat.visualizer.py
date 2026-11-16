@@ -28,6 +28,7 @@
         <input id="organism" type="search" placeholder="e.g. Agaricales, Amanita muscaria">
         <ul class="suggestions" role="listbox" hidden></ul>
       </div>
+      <ul class="chips" id="organism-chips" aria-label="Chosen organisms"></ul>
       <p class="hint" id="organism-hint">Leave empty for all organisms.</p>
 
       <label for="exclude">Exclude</label>
@@ -53,6 +54,7 @@
         <div><label for="lon">Longitude</label><input id="lon" type="number" step="0.0001" min="-180" max="180" required></div>
         <div><label for="radius">Radius km</label><input id="radius" type="number" step="1" min="1" max="1000" required></div>
       </div>
+      <p class="hint" id="area-hint">Drag the dot on the circle's edge to change the radius.</p>
       <label for="view">Group by</label>
       <select id="view">
         <option value="daily">Day of year</option>
@@ -123,6 +125,11 @@
         </div>
       </div>
       <p class="summary" id="chart-summary"></p>
+      <ul class="series-legend" id="series-legend" hidden></ul>
+      <p class="inat-link" id="inat-link-row" hidden>
+        <a id="inat-link" target="_blank" rel="noopener">iNaturalist observations included in this graph</a>
+        <span class="hint">Click a bar to see its observations.</span>
+      </p>
       <div class="chart-wrap"><canvas id="chart" role="img" aria-label="Observations by time of year"></canvas></div>
     </section>
 

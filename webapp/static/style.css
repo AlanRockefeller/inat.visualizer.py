@@ -191,6 +191,43 @@ button.primary { background: var(--accent); color: var(--accent-ink); border-col
 .panel-actions button { padding: 5px 10px; font-size: 13px; }
 .summary { margin: 0; color: var(--text-2); font-size: 13px; }
 
+.chips { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 100%;
+  padding: 3px 4px 3px 8px;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface-2); font-size: 13px;
+}
+.chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip button {
+  width: 22px; height: 22px; padding: 0; flex: none;
+  border: 0; border-radius: 50%; background: transparent;
+  color: var(--muted); font-size: 16px; line-height: 1; cursor: pointer;
+}
+.chip button:hover { background: var(--border); color: var(--text); }
+.swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; display: inline-block; }
+
+.series-legend {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px;
+}
+.series-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.series-legend a { color: var(--text); }
+.series-legend .count { color: var(--muted); font-variant-numeric: tabular-nums; }
+.inat-link { margin: 0; font-size: 13px; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; }
+.inat-link .hint { margin: 0; }
+
+.handle-tip {
+  background: var(--surface); color: var(--text); border-color: var(--border);
+  font-size: 12px; padding: 2px 6px; box-shadow: 0 1px 3px rgb(0 0 0 / 20%);
+}
+/* Fingers need bigger targets than the 12-14px handles. */
+@media (pointer: coarse) {
+  .leaflet-marker-icon.radius-handle { width: 24px !important; height: 24px !important;
+    margin-left: -12px !important; margin-top: -12px !important; }
+}
+
 .chart-wrap { position: relative; height: 34vh; min-height: 240px; }
 /* With the map hidden, the graph takes the rest of the column. A zero flex
    basis keeps Chart.js's canvas from feeding back into the container size. */

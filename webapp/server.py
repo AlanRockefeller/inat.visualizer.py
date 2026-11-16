@@ -4,8 +4,9 @@ Run locally from the repository root:
 
     INAT_DATA_DIR=. uvicorn webapp.server:app --port 8765
 
-Taxon and place names are resolved in the browser against api.inaturalist.org,
-so this server only ever receives numeric taxon IDs and never calls iNat itself.
+Taxon and place names, and region outlines, are resolved in the browser
+against api.inaturalist.org, so this server only receives numeric taxon IDs
+and GeoJSON outlines, and never calls iNat itself.
 """
 
 from __future__ import annotations
@@ -25,8 +26,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
+import hashlib
+
 import duckdb
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import MutableHeaders
@@ -36,11 +39,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from inat_core import (  # noqa: E402
     MAP_RADIUS_MAX_KM,
     MAP_RADIUS_MIN_KM,
+    RegionError,
+    SpatialUnavailable,
     abundance_cell_radius_km,
+    region_bounds,
     descendant_taxon_ids,
     run_local_abundance_query,
     run_local_date_counts,
     run_local_observation_query,
+    run_region_date_counts,
+    run_region_observation_query,
     seasonal_bin_counts,
 )
 from inat_visualizer_version import __version__  # noqa: E402
@@ -58,6 +66,9 @@ DUCKDB_THREADS = int(os.environ.get("INAT_DUCKDB_THREADS", "4"))
 DUCKDB_TEMP_DIR = os.environ.get(
     "INAT_DUCKDB_TEMP_DIR", os.path.join(tempfile.gettempdir(), "inat-visualizer-duckdb")
 )
+# Where DuckDB's spatial extension (used by region searches) is installed.
+# deploy.sh installs it there; the service itself cannot write to it.
+DUCKDB_EXTENSION_DIR = os.environ.get("INAT_DUCKDB_EXTENSION_DIR", "")
 RESULT_CACHE_ENTRIES = int(os.environ.get("INAT_RESULT_CACHE_ENTRIES", "256"))
 # Budget for cached results, measured as the size of their JSON. Broad
 # abundance searches at 0.25 degrees return tens of thousands of cells, so an
@@ -230,6 +241,9 @@ def configure_connection(connection) -> None:
     connection.execute(f"SET memory_limit = '{DUCKDB_MEMORY_LIMIT}'")
     connection.execute(f"SET threads = {DUCKDB_THREADS}")
     connection.execute(f"SET temp_directory = '{temp_dir}'")
+    if DUCKDB_EXTENSION_DIR:
+        extension_dir = DUCKDB_EXTENSION_DIR.replace("'", "''")
+        connection.execute(f"SET extension_directory = '{extension_dir}'")
 
 
 async def run_limited_query(
@@ -413,30 +427,27 @@ def observations_csv(observations: list[dict[str, Any]]) -> str:
     return buffer.getvalue()
 
 
-@app.get("/api/seasonal")
-async def seasonal(
+async def seasonal_response(
     request: Request,
-    lat: float = Query(ge=-90, le=90),
-    lon: float = Query(ge=-180, le=180),
-    radius: float = Query(ge=MAP_RADIUS_MIN_KM, le=MAP_RADIUS_MAX_KM),
-    date_from: str = Query(pattern=DATE_PATTERN),
-    date_to: str = Query(pattern=DATE_PATTERN),
-    taxon_id: list[int] = Query(default=[]),
-    exclude_taxon_id: list[int] = Query(default=[]),
-    format: Literal["json", "csv"] = "json",
+    area_key: tuple,
+    area_kwargs: dict[str, Any],
+    count_query: Callable[..., Any],
+    row_query: Callable[..., Any],
+    date_from: str,
+    date_to: str,
+    taxon_id: list[int],
+    exclude_taxon_id: list[int],
+    format: str,
+    row_query_kwargs: dict[str, Any] | None = None,
 ) -> Response:
-    """Observation counts by day, week and month of year within a radius."""
+    """Seasonal counts (JSON) or rows (CSV) for one search area."""
     require_database()
     validate_date_range(date_from, date_to)
     validate_taxon_list("taxon_id", taxon_id)
     validate_taxon_list("exclude_taxon_id", exclude_taxon_id)
-    # Round to about a metre so the cache key and the query use the same values.
-    lat, lon, radius = round(lat, 5), round(lon, 5), round(radius, 3)
     key = (
         "seasonal",
-        lat,
-        lon,
-        radius,
+        *area_key,
         date_from,
         date_to,
         tuple(sorted(taxon_id)),
@@ -449,16 +460,14 @@ async def seasonal(
         taxon_ids = await expand_taxa(taxon_id, request)
         exclude_ids = await expand_taxa(exclude_taxon_id, request)
         frame = await run_limited_query(
-            run_local_date_counts,
+            count_query,
             request=request,
             parquet_path=str(OBSERVATIONS_FILE),
             date_from=date_from,
             date_to=date_to,
-            lat=lat,
-            lon=lon,
-            radius=radius,
             taxon_ids=taxon_ids,
             exclude_taxon_ids=exclude_ids,
+            **area_kwargs,
         )
         dates, weights = frame["date"], frame["count"]
         result = {
@@ -488,18 +497,16 @@ async def seasonal(
         taxon_ids = await expand_taxa(taxon_id, request)
         exclude_ids = await expand_taxa(exclude_taxon_id, request)
     observations, _count = await run_limited_query(
-        run_local_observation_query,
+        row_query,
         request=request,
         parquet_path=str(OBSERVATIONS_FILE),
         date_from=date_from,
         date_to=date_to,
-        lat=lat,
-        lon=lon,
-        radius=radius,
         taxon_ids=taxon_ids,
         exclude_taxon_ids=exclude_ids,
-        estimate_count=False,
         limit=MAX_CSV_ROWS + 1,
+        **area_kwargs,
+        **(row_query_kwargs or {}),
     )
     if len(observations) > MAX_CSV_ROWS:
         # The database may have changed since the cached total was computed.
@@ -514,6 +521,76 @@ async def seasonal(
         media_type="text/csv",
         headers={"Content-Disposition": 'attachment; filename="observations.csv"'},
     )
+
+
+@app.get("/api/seasonal")
+async def seasonal(
+    request: Request,
+    lat: float = Query(ge=-90, le=90),
+    lon: float = Query(ge=-180, le=180),
+    radius: float = Query(ge=MAP_RADIUS_MIN_KM, le=MAP_RADIUS_MAX_KM),
+    date_from: str = Query(pattern=DATE_PATTERN),
+    date_to: str = Query(pattern=DATE_PATTERN),
+    taxon_id: list[int] = Query(default=[]),
+    exclude_taxon_id: list[int] = Query(default=[]),
+    format: Literal["json", "csv"] = "json",
+) -> Response:
+    """Observation counts by day, week and month of year within a radius."""
+    # Round to about a metre so the cache key and the query use the same values.
+    lat, lon, radius = round(lat, 5), round(lon, 5), round(radius, 3)
+    return await seasonal_response(
+        request,
+        ("circle", lat, lon, radius),
+        {"lat": lat, "lon": lon, "radius": radius},
+        run_local_date_counts,
+        run_local_observation_query,
+        date_from,
+        date_to,
+        taxon_id,
+        exclude_taxon_id,
+        format,
+        row_query_kwargs={"estimate_count": False},
+    )
+
+
+@app.post("/api/seasonal/region")
+async def seasonal_region(
+    request: Request,
+    region: dict[str, Any] = Body(),
+    date_from: str = Body(pattern=DATE_PATTERN),
+    date_to: str = Body(pattern=DATE_PATTERN),
+    taxon_id: list[int] = Body(default=[]),
+    exclude_taxon_id: list[int] = Body(default=[]),
+    format: Literal["json", "csv"] = Body(default="json"),
+) -> Response:
+    """Like /api/seasonal, inside a GeoJSON Polygon or MultiPolygon.
+
+    The browser sends the outline it fetched from iNaturalist for a place, so
+    the outline itself is the cache key (by hash).
+    """
+    try:
+        region_bounds(region)
+    except RegionError as error:
+        raise HTTPException(422, str(error)) from None
+    digest = hashlib.sha256(
+        json.dumps(region, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    try:
+        return await seasonal_response(
+            request,
+            ("region", digest),
+            {"geometry": region},
+            run_region_date_counts,
+            run_region_observation_query,
+            date_from,
+            date_to,
+            taxon_id,
+            exclude_taxon_id,
+            format,
+        )
+    except SpatialUnavailable as error:
+        logger.error("Region search failed: %s", error)
+        raise HTTPException(503, "Region searches are not available on this server.") from None
 
 
 @app.get("/api/abundance")
