@@ -29,6 +29,9 @@ sudo -v
 cd "$APP_DIR"
 sudo -u inatviz git pull --ff-only
 sudo -u inatviz .venv-web/bin/pip install -q -r requirements-web.txt
+# Region searches need DuckDB's spatial extension. The service cannot write to
+# /opt, so install it here (a no-op when this DuckDB version already has it).
+sudo -u inatviz .venv-web/bin/python -c "import duckdb; duckdb.connect(config={'extension_directory': '/opt/inat-visualizer/.duckdb-extensions'}).install_extension('spatial')"
 
 # git pull does not touch the installed copies of the systemd units and nginx
 # files (see deploy/README.md for where they live), so install the ones that

@@ -51,26 +51,49 @@ the public URL. If nginx rejects a changed vhost, the previous file is put back.
 
 ## Database updates
 
-`inat-visualizer-update.timer` would rebuild the Parquet files every Sunday with
-`update_database.py`, but it is **left disabled on dikarya.us**: the
-observations archive is about 30 GB and its extracted CSV is larger still, more
-than the shared disk has free. Rebuild on a workstation instead and copy the
-results in:
+The data is built on a workstation and copied to the server, because the
+server's disk cannot hold iNaturalist's ~30 GB export while it is processed.
+`inat-visualizer-update.timer` (a server-side rebuild) stays disabled on
+dikarya.us. One command does the whole update:
 
 ```bash
-python update_database.py
-rsync -P observations.parquet taxonomy.parquet dikarya.us:inatviz-data/
-ssh -t dikarya.us 'for f in taxonomy observations; do
-  sudo install -o inatviz -g inatviz -m 644 ~/inatviz-data/$f.parquet /srv/inat-visualizer/data/$f.parquet.new &&
-  sudo mv /srv/inat-visualizer/data/$f.parquet.new /srv/inat-visualizer/data/$f.parquet; done'
+python update_database.py --upload dikarya.us
 ```
 
-Each `mv` is atomic (taxonomy first, then observations, so a query in the
-second or so between the two can pair the new taxonomy with the old
-observations), and the server clears its caches when the files' size or mtime
-changes, so no restart is needed. On a server with enough disk, enable the
-timer with `sudo systemctl enable --now inat-visualizer-update.timer`; follow a
-run with `journalctl -fu inat-visualizer-update`.
+1. It rebuilds from the GBIF export only when iNaturalist has published a new
+   one since the last build (`--force` rebuilds anyway).
+2. If `backfill/` exists, it fetches the research-grade observations the export
+   leaves out (see below), up to the day's API budget.
+3. It merges the two into `observations.parquet`, the export winning for any
+   observation in both.
+4. `--upload` copies both Parquet files to the server and swaps them in (sudo
+   asks for your password once). Taxonomy goes first, then observations; each
+   swap is atomic and the server clears its caches when the files change.
+
+### Observations without an open license
+
+iNaturalist's export only includes observations licensed CC0, CC-BY or
+CC-BY-NC: about 175 of 227 million research-grade observations.
+`backfill_observations.py` fetches the rest (about 45 million unlicensed and 7
+million CC-BY-SA/-ND) from the API, keeping only the columns the graphs count:
+
+```bash
+python backfill_observations.py            # runs until today's 10,000 requests are spent
+python backfill_observations.py --status   # progress
+```
+
+The first pass takes about four weeks at iNat's recommended pace (one request
+a second, 10,000 a day). It saves its place every few pages, so it can be
+stopped with Ctrl-C and restarted, and `update_database.py` merges whatever has
+been fetched so far. After the first pass, each run fetches only observations
+changed since the previous one, whatever its license (iNat updates about 3.5
+million observations a week, so about 18,000 requests: two days of budget). It drops observations that lost research grade, and those that moved
+to a license the export carries, since the export counts them. Observations
+deleted on iNaturalist stay counted: the API only lists deletions to their
+owners. Only one backfill or update can use the store at a time.
+
+Once backfilled rows are merged, the site's iNaturalist links drop their
+license filter, so they show the same observations the graph counts.
 
 ## Tile cache
 
@@ -95,6 +118,7 @@ run with `journalctl -fu inat-visualizer-update`.
 | `INAT_DUCKDB_THREADS` | `4` (unit sets `2`) | DuckDB threads per query |
 | `INAT_QUERY_TIMEOUT` | `90` | Seconds before a query is interrupted (HTTP 504) |
 | `INAT_MAX_CSV_ROWS` | `500000` | Largest CSV download |
+| `INAT_DUCKDB_EXTENSION_DIR` | DuckDB's default (unit sets `/opt/inat-visualizer/.duckdb-extensions`) | Where the spatial extension for region searches is installed; `deploy.sh` and `setup.sh` install it |
 | `INAT_RESULT_CACHE_ENTRIES` | `256` | Cached query results |
 | `INAT_RESULT_CACHE_MB` | `64` | Budget for cached results, measured as JSON size |
 

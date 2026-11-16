@@ -52,6 +52,9 @@ if [ ! -f deploy/setup.sh ] || ! grep -q "server_name $DOMAIN;" deploy/nginx-vis
 fi
 [ -x .venv-web/bin/python ] || sudo -u inatviz python3 -m venv .venv-web
 sudo -u inatviz .venv-web/bin/pip install -q -r requirements-web.txt
+# Region searches need DuckDB's spatial extension. The service cannot write to
+# /opt, so install it here (a no-op when this DuckDB version already has it).
+sudo -u inatviz .venv-web/bin/python -c "import duckdb; duckdb.connect(config={'extension_directory': '/opt/inat-visualizer/.duckdb-extensions'}).install_extension('spatial')"
 
 echo "== Data"
 if [ -n "$DATA_SRC" ]; then

@@ -15,6 +15,8 @@ Environment=INAT_MAX_CONCURRENT_QUERIES=2
 Environment=INAT_DUCKDB_MEMORY=3GB
 Environment=INAT_DUCKDB_THREADS=2
 Environment=INAT_QUERY_TIMEOUT=90
+# Region searches use DuckDB's spatial extension; deploy.sh installs it here.
+Environment=INAT_DUCKDB_EXTENSION_DIR=/opt/inat-visualizer/.duckdb-extensions
 ExecStart=/opt/inat-visualizer/.venv-web/bin/uvicorn webapp.server:app \
     --host 127.0.0.1 --port 8765 --workers 1 \
     --proxy-headers --forwarded-allow-ips 127.0.0.1 \

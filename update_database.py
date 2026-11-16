@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Rebuild the visualizer's local Parquet databases from iNaturalist DWCA files."""
+"""Rebuild the visualizer's local Parquet databases from iNaturalist DWCA files.
+
+One command keeps everything current:
+
+    python update_database.py [--upload dikarya.us]
+
+1. If iNaturalist has published a new GBIF export since the last build (or
+   there is no build yet), download it and the taxonomy and rebuild
+   observations-gbif.parquet and taxonomy.parquet.
+2. If a backfill store exists (see backfill_observations.py), fetch the
+   observations the export leaves out, up to today's API budget.
+3. Merge the two into observations.parquet, the export winning for any
+   observation in both.
+4. With --upload, copy the databases to the server and swap them in.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +40,11 @@ OBSERVATIONS_URL = (
 TAXONOMY_URL = "https://www.inaturalist.org/taxa/inaturalist-taxonomy.dwca.zip"
 OBSERVATIONS_ARCHIVE_NAME = "gbif-observations-dwca.zip"
 TAXONOMY_ARCHIVE_NAME = "inaturalist-taxonomy.dwca.zip"
+GBIF_BASE_NAME = "observations-gbif.parquet"
+STATE_NAME = "update_state.json"
+# Parquet footer key telling the web app which licenses the database covers:
+# 'all' once backfilled rows are merged in; absent for the export alone.
+LICENSES_KEY = "inat_licenses"
 EXTRACTION_RESERVE_BYTES = 5 * 1024**3
 COPY_BUFFER_BYTES = 16 * 1024**2
 
@@ -415,6 +434,7 @@ def update_databases(
     output_directory: Path,
     *,
     keep_archives: bool = False,
+    backfill_extra: Path | None = None,
 ) -> tuple[dict[str, object], dict[str, int]]:
     """Build, validate, install, and clean up both application databases."""
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -463,7 +483,8 @@ def update_databases(
         if staged_cache is not None:
             os.replace(staged_cache, output_directory / "taxon_cache.json")
         os.replace(staged_taxonomy, output_directory / "taxonomy.parquet")
-        os.replace(staged_observations, output_directory / "observations.parquet")
+        os.replace(staged_observations, output_directory / GBIF_BASE_NAME)
+        merge_observations(output_directory, backfill_extra)
 
     if not keep_archives:
         for archive in {observation_archive, taxonomy_archive}:
@@ -475,6 +496,105 @@ def update_databases(
 
     status("Database update complete; only the Parquet databases are retained.")
     return observation_stats, taxonomy_stats
+
+
+def merge_observations(output_directory: Path, backfill_extra: Path | None) -> dict[str, object]:
+    """Write observations.parquet from the GBIF build plus backfilled rows.
+
+    Observations present in both keep the export's row. Without backfilled
+    rows the result is a hard link to the GBIF build, so no space is used.
+    """
+    base = output_directory / GBIF_BASE_NAME
+    target = output_directory / "observations.parquet"
+    if not base.exists():
+        if not target.exists():
+            raise UpdateError(f"No {GBIF_BASE_NAME} or observations.parquet to merge into.")
+        # A database from before backfills existed is the export build itself.
+        link_or_copy(target, base)
+    staged = output_directory / ".observations.parquet.merging"
+    staged.unlink(missing_ok=True)
+    use_extra = backfill_extra is not None and backfill_extra.exists()
+    with tempfile.TemporaryDirectory(prefix=".inat-merge-", dir=output_directory) as temp_name:
+        connection = configure_duckdb(Path(temp_name))
+        try:
+            if use_extra:
+                status("Merging backfilled observations into observations.parquet...")
+                connection.execute(
+                    f"""
+                    COPY (
+                        SELECT id, decimalLatitude, decimalLongitude, taxonID, taxonRank, eventDate
+                        FROM read_parquet({sql_literal(base)})
+                        UNION ALL
+                        SELECT e.id, e.decimalLatitude, e.decimalLongitude, e.taxonID,
+                               e.taxonRank, e.eventDate
+                        FROM read_parquet({sql_literal(backfill_extra)}) e
+                        ANTI JOIN read_parquet({sql_literal(base)}) g USING (id)
+                        WHERE NOT e.removed
+                    ) TO {sql_literal(staged)} (
+                        FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 1000000,
+                        KV_METADATA {{{LICENSES_KEY}: 'all'}}
+                    )
+                    """
+                )
+            else:
+                link_or_copy(base, staged)
+            stats = validate_observations(connection, staged)
+        finally:
+            connection.close()
+    os.replace(staged, target)
+    status(
+        f"observations.parquet: {stats['rows']:,} rows"
+        + (" including backfilled observations." if use_extra else " (export only).")
+    )
+    return stats
+
+
+def link_or_copy(source: Path, destination: Path) -> None:
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+
+
+def remote_last_modified(url: str) -> str | None:
+    request = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": "iNat-Seasonal-Visualizer-database-updater/1"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.headers.get("Last-Modified")
+    except OSError as error:
+        raise UpdateError(f"Could not check {url}: {error}") from error
+
+
+def load_update_state(output_directory: Path) -> dict[str, object]:
+    path = output_directory / STATE_NAME
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def save_update_state(output_directory: Path, state: dict[str, object]) -> None:
+    path = output_directory / STATE_NAME
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(state, indent=2, sort_keys=True))
+    os.replace(temporary, path)
+
+
+def upload(output_directory: Path, host: str) -> None:
+    """Copy the databases to ``host`` and swap them in with sudo (asks once)."""
+    import subprocess
+
+    files = [output_directory / "taxonomy.parquet", output_directory / "observations.parquet"]
+    status(f"Uploading to {host}...")
+    subprocess.run(["ssh", host, "mkdir -p inatviz-data"], check=True)
+    subprocess.run(["rsync", "-P", *map(str, files), f"{host}:inatviz-data/"], check=True)
+    # Taxonomy first, then observations: each mv is atomic and the server
+    # notices the new files on its own.
+    install = (
+        "set -e; d=/srv/inat-visualizer/data; for f in taxonomy observations; do "
+        'sudo install -o inatviz -g inatviz -m 644 "$HOME/inatviz-data/$f.parquet" "$d/$f.parquet.new"; '
+        'sudo mv "$d/$f.parquet.new" "$d/$f.parquet"; done; echo installed'
+    )
+    subprocess.run(["ssh", "-t", host, install], check=True)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -505,6 +625,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="keep the two DWCA ZIP files after a successful update",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="rebuild from the export even if it has not changed since the last build",
+    )
+    parser.add_argument(
+        "--backfill-dir",
+        type=Path,
+        help="backfill store from backfill_observations.py (default: <output-dir>/backfill)",
+    )
+    parser.add_argument(
+        "--no-fetch",
+        action="store_true",
+        help="merge the backfill store as it is, without calling the iNaturalist API",
+    )
+    parser.add_argument(
+        "--backfill-hours",
+        type=float,
+        help="stop fetching backfill observations after this many hours "
+        "(default: until today's API budget is spent)",
+    )
+    parser.add_argument(
+        "--upload",
+        metavar="HOST",
+        help="afterwards, copy the databases to HOST over ssh and install them",
+    )
     return parser.parse_args(argv)
 
 
@@ -521,20 +667,93 @@ def main(argv: list[str] | None = None) -> int:
         if args.taxonomy_archive
         else output_directory / TAXONOMY_ARCHIVE_NAME
     )
+    backfill_dir = (args.backfill_dir or output_directory / "backfill").resolve()
+    backfill_extra = backfill_dir / "extra.parquet"
 
     try:
-        ensure_archive(observation_archive, OBSERVATIONS_URL)
-        ensure_archive(taxonomy_archive, TAXONOMY_URL)
-        update_databases(
-            observation_archive,
-            taxonomy_archive,
-            output_directory,
-            keep_archives=args.keep_archives,
-        )
+        state = load_update_state(output_directory)
+        # 1. The GBIF export, only when it is new (or archives were given).
+        last_modified = None
+        have_build = (output_directory / GBIF_BASE_NAME).exists() or (
+            output_directory / "observations.parquet"
+        ).exists()
+        rebuild = args.force or observation_archive.exists() or not have_build
+        if not rebuild:
+            last_modified = remote_last_modified(OBSERVATIONS_URL)
+            rebuild = last_modified is None or last_modified != state.get("gbif_last_modified")
+            status(
+                f"GBIF export {'changed' if rebuild else 'unchanged'} "
+                f"(published {last_modified})."
+            )
+        # 2. Fetch backfill observations first, so one merge covers both.
+        if (backfill_dir / "state.json").exists():
+            import backfill_observations as backfill
+
+            try:
+                store = backfill.Store(backfill_dir)
+            except backfill.BackfillError as error:
+                raise UpdateError(f"{error}; stop it first, or pass --backfill-dir") from None
+            with store:
+                if not args.no_fetch:
+                    client = backfill.ApiClient(store.state)
+                    deadline = (
+                        time.monotonic() + args.backfill_hours * 3600
+                        if args.backfill_hours
+                        else None
+                    )
+                    try:
+                        outcome = backfill.run(store, client, deadline=deadline)
+                        status(f"Backfill: {outcome}.")
+                    except backfill.BackfillError as error:
+                        status(f"Backfill stopped ({error}); merging what is stored.")
+                status(f"Backfill store holds {store.compact():,} observations.")
+        if rebuild:
+            if last_modified is None:
+                try:
+                    last_modified = remote_last_modified(OBSERVATIONS_URL)
+                except UpdateError as error:
+                    status(f"{error}; the next run will rebuild.")
+            built_from = last_modified
+            if not args.observations_archive:
+                # An archive kept (--keep-archives) from an older export must
+                # not be recorded as the new one.
+                if observation_archive.exists() and state.get("archive_last_modified") != last_modified:
+                    if last_modified is not None:
+                        status("The kept archive is from an older export; downloading the new one.")
+                        observation_archive.unlink()
+                    else:
+                        built_from = state.get("archive_last_modified")
+                if not observation_archive.exists():
+                    state["archive_last_modified"] = last_modified
+            ensure_archive(observation_archive, OBSERVATIONS_URL)
+            ensure_archive(taxonomy_archive, TAXONOMY_URL)
+            update_databases(
+                observation_archive,
+                taxonomy_archive,
+                output_directory,
+                keep_archives=args.keep_archives,
+                backfill_extra=backfill_extra,
+            )
+            state["gbif_last_modified"] = built_from
+            save_update_state(output_directory, state)
+        else:
+            # 3. Merge the new backfill rows into the existing export build.
+            merge_observations(output_directory, backfill_extra)
+        if args.upload:
+            upload(output_directory, args.upload)
     except (UpdateError, duckdb.Error, OSError) as error:
         print(f"Database update failed: {error}", file=sys.stderr)
         return 1
+    except subprocess_error() as error:
+        print(f"Upload failed: {error}", file=sys.stderr)
+        return 1
     return 0
+
+
+def subprocess_error() -> type[BaseException]:
+    import subprocess
+
+    return subprocess.CalledProcessError
 
 
 if __name__ == "__main__":

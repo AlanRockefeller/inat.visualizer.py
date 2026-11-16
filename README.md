@@ -198,6 +198,12 @@ validated before they atomically replace the installed files. Extracted CSVs
 and source archives are removed after success. Use `--keep-archives` to retain
 the ZIP files, or `--help` for paths and other options.
 
+Running it again only rebuilds from the export when iNaturalist has published
+a new one (`--force` rebuilds anyway). The export only covers openly licensed
+observations; `backfill_observations.py` fetches the rest from the iNaturalist
+API, and later runs of `./update_database.py` merge them in. See
+[deploy/README.md](deploy/README.md#observations-without-an-open-license).
+
 ### Expected columns
 
 `observations.parquet` must contain:
