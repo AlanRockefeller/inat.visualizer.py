@@ -6,6 +6,14 @@
 "use strict";
 
 const INAT_API = "https://api.inaturalist.org/v1";
+const INAT_OBSERVATIONS = "https://www.inaturalist.org/observations";
+// The database is iNaturalist's GBIF export: research grade, and only these
+// licenses, so iNat links filter the same way to show the same observations.
+const INAT_EXPORT_FILTER = { quality_grade: "research", license: "cc0,cc-by,cc-by-nc" };
+// One color per compared organism. Blue first (the desktop app's bar color);
+// the rest are Okabe-Ito hues chosen to stay apart, colorblind-friendly too.
+const SERIES_COLORS = ["#1f77b4", "#e69f00", "#009e73", "#d55e00", "#9467bd", "#cc79a7"];
+const MAX_SERIES = SERIES_COLORS.length;
 const OSM_TILES = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 const LOCAL_TILES = "tiles/{z}/{x}/{y}.png";
 const OSM_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
@@ -37,7 +45,10 @@ const fmt = (n) => Number(n).toLocaleString();
 
 const state = {
   mode: "seasonal",
-  taxa: { organism: null, exclude: null }, // {id, label}
+  taxa: { exclude: null }, // {id, label}
+  organisms: [], // [{id, label}], compared as separate series; empty = all organisms
+  place: null, // {id, name, geometry, lat, lon} while a named region is the search area
+  lastRadius: 10, // restored when leaving region mode without a typed radius
   seasonal: null, // last /api/seasonal response + its request
   abundance: null, // last /api/abundance response + its request
   ranked: [],
@@ -216,6 +227,62 @@ async function resolveTaxon(field, signal) {
   return state.taxa[field];
 }
 
+const seriesColor = (index) => SERIES_COLORS[index % SERIES_COLORS.length];
+
+function renderOrganismChips() {
+  const chips = $("organism-chips");
+  chips.innerHTML = state.organisms.map((taxon, i) =>
+    `<li class="chip"><span class="swatch" style="background:${seriesColor(i)}"></span>` +
+    `<span class="chip-label">${escapeHtml(taxon.label)}</span>` +
+    `<button type="button" data-index="${i}" aria-label="Remove ${escapeHtml(taxon.label)}">×</button></li>`).join("");
+  chips.hidden = state.organisms.length === 0;
+  const full = state.organisms.length >= MAX_SERIES;
+  $("organism").disabled = full;
+  $("organism").placeholder = full ? `Up to ${MAX_SERIES} organisms`
+    : state.organisms.length ? "Add another to compare" : "e.g. Agaricales, Amanita muscaria";
+  updateOrganismHint();
+}
+
+function addOrganism(taxon) {
+  if (!state.organisms.some((t) => t.id === taxon.id) && state.organisms.length < MAX_SERIES) {
+    state.organisms.push(taxon);
+  }
+  $("organism").value = "";
+  renderOrganismChips();
+}
+
+function setupOrganismPicker() {
+  const input = $("organism");
+  const list = input.parentElement.querySelector(".suggestions");
+  attachAutocomplete(input, list, {
+    search: searchTaxa,
+    render: renderTaxon,
+    onPick: (taxon) => addOrganism({ id: taxon.id, label: taxonLabel(taxon) }),
+  });
+  $("organism-chips").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-index]");
+    if (!button) return;
+    state.organisms.splice(Number(button.dataset.index), 1);
+    renderOrganismChips();
+    $("organism").focus();
+  });
+}
+
+// Text typed into the organism box but never picked becomes a chip using
+// iNat's best match, as the single-organism field did.
+async function resolveOrganisms(signal) {
+  const text = $("organism").value.trim();
+  if (text) {
+    const [best] = await searchTaxa(text, signal);
+    if ($("organism").value.trim() !== text) {
+      throw new Error("The organism field changed during the lookup. Run the search again.");
+    }
+    if (!best) throw new Error(`No iNaturalist taxon matches "${text}".`);
+    addOrganism({ id: best.id, label: taxonLabel(best) });
+  }
+  return state.organisms.slice();
+}
+
 function setupPlacePicker() {
   const input = $("place");
   const list = input.parentElement.querySelector(".suggestions");
@@ -226,9 +293,12 @@ function setupPlacePicker() {
       return results.filter((r) => r.type === "Place" && r.record?.location).map((r) => r.record);
     },
     render: (place) => escapeHtml(place.display_name || place.name),
-    onPick: (place) => {
+    onPick: async (place) => {
       const [lat, lon] = place.location.split(",").map(Number);
       input.value = place.display_name || place.name;
+      // Prefer the place's outline; fall back to a circle when it has none.
+      if (await selectRegion(place.id, input.value, [lat, lon])) return;
+      clearRegion();
       setCenter(lat, lon);
       const coords = place.bounding_box_geojson?.coordinates?.flat(3);
       if (coords && coords.length >= 4) {
@@ -307,11 +377,13 @@ function setRadius(km) {
 }
 
 function fitSelection() {
-  map.fitBounds(searchCircle.getBounds(), { padding: [30, 30], maxZoom: 13 });
+  const bounds = state.place ? regionLayer.getBounds() : searchCircle.getBounds();
+  if (bounds.isValid()) map.fitBounds(bounds, { padding: [30, 30], maxZoom: 13 });
 }
 
 map.on("click", (event) => {
   if (state.mode === "seasonal") {
+    clearRegion();
     setCenter(event.latlng.lat, event.latlng.lng);
   } else {
     const cell = cellAt(event.latlng.lat, normalizeLon(event.latlng.lng));
@@ -321,10 +393,88 @@ map.on("click", (event) => {
 centerMarker.on("drag", (e) => setCenter(e.latlng.lat, e.latlng.lng));
 radiusHandle.on("drag", (e) => setRadius(map.distance(centerMarker.getLatLng(), e.latlng) / 1000));
 radiusHandle.on("dragend", updateSelectionOverlay);
+// A typed radius or coordinate means a circle again, centred on the region's
+// middle unless the coordinates were edited too.
 ["lat", "lon", "radius"].forEach((id) => $(id).addEventListener("change", () => {
+  if (state.place && (id !== "radius" || $("radius").value !== "")) clearRegion();
+  if (id === "radius" && $("radius").value) state.lastRadius = Number($("radius").value);
   updateSelectionOverlay();
   fitSelection();
 }));
+
+// The radius handle is a small dot that is easy to miss, especially on a
+// phone, so it carries a label until it has been dragged once.
+radiusHandle.bindTooltip("Drag to resize", {
+  permanent: true, direction: "right", offset: [8, 0], className: "handle-tip",
+});
+radiusHandle.once("dragstart", () => radiusHandle.unbindTooltip());
+
+/* ---------- named regions ---------- */
+
+const regionLayer = L.geoJSON(null, {
+  interactive: false,
+  style: () => ({ color: selectionColor(), weight: 2, fillOpacity: 0.08 }),
+});
+let regionRequest = 0;
+
+async function fetchPlace(id) {
+  const place = (await fetchJson(`${INAT_API}/places/${id}`)).results?.[0];
+  const geometry = place?.geometry_geojson;
+  if (!geometry || !["Polygon", "MultiPolygon"].includes(geometry.type)) return null;
+  return place;
+}
+
+// Search inside a named place's outline instead of a circle. Returns false
+// when iNat has no outline for it, so the caller can fall back to a circle.
+async function selectRegion(id, name, center) {
+  const request = ++regionRequest;
+  let place;
+  try {
+    setStatus("Loading the outline of " + name + "…", "busy");
+    place = await fetchPlace(id);
+  } catch (error) {
+    setStatus(`Could not load the outline of ${name}: ${error.message}`, "error");
+    return false;
+  }
+  if (request !== regionRequest) return true; // a later pick or edit won
+  setStatus("");
+  if (!place) return false;
+  const [lat, lon] = center || place.location.split(",").map(Number);
+  if (!state.place && $("radius").value) state.lastRadius = Number($("radius").value);
+  state.place = { id: place.id, name, geometry: place.geometry_geojson, lat, lon };
+  regionLayer.clearLayers().addData(place.geometry_geojson);
+  $("lat").value = lat.toFixed(4);
+  $("lon").value = normalizeLon(lon).toFixed(4);
+  $("radius").value = "";
+  $("radius").required = false;
+  [searchCircle, centerMarker, radiusHandle].forEach((layer) => seasonalLayer.removeLayer(layer));
+  seasonalLayer.addLayer(regionLayer);
+  updateAreaHint();
+  if (state.mode === "seasonal" && !$("map").hidden) fitSelection();
+  return true;
+}
+
+// Back to a circle centred where the region was (or wherever the caller
+// moves it next), with the typed radius or the last one used.
+function clearRegion() {
+  regionRequest++;
+  if (!state.place) return;
+  state.place = null;
+  seasonalLayer.removeLayer(regionLayer);
+  regionLayer.clearLayers();
+  [searchCircle, centerMarker, radiusHandle].forEach((layer) => seasonalLayer.addLayer(layer));
+  $("radius").required = true;
+  if (!$("radius").value) $("radius").value = state.lastRadius;
+  $("place").value = "";
+  updateSelectionOverlay();
+  updateAreaHint();
+}
+
+function updateAreaHint() {
+  $("area-hint").textContent = state.place
+    ? `Searching inside the outline of ${state.place.name}. Type a radius to search a circle instead.`
+    : "Drag the dot on the circle's edge to change the radius.";
+}
 
 /* ---------- map visibility ---------- */
 
@@ -345,6 +495,15 @@ function setMapVisible(visible) {
 }
 $("map-toggle").addEventListener("click", () => setMapVisible($("map").hidden));
 
+function updateOrganismHint() {
+  const n = state.organisms.length;
+  $("organism-hint").textContent = state.mode === "seasonal"
+    ? (n ? `Add up to ${MAX_SERIES} to compare them on one graph.`
+      : `Leave empty for all organisms, or add up to ${MAX_SERIES} to compare.`)
+    : (n > 1 ? "The abundance map combines the organisms above."
+      : "Required for the abundance map.");
+}
+
 /* ---------- mode switching ---------- */
 
 function setMode(mode) {
@@ -358,8 +517,7 @@ function setMode(mode) {
   });
   setMapVisible(true);
   $("run").textContent = mode === "seasonal" ? "Graph" : "Map abundance";
-  $("organism-hint").textContent = mode === "seasonal"
-    ? "Leave empty for all organisms." : "Required for the abundance map.";
+  updateOrganismHint();
   if (mode === "seasonal") {
     map.removeLayer(heatLayer);
     if (highlightRect) map.removeLayer(highlightRect);
@@ -483,46 +641,56 @@ function binLabels(view) {
 
 let chart = null;
 
+// Below this chart width, month names become single letters so twelve fit.
+const NARROW_CHART_PX = 560;
+
 function renderChart() {
   const result = state.seasonal;
   if (!result) return;
+  const { request, results } = result;
   const view = $("view").value;
-  const data = result.data.bins[view];
   const { ticks, tooltip } = binLabels(view);
-  const barColor = cssVar("--bar");
-  const hoverColor = cssVar("--bar-hover");
+  const multiple = request.series.length > 1;
   const inkColor = cssVar("--text-2");
   const gridColor = cssVar("--grid");
   const bodyFont = getComputedStyle(document.body).fontFamily;
+  const narrowBars = view === "daily" || (multiple && view === "weekly");
 
   if (chart) chart.destroy();
   chart = new Chart($("chart"), {
     type: "bar",
     data: {
       labels: ticks,
-      datasets: [{
-        label: "Observations",
-        data,
-        backgroundColor: barColor,
-        hoverBackgroundColor: hoverColor,
-        borderRadius: view === "daily" ? 1 : 4,
+      datasets: request.series.map((series, i) => ({
+        label: series.label || "All organisms",
+        data: results[i].bins[view],
+        // A single series keeps the theme's bar colors (the desktop blue).
+        backgroundColor: multiple ? seriesColor(i) : cssVar("--bar"),
+        hoverBackgroundColor: multiple ? seriesColor(i) : cssVar("--bar-hover"),
+        borderRadius: narrowBars ? 1 : 4,
         borderSkipped: "start",
-        categoryPercentage: view === "daily" ? 1 : 0.9,
-        barPercentage: view === "daily" ? 1 : 0.9,
-      }],
+        categoryPercentage: narrowBars ? 1 : 0.9,
+        barPercentage: narrowBars ? 1 : 0.9,
+      })),
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
       interaction: { mode: "index", intersect: false },
+      onClick: (event, _elements, chartInstance) => openBar(event, chartInstance),
+      onHover: (event, elements) => {
+        event.native.target.style.cursor = elements.length ? "pointer" : "default";
+      },
       plugins: {
-        legend: { display: false },
+        legend: { display: false }, // the HTML legend above the chart has links
         tooltip: {
-          displayColors: false,
+          displayColors: multiple,
           callbacks: {
             title: (items) => tooltip[items[0].dataIndex],
-            label: (item) => `${fmt(item.raw)} observations`,
+            label: (item) => multiple
+              ? `${item.dataset.label}: ${fmt(item.raw)}` : `${fmt(item.raw)} observations`,
+            footer: () => "Click to open on iNaturalist",
           },
         },
       },
@@ -534,9 +702,12 @@ function renderChart() {
             font: { family: bodyFont },
             autoSkip: false,
             maxRotation: 0,
-            // One label per month, at the first bin of that month.
-            callback: (_value, index) =>
-              (index === 0 || ticks[index] !== ticks[index - 1] ? ticks[index] : null),
+            // One label per month, at the first bin of that month; a single
+            // letter when the chart is too narrow for twelve names.
+            callback(_value, index) {
+              if (index !== 0 && ticks[index] === ticks[index - 1]) return null;
+              return this.chart.width < NARROW_CHART_PX ? ticks[index][0] : ticks[index];
+            },
           },
         },
         y: {
@@ -551,52 +722,142 @@ function renderChart() {
   });
 }
 
-function seasonalTitle(request) {
-  const who = request.organismLabel || "All organisms";
-  const minus = request.excludeLabel ? `, excluding ${request.excludeLabel}` : "";
-  return `${who}${minus} within ${fmt(request.radius)} km of ${request.lat.toFixed(3)}, ${request.lon.toFixed(3)}`;
+// A click on a bar opens that organism's observations for the bar's day, week
+// or month; a click elsewhere in a column opens every series for it.
+function openBar(event, chartInstance) {
+  const { request } = state.seasonal;
+  const [hit] = chartInstance.getElementsAtEventForMode(event, "nearest", { intersect: true }, false);
+  const [column] = hit ? [hit]
+    : chartInstance.getElementsAtEventForMode(event, "index", { intersect: false }, false);
+  if (!column) return;
+  const series = hit ? [request.series[hit.datasetIndex]] : request.series;
+  const url = inatUrl(request, series, { view: $("view").value, index: column.index });
+  window.open(url, "_blank", "noopener");
 }
 
-function seasonalQuery(request, extra = {}) {
+function areaLabel(area) {
+  return area.placeId ? `in ${area.placeName}`
+    : `within ${fmt(area.radius)} km of ${area.lat.toFixed(3)}, ${area.lon.toFixed(3)}`;
+}
+
+function seasonalTitle(request) {
+  const labels = request.series.map((s) => s.label || "All organisms");
+  const who = labels.length > 2 ? `${labels.slice(0, -1).join(", ")} and ${labels.at(-1)}`
+    : labels.join(" and ");
+  const minus = request.excludeLabel ? `, excluding ${request.excludeLabel}` : "";
+  return `${who}${minus} ${areaLabel(request.area)}`;
+}
+
+// One request per series; `taxonIds` empty means all organisms.
+async function fetchSeasonal(request, taxonIds, { format = "json", signal } = {}) {
+  const { area } = request;
+  if (area.placeId) {
+    const response = await fetch("api/seasonal/region", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        region: area.geometry, date_from: request.dateFrom, date_to: request.dateTo,
+        taxon_id: taxonIds, exclude_taxon_id: request.excludeId ? [request.excludeId] : [],
+        format,
+      }),
+      signal,
+    });
+    return checkResponse(response, format);
+  }
   const params = new URLSearchParams({
-    lat: request.lat, lon: request.lon, radius: request.radius,
-    date_from: request.dateFrom, date_to: request.dateTo, ...extra,
+    lat: area.lat, lon: area.lon, radius: area.radius,
+    date_from: request.dateFrom, date_to: request.dateTo, format,
   });
-  if (request.taxonId) params.append("taxon_id", request.taxonId);
+  taxonIds.forEach((id) => params.append("taxon_id", id));
   if (request.excludeId) params.append("exclude_taxon_id", request.excludeId);
-  return `api/seasonal?${params}`;
+  return checkResponse(await fetch(`api/seasonal?${params}`, { signal }), format);
+}
+
+async function checkResponse(response, format) {
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const detail = Array.isArray(body.detail) ? body.detail.map((d) => d.msg).join("; ") : body.detail;
+    throw new Error(detail || `${response.status} ${response.statusText}`);
+  }
+  return format === "json" ? response.json() : response.blob();
 }
 
 async function runSeasonal(signal) {
-  const organism = await resolveTaxon("organism", signal);
+  const organisms = await resolveOrganisms(signal);
   const exclude = await resolveTaxon("exclude", signal);
+  const area = state.place
+    ? { placeId: state.place.id, placeName: state.place.name, geometry: state.place.geometry,
+        lat: state.place.lat, lon: state.place.lon }
+    : { lat: Number($("lat").value), lon: Number($("lon").value), radius: Number($("radius").value) };
   const request = {
-    lat: Number($("lat").value),
-    lon: Number($("lon").value),
-    radius: Number($("radius").value),
+    area,
     dateFrom: $("date-from").value,
     dateTo: $("date-to").value,
-    taxonId: organism?.id,
-    organismLabel: organism?.label,
+    series: organisms.length ? organisms.map((t) => ({ taxonId: t.id, label: t.label }))
+      : [{ taxonId: null, label: null }],
     excludeId: exclude?.id,
     excludeLabel: exclude?.label,
   };
   setStatus("Counting observations…", "busy");
   const started = performance.now();
-  const data = await fetchJson(seasonalQuery(request), { signal });
-  state.seasonal = { request, data };
+  const results = await Promise.all(request.series.map((series) =>
+    fetchSeasonal(request, series.taxonId ? [series.taxonId] : [], { signal })));
+  state.seasonal = { request, results };
   $("chart-title").textContent = seasonalTitle(request);
-  const span = data.first_date ? `, ${data.first_date} to ${data.last_date}` : "";
-  const taxa = data.taxa_included ? ` · ${fmt(data.taxa_included)} taxa included` : "";
-  $("chart-summary").textContent = `${fmt(data.total)} observations${span}${taxa}.`;
-  $("download-png").disabled = data.total === 0;
-  $("download-csv").disabled = data.total === 0;
+  const total = results.reduce((sum, r) => sum + r.total, 0);
+  const firsts = results.map((r) => r.first_date).filter(Boolean).sort();
+  const lasts = results.map((r) => r.last_date).filter(Boolean).sort();
+  const span = firsts.length ? `, ${firsts[0]} to ${lasts.at(-1)}` : "";
+  const taxa = results.length === 1 && results[0].taxa_included
+    ? ` · ${fmt(results[0].taxa_included)} taxa included` : "";
+  $("chart-summary").textContent = `${fmt(total)} observations${span}${taxa}.`;
+  $("download-png").disabled = total === 0;
+  $("download-csv").disabled = total === 0;
+  renderLegend();
   renderChart();
   // Only while still on the seasonal view: the mode can change mid-search, and
   // an empty result keeps the map out so the area can be adjusted.
-  if (state.mode === "seasonal") setMapVisible(!data.total);
+  if (state.mode === "seasonal") setMapVisible(!total);
   const seconds = ((performance.now() - started) / 1000).toFixed(1);
-  setStatus(data.total ? `Done in ${seconds}s.` : "No observations match this search.");
+  setStatus(total ? `Done in ${seconds}s.` : "No observations match this search.");
+}
+
+/* ---------- iNaturalist links ---------- */
+
+// Observations on inaturalist.org matching a search, optionally narrowed to
+// some series and to one bar's day, week or month of the year.
+function inatUrl(request, series, bin) {
+  const p = new URLSearchParams({ ...INAT_EXPORT_FILTER, d1: request.dateFrom, d2: request.dateTo });
+  const ids = series.map((s) => s.taxonId).filter(Boolean);
+  if (ids.length) p.set("taxon_ids", ids.join(","));
+  if (request.excludeId) p.set("without_taxon_id", request.excludeId);
+  const { area } = request;
+  if (area.placeId) p.set("place_id", area.placeId);
+  else { p.set("lat", area.lat); p.set("lng", area.lon); p.set("radius", area.radius); }
+  if (bin) {
+    const { view, index } = bin;
+    if (view === "monthly") p.set("month", index + 1);
+    else if (view === "weekly") p.set("week", index + 1); // both use ISO weeks
+    else {
+      const date = new Date(Date.UTC(LEAP_YEAR, 0, index + 1));
+      p.set("month", date.getUTCMonth() + 1);
+      p.set("day", date.getUTCDate());
+    }
+  }
+  return `${INAT_OBSERVATIONS}?${p}`;
+}
+
+function renderLegend() {
+  const { request, results } = state.seasonal;
+  const legend = $("series-legend");
+  const multiple = request.series.length > 1;
+  legend.hidden = !multiple;
+  legend.innerHTML = multiple ? request.series.map((series, i) =>
+    `<li><span class="swatch" style="background:${seriesColor(i)}"></span>` +
+    `<a href="${escapeHtml(inatUrl(request, [series]))}" target="_blank" rel="noopener">` +
+    `${escapeHtml(series.label)}</a> <span class="count">${fmt(results[i].total)}</span></li>`).join("") : "";
+  $("inat-link").href = inatUrl(request, request.series);
+  $("inat-link-row").hidden = false;
 }
 
 function downloadBlob(blob, filename) {
@@ -612,23 +873,55 @@ function downloadBlob(blob, filename) {
 
 function downloadPng() {
   if (!chart) return;
+  // Leave out a tooltip that is showing from the last hover or click.
+  chart.tooltip.setActiveElements([], { x: 0, y: 0 });
+  chart.setActiveElements([]);
+  chart.update("none");
   const source = $("chart");
+  const { request, results } = state.seasonal;
+  const font = getComputedStyle(document.body).fontFamily;
   const pad = 20;
-  const titleHeight = 48;
-  const out = document.createElement("canvas");
   const scale = source.width / source.clientWidth;
+  const ctx0 = document.createElement("canvas").getContext("2d");
+  ctx0.font = `${12 * scale}px ${font}`;
+  // Lay out the legend (only for several organisms) in rows that fit the width.
+  const legendRows = [];
+  if (request.series.length > 1) {
+    let row = [];
+    let x = 0;
+    request.series.forEach((series, i) => {
+      const text = `${series.label} (${fmt(results[i].total)})`;
+      const width = (14 + 6) * scale + ctx0.measureText(text).width + 16 * scale;
+      if (row.length && x + width > source.width) { legendRows.push(row); row = []; x = 0; }
+      row.push({ text, color: seriesColor(i), x });
+      x += width;
+    });
+    legendRows.push(row);
+  }
+  const titleHeight = 48 + legendRows.length * 20;
+  const out = document.createElement("canvas");
   out.width = source.width + pad * 2 * scale;
   out.height = source.height + (titleHeight + pad) * scale;
   const ctx = out.getContext("2d");
   ctx.fillStyle = cssVar("--surface");
   ctx.fillRect(0, 0, out.width, out.height);
   ctx.fillStyle = cssVar("--text");
-  ctx.font = `600 ${15 * scale}px ${getComputedStyle(document.body).fontFamily}`;
+  ctx.font = `600 ${15 * scale}px ${font}`;
   ctx.fillText($("chart-title").textContent, pad * scale, 24 * scale);
   ctx.fillStyle = cssVar("--text-2");
-  ctx.font = `${12 * scale}px ${getComputedStyle(document.body).fontFamily}`;
+  ctx.font = `${12 * scale}px ${font}`;
   ctx.fillText(`${$("chart-summary").textContent} Source: iNaturalist via visualizer.dikarya.us`,
     pad * scale, 42 * scale);
+  legendRows.forEach((row, r) => {
+    const y = (62 + r * 20) * scale;
+    row.forEach((item) => {
+      const x = pad * scale + item.x;
+      ctx.fillStyle = item.color;
+      ctx.fillRect(x, y - 10 * scale, 14 * scale, 10 * scale);
+      ctx.fillStyle = cssVar("--text-2");
+      ctx.fillText(item.text, x + 20 * scale, y);
+    });
+  });
   ctx.drawImage(source, pad * scale, titleHeight * scale);
   out.toBlob((blob) => downloadBlob(blob, "inat-seasonal.png"), "image/png");
 }
@@ -637,12 +930,9 @@ async function downloadCsv() {
   if (!state.seasonal) return;
   setStatus("Preparing CSV…", "busy");
   try {
-    const response = await fetch(seasonalQuery(state.seasonal.request, { format: "csv" }));
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      throw new Error(body.detail || response.statusText);
-    }
-    downloadBlob(await response.blob(), "inat-observations.csv");
+    const { request } = state.seasonal;
+    const ids = request.series.map((series) => series.taxonId).filter(Boolean);
+    downloadBlob(await fetchSeasonal(request, ids, { format: "csv" }), "inat-observations.csv");
     setStatus("CSV downloaded.");
   } catch (error) {
     setStatus(error.message, "error");
@@ -784,6 +1074,7 @@ function graphSelectedCell() {
   const cell = state.selectedCell;
   if (!cell) return;
   setMode("seasonal");
+  clearRegion();
   setCenter(cell.cell_lat + cell.cell_deg / 2, cell.cell_lon + cell.cell_deg / 2);
   setRadius(cell.radius_km);
   fitSelection();
@@ -824,13 +1115,14 @@ async function requestPlaceNames() {
 }
 
 async function runAbundance(signal) {
-  const organism = await resolveTaxon("organism", signal);
-  if (!organism) throw new Error("Choose an organism to map where it is observed most.");
+  const organisms = await resolveOrganisms(signal);
+  if (!organisms.length) throw new Error("Choose an organism to map where it is observed most.");
   const exclude = await resolveTaxon("exclude", signal);
   const [start, end] = seasonRange();
+  // Several organisms are mapped together, as one combined group.
   const request = {
-    taxonId: organism.id,
-    organismLabel: organism.label,
+    taxonIds: organisms.map((t) => t.id),
+    organismLabels: organisms.map((t) => t.label),
     excludeId: exclude?.id,
     excludeLabel: exclude?.label,
     seasonStart: monthDayString(start),
@@ -841,9 +1133,10 @@ async function runAbundance(signal) {
     seasonLabel: seasonLabel(),
   };
   const params = new URLSearchParams({
-    taxon_id: request.taxonId, season_start: request.seasonStart, season_end: request.seasonEnd,
+    season_start: request.seasonStart, season_end: request.seasonEnd,
     date_from: request.dateFrom, date_to: request.dateTo, cell_deg: request.cellDeg,
   });
+  request.taxonIds.forEach((id) => params.append("taxon_id", id));
   if (request.excludeId) params.append("exclude_taxon_id", request.excludeId);
   setStatus("Scanning every observation for this time of year…", "busy");
   const started = performance.now();
@@ -852,7 +1145,10 @@ async function runAbundance(signal) {
   state.selectedCell = null;
   $("graph-cell").disabled = true;
   if (highlightRect) { map.removeLayer(highlightRect); highlightRect = null; }
-  $("abundance-title").textContent = `Where ${organism.label} is observed, ${request.seasonLabel}`;
+  const who = request.organismLabels.length > 1
+    ? `${request.organismLabels.slice(0, -1).join(", ")} or ${request.organismLabels.at(-1)}`
+    : request.organismLabels[0];
+  $("abundance-title").textContent = `Where ${who} is observed, ${request.seasonLabel}`;
   drawHeatmap();
   renderRanking();
   if (state.ranked.length) {
@@ -885,9 +1181,13 @@ function writeUrl() {
   if (!result) return;
   const request = result.request;
   const p = new URLSearchParams({ mode: state.mode });
-  if (request.taxonId) {
-    p.set("organism", request.taxonId);
-    p.set("organism_name", request.organismLabel || `Taxon ${request.taxonId}`);
+  // Repeated organism/organism_name pairs, in series order.
+  const organisms = state.mode === "seasonal"
+    ? request.series.filter((s) => s.taxonId).map((s) => [s.taxonId, s.label])
+    : request.taxonIds.map((id, i) => [id, request.organismLabels[i]]);
+  for (const [id, label] of organisms) {
+    p.append("organism", id);
+    p.append("organism_name", label || `Taxon ${id}`);
   }
   if (request.excludeId) {
     p.set("exclude", request.excludeId);
@@ -896,9 +1196,15 @@ function writeUrl() {
   p.set("from", request.dateFrom);
   p.set("to", request.dateTo);
   if (state.mode === "seasonal") {
-    p.set("lat", request.lat);
-    p.set("lon", request.lon);
-    p.set("radius", request.radius);
+    const { area } = request;
+    if (area.placeId) {
+      p.set("place", area.placeId);
+      p.set("place_name", area.placeName);
+    } else {
+      p.set("lat", area.lat);
+      p.set("lon", area.lon);
+      p.set("radius", area.radius);
+    }
     p.set("view", $("view").value);
   } else {
     p.set("season", `${request.seasonStart}_${request.seasonEnd}`);
@@ -911,12 +1217,15 @@ function writeUrl() {
 
 function readUrl() {
   const p = new URLSearchParams(location.search);
-  for (const field of ["organism", "exclude"]) {
-    const id = Number(p.get(field));
-    if (id) {
-      state.taxa[field] = { id, label: p.get(`${field}_name`) || `Taxon ${id}` };
-      $(field).value = state.taxa[field].label;
-    }
+  const names = p.getAll("organism_name");
+  p.getAll("organism").forEach((value, i) => {
+    const id = Number(value);
+    if (id) addOrganism({ id, label: names[i] || `Taxon ${id}` });
+  });
+  const excludeId = Number(p.get("exclude"));
+  if (excludeId) {
+    state.taxa.exclude = { id: excludeId, label: p.get("exclude_name") || `Taxon ${excludeId}` };
+    $("exclude").value = state.taxa.exclude.label;
   }
   if (p.get("from")) $("date-from").value = p.get("from");
   if (p.get("to")) $("date-to").value = p.get("to");
@@ -933,7 +1242,18 @@ function readUrl() {
   $("min-obs").disabled = $("metric").value !== "share";
   const mode = p.get("mode") === "abundance" ? "abundance" : "seasonal";
   setMode(mode);
-  return p.has("mode");
+  // A region permalink needs the outline from iNat before it can search.
+  const placeId = Number(p.get("place"));
+  let ready = Promise.resolve(true);
+  if (placeId) {
+    const name = p.get("place_name") || `Place ${placeId}`;
+    $("place").value = name;
+    ready = selectRegion(placeId, name).then((ok) => {
+      if (!ok) setStatus(`iNaturalist has no outline for ${name}.`, "error");
+      return ok;
+    });
+  }
+  return { hasPermalink: p.has("mode"), ready };
 }
 
 /* ---------- search lifecycle ---------- */
@@ -969,6 +1289,7 @@ $("download-csv").addEventListener("click", downloadCsv);
 window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
   renderChart();
   searchCircle.setStyle({ color: selectionColor() });
+  regionLayer.setStyle({ color: selectionColor() });
   if (highlightRect) highlightRect.setStyle({ color: selectionColor() });
 });
 
@@ -989,7 +1310,8 @@ async function loadStats() {
 
 /* ---------- start ---------- */
 
-setupTaxonPicker("organism");
+setupOrganismPicker();
+renderOrganismChips();
 setupTaxonPicker("exclude");
 setupPlacePicker();
 setupSeasonPicker();
@@ -1000,11 +1322,11 @@ $("lon").value = DEFAULTS.lon.toFixed(4);
 $("radius").value = DEFAULTS.radius;
 updateSelectionOverlay();
 
-const hasPermalink = readUrl();
-loadStats().then(() => {
+const permalink = readUrl();
+Promise.all([loadStats(), permalink.ready]).then(([, placeReady]) => {
   // A permalink's own date range wins over the newest-date default, but not
   // over an edit the user made while the stats were loading.
   const p = new URLSearchParams(location.search);
   if (p.get("to") && !dateToEdited) $("date-to").value = p.get("to");
-  if (hasPermalink) $("search-form").requestSubmit();
+  if (permalink.hasPermalink && placeReady) $("search-form").requestSubmit();
 });

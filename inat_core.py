@@ -6,6 +6,7 @@ web server can import it without PyQt6 or matplotlib.
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from typing import Any
@@ -609,3 +610,222 @@ def seasonal_bin_counts(
         if 0 <= index < bins:
             counts[index] = int(count)
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Region (polygon) searches
+# ---------------------------------------------------------------------------
+
+REGION_MAX_VERTICES = 50_000
+
+
+class RegionError(ValueError):
+    """The region GeoJSON is not a usable Polygon or MultiPolygon."""
+
+
+class SpatialUnavailable(RuntimeError):
+    """DuckDB's spatial extension cannot be loaded or installed."""
+
+
+def region_polygons(geometry: Mapping[str, Any]) -> list:
+    """Return the polygons of a GeoJSON Polygon/MultiPolygon after validating it."""
+    kind = geometry.get("type") if isinstance(geometry, Mapping) else None
+    coordinates = geometry.get("coordinates") if kind else None
+    if kind == "Polygon":
+        polygons = [coordinates]
+    elif kind == "MultiPolygon":
+        polygons = coordinates
+    else:
+        raise RegionError("The region must be a GeoJSON Polygon or MultiPolygon.")
+    vertices = 0
+    if not isinstance(polygons, list) or not polygons:
+        raise RegionError("The region has no polygons.")
+    for polygon in polygons:
+        if not isinstance(polygon, list) or not polygon:
+            raise RegionError("A region polygon has no rings.")
+        for ring in polygon:
+            if not isinstance(ring, list) or len(ring) < 4:
+                raise RegionError("A region ring needs at least four positions.")
+            for point in ring:
+                if (
+                    not isinstance(point, list)
+                    or len(point) < 2
+                    or not all(isinstance(v, (int, float)) for v in point[:2])
+                    or not -180 <= point[0] <= 180
+                    or not -90 <= point[1] <= 90
+                ):
+                    raise RegionError("A region position is not a valid [lon, lat].")
+            vertices += len(ring)
+    if vertices > REGION_MAX_VERTICES:
+        raise RegionError(
+            f"The region outline has {vertices:,} points, more than the "
+            f"{REGION_MAX_VERTICES:,} supported."
+        )
+    return polygons
+
+
+def region_bounds(geometry: Mapping[str, Any]) -> tuple[float, float, float, float]:
+    """Return (lat_min, lat_max, lon_min, lon_max) of a validated region."""
+    points = [
+        point
+        for polygon in region_polygons(geometry)
+        for ring in polygon
+        for point in ring
+    ]
+    lons = [point[0] for point in points]
+    lats = [point[1] for point in points]
+    return min(lats), max(lats), min(lons), max(lons)
+
+
+def load_spatial_extension(con) -> None:
+    """Load DuckDB's spatial extension, installing it on first use.
+
+    Production installs it at deploy time into a directory set with
+    ``extension_directory``, because the service cannot write there.
+    """
+    try:
+        con.load_extension("spatial")
+    except duckdb.Error:
+        try:
+            con.install_extension("spatial")
+            con.load_extension("spatial")
+        except duckdb.Error as error:
+            raise SpatialUnavailable(
+                "Region searches need DuckDB's spatial extension, which is not "
+                f"installed: {error}"
+            ) from None
+
+
+def region_points_sql(
+    geometry: Mapping[str, Any], date_from: str, date_to: str, filter_sql: str
+) -> tuple[str, list[Any]]:
+    """Return CTEs ``box`` (candidate rows) and ``inside`` (coordinates in the region).
+
+    Coordinates are stored to 0.001 degree, so many observations share a
+    point. Testing each distinct point against the polygon once and joining the
+    answer back is several times faster than testing every row.
+    """
+    lat_min, lat_max, lon_min, lon_max = region_bounds(geometry)
+    sql = f"""
+        WITH region AS (SELECT ST_GeomFromGeoJSON(?) AS geom),
+        box AS (
+            SELECT id, decimalLatitude, decimalLongitude, eventDate, taxonID
+            FROM {{source}}
+            WHERE CAST(eventDate AS DATE) BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)
+            AND decimalLatitude BETWEEN ? AND ?
+            AND decimalLongitude BETWEEN ? AND ?
+            {filter_sql}
+        ),
+        points AS (SELECT DISTINCT decimalLatitude, decimalLongitude FROM box),
+        inside AS (
+            SELECT decimalLatitude, decimalLongitude
+            FROM points, region
+            WHERE ST_Contains(region.geom, ST_Point(decimalLongitude, decimalLatitude))
+        )
+    """
+    params = [json.dumps(geometry), date_from, date_to, lat_min, lat_max, lon_min, lon_max]
+    return sql, params
+
+
+def _region_query(
+    parquet_path: str,
+    geometry: Mapping[str, Any],
+    date_from: str,
+    date_to: str,
+    taxon_ids: list[int] | None,
+    exclude_taxon_ids: list[int] | None,
+    select_sql: str,
+    fetch,
+    cancel_callback=None,
+    connection_callback=None,
+    required_columns=REQUIRED_OBSERVATION_COLUMNS,
+    tail_params: list[Any] | None = None,
+):
+    """Run ``select_sql`` over the region CTEs and return ``fetch(connection)``."""
+    region_polygons(geometry)
+    escaped_path = parquet_path.replace("'", "''")
+    con = None
+    try:
+        raise_if_search_cancelled(cancel_callback)
+        con = duckdb.connect()
+        if connection_callback:
+            connection_callback(con)
+        load_spatial_extension(con)
+        check_observation_columns(con, escaped_path, required_columns)
+        filter_sql = taxon_filter_sql(con, taxon_ids or [], exclude_taxon_ids or [])
+        raise_if_search_cancelled(cancel_callback)
+        ctes, params = region_points_sql(geometry, date_from, date_to, filter_sql)
+        query = ctes.replace("{source}", f"'{escaped_path}'") + select_sql
+        con.execute(query, params + (tail_params or []))
+        result = fetch(con)
+        raise_if_search_cancelled(cancel_callback)
+        return result
+    finally:
+        if connection_callback:
+            connection_callback(None)
+        if con is not None:
+            con.close()
+
+
+def run_region_date_counts(
+    parquet_path: str,
+    geometry: Mapping[str, Any],
+    date_from: str,
+    date_to: str,
+    taxon_ids: list[int] | None = None,
+    exclude_taxon_ids: list[int] | None = None,
+    cancel_callback=None,
+    connection_callback=None,
+) -> pd.DataFrame:
+    """Like ``run_local_date_counts``, for observations inside a region polygon."""
+    frame = _region_query(
+        parquet_path, geometry, date_from, date_to, taxon_ids, exclude_taxon_ids,
+        """
+        SELECT CAST(eventDate AS DATE) AS date, count(*) AS count
+        FROM box SEMI JOIN inside USING (decimalLatitude, decimalLongitude)
+        GROUP BY 1 ORDER BY 1
+        """,
+        lambda con: con.fetch_df(),
+        cancel_callback, connection_callback,
+    )
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame["count"] = frame["count"].astype("int64")
+    return frame
+
+
+def run_region_observation_query(
+    parquet_path: str,
+    geometry: Mapping[str, Any],
+    date_from: str,
+    date_to: str,
+    taxon_ids: list[int] | None = None,
+    exclude_taxon_ids: list[int] | None = None,
+    cancel_callback=None,
+    connection_callback=None,
+    limit: int | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Like ``run_local_observation_query`` (without the estimate), inside a region."""
+    select_sql = """
+        SELECT id, decimalLatitude, decimalLongitude, eventDate, taxonID
+        FROM box SEMI JOIN inside USING (decimalLatitude, decimalLongitude)
+    """
+    tail = []
+    if limit is not None:
+        select_sql += " LIMIT ?"
+        tail.append(int(limit))
+    rows = _region_query(
+        parquet_path, geometry, date_from, date_to, taxon_ids, exclude_taxon_ids,
+        select_sql, lambda con: con.fetchall(), cancel_callback, connection_callback,
+        required_columns=REQUIRED_ROW_COLUMNS, tail_params=tail,
+    )
+    observations = [
+        {
+            "id": row[0],
+            "decimalLatitude": row[1],
+            "decimalLongitude": row[2],
+            "eventDate": row[3],
+            "taxonID": row[4],
+        }
+        for row in rows
+    ]
+    return observations, len(observations)

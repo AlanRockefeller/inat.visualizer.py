@@ -95,6 +95,7 @@ run with `journalctl -fu inat-visualizer-update`.
 | `INAT_DUCKDB_THREADS` | `4` (unit sets `2`) | DuckDB threads per query |
 | `INAT_QUERY_TIMEOUT` | `90` | Seconds before a query is interrupted (HTTP 504) |
 | `INAT_MAX_CSV_ROWS` | `500000` | Largest CSV download |
+| `INAT_DUCKDB_EXTENSION_DIR` | DuckDB's default (unit sets `/opt/inat-visualizer/.duckdb-extensions`) | Where the spatial extension for region searches is installed; `deploy.sh` and `setup.sh` install it |
 | `INAT_RESULT_CACHE_ENTRIES` | `256` | Cached query results |
 | `INAT_RESULT_CACHE_MB` | `64` | Budget for cached results, measured as JSON size |
 

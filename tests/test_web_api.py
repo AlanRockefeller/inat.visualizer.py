@@ -254,6 +254,81 @@ class WebApiTests(unittest.TestCase):
         os.utime(self.observations, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**9))
         self.assertEqual(self.seasonal().json()["total"], 4)
 
+    # A square around San Francisco (0.1 degree each way) and one around New York.
+    SF_SQUARE = {
+        "type": "Polygon",
+        "coordinates": [[
+            [SF[1] - 0.1, SF[0] - 0.1], [SF[1] + 0.1, SF[0] - 0.1],
+            [SF[1] + 0.1, SF[0] + 0.1], [SF[1] - 0.1, SF[0] + 0.1],
+            [SF[1] - 0.1, SF[0] - 0.1],
+        ]],
+    }
+
+    def region(self, region=None, **body):
+        payload = {
+            "region": region or self.SF_SQUARE,
+            "date_from": "2000-01-01",
+            "date_to": "2030-01-01",
+            **body,
+        }
+        return self.client.post("/api/seasonal/region", json=payload)
+
+    def require_spatial(self):
+        import duckdb
+
+        from inat_core import SpatialUnavailable, load_spatial_extension
+
+        con = duckdb.connect()
+        try:
+            load_spatial_extension(con)
+        except SpatialUnavailable:
+            self.skipTest("DuckDB spatial extension unavailable (offline?)")
+        finally:
+            con.close()
+
+    def test_region_counts_only_points_inside(self):
+        self.require_spatial()
+        body = self.region().json()
+        self.assertEqual(body["total"], 3)  # the three San Francisco observations
+        self.assertEqual(self.region(taxon_id=[1]).json()["total"], 2)
+        self.assertEqual(self.region(exclude_taxon_id=[1]).json()["total"], 1)
+
+    def test_region_multipolygon_and_csv(self):
+        self.require_spatial()
+        ny = {
+            "type": "Polygon",
+            "coordinates": [[
+                [NEW_YORK[1] - 0.1, NEW_YORK[0] - 0.1], [NEW_YORK[1] + 0.1, NEW_YORK[0] - 0.1],
+                [NEW_YORK[1] + 0.1, NEW_YORK[0] + 0.1], [NEW_YORK[1] - 0.1, NEW_YORK[0] + 0.1],
+                [NEW_YORK[1] - 0.1, NEW_YORK[0] - 0.1],
+            ]],
+        }
+        both = {
+            "type": "MultiPolygon",
+            "coordinates": [self.SF_SQUARE["coordinates"], ny["coordinates"]],
+        }
+        self.assertEqual(self.region(both).json()["total"], 4)
+        response = self.region(ny, format="csv")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text.strip().splitlines()[1].split(",")[0], "13")
+
+    def test_region_validation(self):
+        self.assertEqual(self.region({"type": "Point", "coordinates": [0, 0]}).status_code, 422)
+        bad_ring = {"type": "Polygon", "coordinates": [[[0, 0], [1, 1], [0, 0]]]}
+        self.assertEqual(self.region(bad_ring).status_code, 422)
+        off_world = {"type": "Polygon", "coordinates": [[[0, 0], [200, 0], [0, 1], [0, 0]]]}
+        self.assertEqual(self.region(off_world).status_code, 422)
+        self.assertEqual(self.region(date_from="2022-02-30").status_code, 422)
+
+    def test_region_without_spatial_extension_returns_503(self):
+        from inat_core import SpatialUnavailable
+
+        def unavailable(con):
+            raise SpatialUnavailable("no extension")
+
+        with patch("inat_core.load_spatial_extension", unavailable):
+            self.assertEqual(self.region().status_code, 503)
+
     def test_missing_database_returns_503(self):
         os.remove(self.observations)
         self.assertEqual(self.client.get("/api/stats").status_code, 503)
