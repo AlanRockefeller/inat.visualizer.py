@@ -9,7 +9,10 @@ const INAT_API = "https://api.inaturalist.org/v1";
 const INAT_OBSERVATIONS = "https://www.inaturalist.org/observations";
 // The database is iNaturalist's GBIF export: research grade, and only these
 // licenses, so iNat links filter the same way to show the same observations.
+// Once backfilled observations are merged in (api/stats says all_licenses),
+// links drop the license filter to match.
 const INAT_EXPORT_FILTER = { quality_grade: "research", license: "cc0,cc-by,cc-by-nc" };
+const INAT_ALL_LICENSES_FILTER = { quality_grade: "research" };
 // One color per compared organism. Blue first (the desktop app's bar color);
 // the rest are Okabe-Ito hues chosen to stay apart, colorblind-friendly too.
 const SERIES_COLORS = ["#1f77b4", "#e69f00", "#009e73", "#d55e00", "#9467bd", "#cc79a7"];
@@ -49,6 +52,8 @@ const state = {
   organisms: [], // [{id, label}], compared as separate series; empty = all organisms
   place: null, // {id, name, geometry, lat, lon} while a named region is the search area
   placeLoading: null, // promise for the place being picked, awaited by Graph
+  placeRelease: null, // ends that wait early when the pick is cancelled
+  allLicenses: false, // the database includes backfilled (non-export) licenses
   lastRadius: 10, // restored when leaving region mode without a typed radius
   seasonal: null, // last /api/seasonal response + its request
   abundance: null, // last /api/abundance response + its request
@@ -294,7 +299,14 @@ function setupPlacePicker() {
       return results.filter((r) => r.type === "Place" && r.record?.location).map((r) => r.record);
     },
     render: (place) => escapeHtml(place.display_name || place.name),
-    onPick: (place) => { state.placeLoading = pickPlace(place); },
+    onPick: (place) => {
+      // Graph waits on this; clearRegion() releases the wait if the pick is
+      // superseded by a circle edit.
+      let release;
+      const cancelled = new Promise((resolve) => { release = resolve; });
+      state.placeLoading = Promise.race([pickPlace(place), cancelled]);
+      state.placeRelease = release;
+    },
   });
 }
 
@@ -465,6 +477,9 @@ async function selectRegion(id, name, center) {
 // moves it next), with the typed radius or the last one used.
 function clearRegion() {
   regionRequest++;
+  state.placeRelease?.();
+  state.placeLoading = null;
+  state.placeRelease = null;
   if (!state.place) return;
   state.place = null;
   seasonalLayer.removeLayer(regionLayer);
@@ -824,13 +839,22 @@ async function checkResponse(response, format) {
   return format === "json" ? response.json() : response.blob();
 }
 
-async function runSeasonal(signal) {
-  if (state.placeLoading) {
+// Wait until the latest place pick has its outline (or was cancelled); a pick
+// made while waiting is waited for too.
+async function settlePlace() {
+  while (state.placeLoading) {
+    const pending = state.placeLoading;
     setStatus("Waiting for the place outline…", "busy");
-    await state.placeLoading;
+    await pending;
+    if (state.placeLoading === pending) state.placeLoading = null;
   }
+}
+
+async function runSeasonal(signal) {
+  await settlePlace();
   const organisms = await resolveOrganisms(signal);
   const exclude = await resolveTaxon("exclude", signal);
+  await settlePlace(); // a place may have been picked during the lookups
   const area = state.place
     ? { placeId: state.place.id, placeName: state.place.name, geometry: state.place.geometry,
         lat: state.place.lat, lon: state.place.lon }
@@ -856,7 +880,12 @@ async function runSeasonal(signal) {
   const span = firsts.length ? `, ${firsts[0]} to ${lasts.at(-1)}` : "";
   const taxa = results.length === 1 && results[0].taxa_included
     ? ` · ${fmt(results[0].taxa_included)} taxa included` : "";
-  $("chart-summary").textContent = `${fmt(total)} observations${span}${taxa}.`;
+  // Series can overlap (a genus and one of its species), so with several the
+  // figure is a sum of per-organism counts, not a count of distinct observations.
+  const counted = results.length > 1
+    ? `${fmt(total)} observations summed over ${results.length} organisms`
+    : `${fmt(total)} observations`;
+  $("chart-summary").textContent = `${counted}${span}${taxa}.`;
   $("download-png").disabled = total === 0;
   $("download-csv").disabled = total === 0;
   renderLegend();
@@ -873,7 +902,8 @@ async function runSeasonal(signal) {
 // Observations on inaturalist.org matching a search, optionally narrowed to
 // some series and to one bar's day, week or month of the year.
 function inatUrl(request, series, bin) {
-  const p = new URLSearchParams({ ...INAT_EXPORT_FILTER, d1: request.dateFrom, d2: request.dateTo });
+  const filter = state.allLicenses ? INAT_ALL_LICENSES_FILTER : INAT_EXPORT_FILTER;
+  const p = new URLSearchParams({ ...filter, d1: request.dateFrom, d2: request.dateTo });
   const ids = series.map((s) => s.taxonId).filter(Boolean);
   if (ids.length) p.set("taxon_ids", ids.join(","));
   if (request.excludeId) p.set("without_taxon_id", request.excludeId);
@@ -1347,6 +1377,7 @@ $("date-to").addEventListener("input", () => { dateToEdited = true; });
 async function loadStats() {
   try {
     const stats = await fetchJson("api/stats");
+    state.allLicenses = Boolean(stats.all_licenses);
     const newest = stats.newest_date ? ` · newest ${stats.newest_date}` : "";
     $("stats").textContent = `${fmt(stats.total_observations)} observations${newest} · updated ${stats.updated} · v${stats.version}`;
     // Default "To" to the newest observation unless the user already changed it.

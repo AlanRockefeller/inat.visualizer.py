@@ -17,8 +17,10 @@ The first run walks every matching observation in id order, about 51 million
 rows at 200 per request, at most one request a second and 10,000 a day (iNat's
 API guidance) -- roughly four weeks. It can be stopped and restarted at any
 time. Once both walks are finished, each run instead asks only for
-observations updated since the previous sync, removing those that are no
-longer research grade, and (with --api-token) those deleted on iNaturalist.
+observations updated since the previous sync, whatever their license, and
+removes those that are no longer research grade or that moved to a license the
+export carries (the export then counts them). Observations deleted on
+iNaturalist are not seen: the API only lists deletions to their owner.
 
     python backfill_observations.py                 # run until today's budget is spent
     python backfill_observations.py --max-hours 2   # or stop after two hours
@@ -31,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import os
 import signal
@@ -45,16 +48,20 @@ from typing import Any
 
 import duckdb
 
-API_V1 = "https://api.inaturalist.org/v1"
 API_V2 = "https://api.inaturalist.org/v2"
 USER_AGENT = "iNat-Seasonal-Visualizer-backfill/1 (+https://visualizer.dikarya.us/)"
 PER_PAGE = 200
-FIELDS = "id,observed_on,location,quality_grade,taxon.id,taxon.rank"
+FIELDS = "id,observed_on,location,quality_grade,license_code,taxon.id,taxon.rank"
+# Licenses the GBIF export carries; observations under these belong to it.
+EXPORT_LICENSES = {"cc0", "cc-by", "cc-by-nc"}
 # The two groups missing from the export, as API filters.
 STREAMS = {
     "unlicensed": {"licensed": "false"},
     "sharealike_noderivs": {"license": "cc-by-sa,cc-by-nd,cc-by-nc-sa,cc-by-nc-nd"},
 }
+# The sync asks for every updated observation, whatever its license, so a
+# stored observation that changed license still reaches the store.
+SYNC_STREAMS = {"changes": {}}
 DEFAULT_DAILY_REQUESTS = 10_000
 MIN_REQUEST_INTERVAL = 1.0
 FLUSH_EVERY_PAGES = 25
@@ -66,6 +73,14 @@ COLUMNS = (
 
 class BackfillError(Exception):
     """The API refused or kept failing; the store is left consistent."""
+
+
+class BudgetSpent(BackfillError):
+    """Today's request budget ran out; run again tomorrow to continue."""
+
+
+def sql_literal(path: Path | str) -> str:
+    return "'" + str(path).replace("'", "''") + "'"
 
 
 def status(message: str) -> None:
@@ -87,7 +102,6 @@ class ApiClient:
         opener: Callable[[urllib.request.Request], Any] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
-        api_token: str | None = None,
     ) -> None:
         self.state = state
         self.daily_limit = daily_limit
@@ -95,7 +109,6 @@ class ApiClient:
         self.opener = opener or (lambda request: urllib.request.urlopen(request, timeout=120))
         self.sleep = sleep
         self.clock = clock
-        self.api_token = api_token
         self.last_request = -float("inf")
 
     def budget_left(self) -> int:
@@ -105,18 +118,18 @@ class ApiClient:
             self.state["requests_today"] = 0
         return self.daily_limit - self.state["requests_today"]
 
-    def get(self, url: str, params: dict[str, Any], auth: bool = False) -> dict[str, Any]:
+    def get(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
         full = f"{url}?{urllib.parse.urlencode(params)}"
         headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-        if auth and self.api_token:
-            headers["Authorization"] = self.api_token
         delay = 5.0
         for attempt in range(8):
+            # Retries count against the budget too.
+            if self.budget_left() <= 0:
+                raise BudgetSpent("today's request budget is spent")
             wait = self.min_interval - (self.clock() - self.last_request)
             if wait > 0:
                 self.sleep(wait)
             self.last_request = self.clock()
-            self.budget_left()
             self.state["requests_today"] += 1
             try:
                 with self.opener(urllib.request.Request(full, headers=headers)) as response:
@@ -141,12 +154,15 @@ def parse_observation(raw: dict[str, Any]) -> dict[str, Any] | None:
     """Turn one API result into a store row, or None when it cannot be counted.
 
     Rows that are not research grade become removals, so a later update can
-    take back an observation that lost its research-grade status.
+    take back an observation that lost its research-grade status. So do rows
+    now under a license the export carries: the export counts those itself.
     """
     observation_id = raw.get("id")
     if not isinstance(observation_id, int):
         return None
     if raw.get("quality_grade") != "research":
+        return {"id": observation_id, "removed": True}
+    if str(raw.get("license_code") or "").lower() in EXPORT_LICENSES:
         return {"id": observation_id, "removed": True}
     try:
         lat_text, lon_text = (raw.get("location") or "").split(",")
@@ -177,8 +193,44 @@ class Store:
         self.state_path = directory / "state.json"
         self.extra_path = directory / "extra.parquet"
         self.parts.mkdir(parents=True, exist_ok=True)
+        # One process at a time: a compaction deletes the parts it folded in,
+        # and a fetcher must not write a part (or move a cursor) meanwhile.
+        self.lock = open(directory / ".lock", "w")
+        try:
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.lock.close()
+            raise BackfillError(f"{directory} is in use by another backfill or update") from None
         self.state = self.load_state()
+        # A crash between writing a part and saving the state leaves rows on
+        # disk with higher sequence numbers than the state; never reuse them.
+        self.state["seq"] = max(self.state["seq"], self.committed_seq())
         self.pending: list[dict[str, Any]] = []
+
+    def close(self) -> None:
+        self.lock.close()
+
+    def __enter__(self) -> Store:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def sources(self) -> list[str]:
+        sources = [str(p) for p in sorted(self.parts.glob("*.parquet"))]
+        if self.extra_path.exists():
+            sources.insert(0, str(self.extra_path))
+        return sources
+
+    def committed_seq(self) -> int:
+        sources = self.sources()
+        if not sources:
+            return 0
+        con = duckdb.connect()
+        try:
+            return int(con.execute("SELECT max(seq) FROM read_parquet(?)", [sources]).fetchone()[0] or 0)
+        finally:
+            con.close()
 
     def load_state(self) -> dict[str, Any]:
         if self.state_path.exists():
@@ -226,7 +278,7 @@ class Store:
                         for r in self.pending
                     ],
                 )
-                con.execute(f"COPY rows TO '{temporary}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+                con.execute(f"COPY rows TO {sql_literal(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)")
             finally:
                 con.close()
             os.replace(temporary, target)
@@ -235,9 +287,7 @@ class Store:
 
     def compact(self) -> int:
         """Fold the parts into extra.parquet (latest row per id, removals dropped)."""
-        sources = [str(p) for p in sorted(self.parts.glob("*.parquet"))]
-        if self.extra_path.exists():
-            sources.insert(0, str(self.extra_path))
+        sources = self.sources()
         if not sources:
             return 0
         temporary = self.extra_path.with_suffix(".parquet.tmp")
@@ -246,24 +296,27 @@ class Store:
             con.execute(
                 f"""
                 COPY (
-                    SELECT id, decimalLatitude, decimalLongitude, taxonID, taxonRank,
-                           eventDate, removed, seq
-                    FROM read_parquet(?)
-                    QUALIFY row_number() OVER (PARTITION BY id ORDER BY seq DESC) = 1
-                ) TO '{temporary}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                    SELECT * FROM (
+                        SELECT id, decimalLatitude, decimalLongitude, taxonID, taxonRank,
+                               eventDate, removed, seq
+                        FROM read_parquet(?)
+                        QUALIFY row_number() OVER (PARTITION BY id ORDER BY seq DESC) = 1
+                    ) WHERE NOT removed
+                ) TO {sql_literal(temporary)} (FORMAT PARQUET, COMPRESSION ZSTD)
                 """,
                 [sources],
             )
-            # Keep removals in the compacted file only while they could still
-            # cancel a row; they never reach the merged database.
+            # A removal has cancelled every earlier row once folded in, and
+            # later parts carry higher sequence numbers, so none are kept.
             rows = con.execute(
-                f"SELECT count(*) FROM read_parquet('{temporary}') WHERE NOT removed"
+                f"SELECT count(*) FROM read_parquet({sql_literal(temporary)})"
             ).fetchone()[0]
         finally:
             con.close()
         os.replace(temporary, self.extra_path)
-        for part in self.parts.glob("*.parquet"):
-            part.unlink()
+        for part in sources:
+            if part != str(self.extra_path):
+                Path(part).unlink()
         return rows
 
 
@@ -278,10 +331,8 @@ def fetch_stream(
     """Page through one filter in id order from ``cursor``; True when finished."""
     pages = 0
     while not should_stop():
-        if client.budget_left() <= 0:
-            return False
         params = {
-            **STREAMS[name],
+            **(STREAMS | SYNC_STREAMS)[name],
             **extra_params,
             "order_by": "id",
             "order": "asc",
@@ -289,7 +340,10 @@ def fetch_stream(
             "per_page": PER_PAGE,
             "fields": FIELDS,
         }
-        body = client.get(f"{API_V2}/observations", params)
+        try:
+            body = client.get(f"{API_V2}/observations", params)
+        except BudgetSpent:
+            break  # the cursor still points at the page that was not fetched
         results = body.get("results") or []
         rows = [row for row in map(parse_observation, results) if row]
         store.add(rows)
@@ -305,23 +359,6 @@ def fetch_stream(
             status(f"{name}: up to id {cursor['id_above']:,}, about {cursor['remaining']:,} to go.")
     store.flush()
     return False
-
-
-def fetch_deleted(client: ApiClient, store: Store, since: str) -> None:
-    """Record observations deleted on iNat since ``since`` (needs an API token)."""
-    page = 1
-    while client.budget_left() > 0:
-        body = client.get(
-            f"{API_V1}/observations/deleted",
-            {"since": since[:10], "per_page": 500, "page": page},
-            auth=True,
-        )
-        ids = [i for i in body.get("results") or [] if isinstance(i, int)]
-        store.add([{"id": i, "removed": True} for i in ids])
-        if len(ids) < 500:
-            break
-        page += 1
-    store.flush()
 
 
 def run(
@@ -356,27 +393,28 @@ def run(
                 return "budget"
         # Phase 2: changes since the last sync (or since the backfill began, to
         # catch edits made during the weeks it took).
+        if state["sync"] is not None and set(state["sync"]["streams"]) != set(SYNC_STREAMS):
+            state["sync"] = None  # begun by an older version with other streams
         if state["sync"] is None:
             since = state["last_sync"] or state["started_at"]
             state["sync"] = {
                 "since": since,
                 "started": utc_now(),
-                "streams": {name: {"id_above": 0, "done": False} for name in STREAMS},
+                "streams": {name: {"id_above": 0, "done": False} for name in SYNC_STREAMS},
             }
             store.save_state()
         sync = state["sync"]
         for name, cursor in sync["streams"].items():
             if cursor["done"]:
                 continue
-            status(f"Syncing {name} changes since {sync['since']}...")
-            # No quality filter: an update may have taken research grade away.
+            status(f"Syncing changes since {sync['since']}...")
+            # No quality or license filter: an update may have taken research
+            # grade away, or moved the observation to an export license.
             cursor["done"] = fetch_stream(
                 client, store, name, cursor, {"updated_since": sync["since"]}, should_stop
             )
             if not cursor["done"]:
                 return "budget"
-        if client.api_token:
-            fetch_deleted(client, store, sync["since"])
         state["last_sync"] = sync["started"]
         state["sync"] = None
         store.flush()
@@ -408,9 +446,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-hours", type=float, help="stop after this many hours")
     parser.add_argument("--daily-requests", type=int, default=DEFAULT_DAILY_REQUESTS,
                         help=f"API requests per day (default {DEFAULT_DAILY_REQUESTS:,})")
-    parser.add_argument("--api-token", default=os.environ.get("INAT_API_TOKEN"),
-                        help="iNat API token (JWT from https://www.inaturalist.org/users/api_token), "
-                             "used only to fetch deletions; also INAT_API_TOKEN")
     parser.add_argument("--status", action="store_true", help="show progress and exit")
     parser.add_argument("--compact", action="store_true",
                         help="fold fetched parts into extra.parquet and exit")
@@ -419,20 +454,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    store = Store(args.store)
-    if args.status:
-        print(describe(store))
-        return 0
-    if args.compact:
-        status(f"extra.parquet now holds {store.compact():,} observations.")
-        return 0
-    client = ApiClient(store.state, daily_limit=args.daily_requests, api_token=args.api_token)
-    deadline = time.monotonic() + args.max_hours * 3600 if args.max_hours else None
     try:
-        outcome = run(store, client, deadline=deadline)
+        store = Store(args.store)
     except BackfillError as error:
-        print(f"Backfill stopped: {error}", file=sys.stderr)
+        print(error, file=sys.stderr)
         return 1
+    with store:
+        if args.status:
+            print(describe(store))
+            return 0
+        if args.compact:
+            status(f"extra.parquet now holds {store.compact():,} observations.")
+            return 0
+        client = ApiClient(store.state, daily_limit=args.daily_requests)
+        deadline = time.monotonic() + args.max_hours * 3600 if args.max_hours else None
+        try:
+            outcome = run(store, client, deadline=deadline)
+        except BackfillError as error:
+            print(f"Backfill stopped: {error}", file=sys.stderr)
+            return 1
     status({"synced": "Up to date.", "budget": "Stopped; run again to continue.",
             "backfilling": "Stopped; run again to continue."}[outcome])
     print(describe(store))

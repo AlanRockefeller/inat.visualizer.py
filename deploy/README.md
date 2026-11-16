@@ -86,10 +86,14 @@ The first pass takes about four weeks at iNat's recommended pace (one request
 a second, 10,000 a day). It saves its place every few pages, so it can be
 stopped with Ctrl-C and restarted, and `update_database.py` merges whatever has
 been fetched so far. After the first pass, each run fetches only observations
-changed since the previous one (about 3,000 requests a week) and drops those
-that lost research grade. Deleted observations are only noticed with an iNat
-API token (`INAT_API_TOKEN`, from https://www.inaturalist.org/users/api_token,
-valid 24 hours); without one they stay counted.
+changed since the previous one, whatever its license (iNat updates about 3.5
+million observations a week, so about 18,000 requests: two days of budget). It drops observations that lost research grade, and those that moved
+to a license the export carries, since the export counts them. Observations
+deleted on iNaturalist stay counted: the API only lists deletions to their
+owners. Only one backfill or update can use the store at a time.
+
+Once backfilled rows are merged, the site's iNaturalist links drop their
+license filter, so they show the same observations the graph counts.
 
 ## Tile cache
 

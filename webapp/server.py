@@ -399,6 +399,12 @@ def compute_stats(cancel_callback=None, connection_callback=None) -> dict[str, A
         total, newest = con.execute(
             f"SELECT count(*), max(eventDate) FROM '{escaped}'"
         ).fetchone()
+        # update_database.py marks a database that includes backfilled
+        # (unlicensed, share-alike, no-derivatives) observations.
+        all_licenses = bool(con.execute(
+            f"SELECT count(*) FROM parquet_kv_metadata('{escaped}') "
+            "WHERE decode(key) = 'inat_licenses' AND decode(value) = 'all'"
+        ).fetchone()[0])
     finally:
         if connection_callback:
             connection_callback(None)
@@ -407,6 +413,7 @@ def compute_stats(cancel_callback=None, connection_callback=None) -> dict[str, A
         "version": __version__,
         "total_observations": int(total or 0),
         "newest_date": newest.isoformat() if newest else None,
+        "all_licenses": all_licenses,
         "updated": dt.datetime.fromtimestamp(
             OBSERVATIONS_FILE.stat().st_mtime, dt.timezone.utc
         ).date().isoformat(),

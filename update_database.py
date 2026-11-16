@@ -42,6 +42,9 @@ OBSERVATIONS_ARCHIVE_NAME = "gbif-observations-dwca.zip"
 TAXONOMY_ARCHIVE_NAME = "inaturalist-taxonomy.dwca.zip"
 GBIF_BASE_NAME = "observations-gbif.parquet"
 STATE_NAME = "update_state.json"
+# Parquet footer key telling the web app which licenses the database covers:
+# 'all' once backfilled rows are merged in; absent for the export alone.
+LICENSES_KEY = "inat_licenses"
 EXTRACTION_RESERVE_BYTES = 5 * 1024**3
 COPY_BUFFER_BYTES = 16 * 1024**2
 
@@ -528,7 +531,8 @@ def merge_observations(output_directory: Path, backfill_extra: Path | None) -> d
                         ANTI JOIN read_parquet({sql_literal(base)}) g USING (id)
                         WHERE NOT e.removed
                     ) TO {sql_literal(staged)} (
-                        FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 1000000
+                        FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 1000000,
+                        KV_METADATA {{{LICENSES_KEY}: 'all'}}
                     )
                     """
                 )
@@ -685,20 +689,42 @@ def main(argv: list[str] | None = None) -> int:
         if (backfill_dir / "state.json").exists():
             import backfill_observations as backfill
 
-            store = backfill.Store(backfill_dir)
-            if not args.no_fetch:
-                client = backfill.ApiClient(store.state, api_token=os.environ.get("INAT_API_TOKEN"))
-                deadline = (
-                    time.monotonic() + args.backfill_hours * 3600 if args.backfill_hours else None
-                )
-                try:
-                    outcome = backfill.run(store, client, deadline=deadline)
-                    status(f"Backfill: {outcome}.")
-                except backfill.BackfillError as error:
-                    status(f"Backfill stopped ({error}); merging what is stored.")
-            status(f"Backfill store holds {store.compact():,} observations.")
+            try:
+                store = backfill.Store(backfill_dir)
+            except backfill.BackfillError as error:
+                raise UpdateError(f"{error}; stop it first, or pass --backfill-dir") from None
+            with store:
+                if not args.no_fetch:
+                    client = backfill.ApiClient(store.state)
+                    deadline = (
+                        time.monotonic() + args.backfill_hours * 3600
+                        if args.backfill_hours
+                        else None
+                    )
+                    try:
+                        outcome = backfill.run(store, client, deadline=deadline)
+                        status(f"Backfill: {outcome}.")
+                    except backfill.BackfillError as error:
+                        status(f"Backfill stopped ({error}); merging what is stored.")
+                status(f"Backfill store holds {store.compact():,} observations.")
         if rebuild:
-            last_modified = last_modified or remote_last_modified(OBSERVATIONS_URL)
+            if last_modified is None:
+                try:
+                    last_modified = remote_last_modified(OBSERVATIONS_URL)
+                except UpdateError as error:
+                    status(f"{error}; the next run will rebuild.")
+            built_from = last_modified
+            if not args.observations_archive:
+                # An archive kept (--keep-archives) from an older export must
+                # not be recorded as the new one.
+                if observation_archive.exists() and state.get("archive_last_modified") != last_modified:
+                    if last_modified is not None:
+                        status("The kept archive is from an older export; downloading the new one.")
+                        observation_archive.unlink()
+                    else:
+                        built_from = state.get("archive_last_modified")
+                if not observation_archive.exists():
+                    state["archive_last_modified"] = last_modified
             ensure_archive(observation_archive, OBSERVATIONS_URL)
             ensure_archive(taxonomy_archive, TAXONOMY_URL)
             update_databases(
@@ -708,7 +734,7 @@ def main(argv: list[str] | None = None) -> int:
                 keep_archives=args.keep_archives,
                 backfill_extra=backfill_extra,
             )
-            state["gbif_last_modified"] = last_modified
+            state["gbif_last_modified"] = built_from
             save_update_state(output_directory, state)
         else:
             # 3. Merge the new backfill rows into the existing export build.

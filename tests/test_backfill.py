@@ -39,9 +39,16 @@ class FakeApi:
         if self.failures:
             code = self.failures.pop(0)
             raise urllib.error.HTTPError(request.full_url, code, "busy", {}, None)
-        name = "unlicensed" if params.get("licensed") == "false" else "sharealike_noderivs"
+        if params.get("licensed") == "false":
+            pool = self.streams.get("unlicensed", [])
+        elif "license" in params:
+            pool = self.streams.get("sharealike_noderivs", [])
+        else:  # the sync: every license
+            pool = sorted(
+                (o for rows in self.streams.values() for o in rows), key=lambda o: o["id"]
+            )
         rows = [
-            o for o in self.streams.get(name, [])
+            o for o in pool
             if o["id"] > int(params["id_above"])
             and (params.get("quality_grade") is None or o["quality_grade"] == params["quality_grade"])
         ]
@@ -61,6 +68,11 @@ def read(path):
 
 
 class BackfillTests(unittest.TestCase):
+    def store(self):
+        store = backfill.Store(self.dir / "bf")
+        self.addCleanup(store.close)
+        return store
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -82,12 +94,13 @@ class BackfillTests(unittest.TestCase):
             "unlicensed": [observation(i) for i in (1, 3, 5, 7, 9)],
             "sharealike_noderivs": [observation(i) for i in (2, 4)],
         })
-        store = backfill.Store(self.dir / "bf")
+        store = self.store()
         self.assertEqual(backfill.run(store, client(store, api, daily=2)), "budget")
         self.assertEqual(store.state["streams"]["unlicensed"]["id_above"], 7)  # two pages of two
 
         # A fresh process picks up from the saved cursor.
-        store = backfill.Store(self.dir / "bf")
+        store.close()
+        store = self.store()
         store.state["requests_today"] = 0
         self.assertEqual(backfill.run(store, client(store, api)), "synced")
         self.assertEqual(store.compact(), 7)
@@ -97,7 +110,7 @@ class BackfillTests(unittest.TestCase):
 
     def test_sync_updates_and_removes_without_quality_filter(self):
         api = FakeApi({"unlicensed": [observation(1), observation(2)]})
-        store = backfill.Store(self.dir / "bf")
+        store = self.store()
         backfill.run(store, client(store, api))
         store.compact()
         # Observation 1 lost research grade, 2 moved, 3 is new.
@@ -114,19 +127,58 @@ class BackfillTests(unittest.TestCase):
         live = frame[~frame["removed"]]
         self.assertEqual(list(live["id"]), [2, 3])
         self.assertEqual(float(live.iloc[0]["decimalLatitude"]), 10.0)
-        self.assertTrue(bool(frame[frame["id"] == 1]["removed"].iloc[0]))
+        self.assertNotIn(1, list(frame["id"]))  # removals are folded away
+
+    def test_sync_removes_observations_that_move_to_an_export_license(self):
+        api = FakeApi({"unlicensed": [observation(1), observation(2)]})
+        store = self.store()
+        backfill.run(store, client(store, api))
+        store.compact()
+        # 1 became CC-BY: the unlicensed filter no longer returns it.
+        api.streams["unlicensed"] = [observation(2)]
+        api.streams["open"] = [{**observation(1), "license_code": "cc-by"}]
+        backfill.run(store, client(store, api))
+        self.assertEqual(store.compact(), 1)
+        self.assertEqual(list(read(store.extra_path)["id"]), [2])
+
+    def test_budget_stops_retries_and_keeps_the_cursor(self):
+        api = FakeApi({"unlicensed": [observation(1)]})
+        api.failures = [429, 429, 429]
+        store = self.store()
+        self.assertEqual(backfill.run(store, client(store, api, daily=2)), "budget")
+        self.assertEqual(len(api.calls), 2)
+        self.assertEqual(store.state["streams"]["unlicensed"]["id_above"], 0)
+
+    def test_store_is_locked_and_recovers_sequence_numbers(self):
+        store = self.store()
+        with self.assertRaises(backfill.BackfillError):
+            backfill.Store(self.dir / "bf")
+        store.add([backfill.parse_observation(observation(1))])
+        store.flush()
+        # Simulate a crash after the part was written but before the state was.
+        store.state["seq"] = 0
+        store.save_state()
+        store.close()
+        self.assertEqual(self.store().state["seq"], 1)
+
+    def test_paths_with_quotes(self):
+        self.dir = self.dir / "O'Brien"
+        store = self.store()
+        store.add([backfill.parse_observation(observation(1))])
+        store.flush()
+        self.assertEqual(store.compact(), 1)
 
     def test_retries_rate_limits(self):
         api = FakeApi({"unlicensed": [observation(1)]})
         api.failures = [429, 503]
-        store = backfill.Store(self.dir / "bf")
+        store = self.store()
         self.assertEqual(backfill.run(store, client(store, api)), "synced")
         self.assertEqual(store.compact(), 1)
 
     def test_refuses_other_http_errors(self):
         api = FakeApi({"unlicensed": [observation(1)]})
         api.failures = [403]
-        store = backfill.Store(self.dir / "bf")
+        store = self.store()
         with self.assertRaises(backfill.BackfillError):
             backfill.run(store, client(store, api))
 
@@ -151,6 +203,7 @@ class MergeTests(unittest.TestCase):
                     TO '{directory / update_database.GBIF_BASE_NAME}' (FORMAT PARQUET)"""
             )
             store = backfill.Store(directory / "backfill")
+            self.addCleanup(store.close)
             store.add([
                 {**backfill.parse_observation(observation(2, lat=50.0))},  # in export: ignored
                 backfill.parse_observation(observation(3)),
@@ -164,6 +217,11 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(list(frame["id"]), [1, 2, 3])
             self.assertEqual(float(frame.iloc[1]["decimalLatitude"]), 2.0)
             self.assertEqual(stats["rows"], 3)
+            kv = duckdb.sql(
+                f"SELECT decode(value) FROM parquet_kv_metadata('{directory / 'observations.parquet'}') "
+                f"WHERE decode(key) = '{update_database.LICENSES_KEY}'"
+            ).fetchall()
+            self.assertEqual(kv, [("all",)])
 
     def test_merge_without_backfill_links_the_export(self):
         with tempfile.TemporaryDirectory() as name:
