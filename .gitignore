@@ -21,3 +21,7 @@ tile_cache/
 # Other generated
 __pycache__/
 *.pyc
+
+# Backfill store and update bookkeeping (backfill_observations.py, update_database.py)
+backfill/
+update_state.json
