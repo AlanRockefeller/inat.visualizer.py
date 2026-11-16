@@ -641,6 +641,31 @@ function binLabels(view) {
 
 let chart = null;
 
+// Redraw hovered bars with a soft halo in their own color, so they read as
+// clickable. Drawn after the datasets so the halo sits on top of neighbours.
+const barGlow = {
+  id: "barGlow",
+  afterDatasetsDraw(chartInstance) {
+    const glow = chartInstance.$glow || [];
+    if (!glow.length) return;
+    const { ctx } = chartInstance;
+    for (const { element } of glow) {
+      ctx.save();
+      ctx.shadowColor = element.options.backgroundColor;
+      ctx.shadowBlur = 14;
+      element.draw(ctx);
+      ctx.restore();
+    }
+  },
+  afterEvent(chartInstance, { event }) {
+    if (event.type === "mouseout" && chartInstance.$glow?.length) {
+      chartInstance.$glow = [];
+      chartInstance.$glowKey = "";
+      chartInstance.draw();
+    }
+  },
+};
+
 // Below this chart width, month names become single letters so twelve fit.
 const NARROW_CHART_PX = 560;
 
@@ -659,6 +684,7 @@ function renderChart() {
   if (chart) chart.destroy();
   chart = new Chart($("chart"), {
     type: "bar",
+    plugins: [barGlow],
     data: {
       labels: ticks,
       datasets: request.series.map((series, i) => ({
@@ -679,8 +705,17 @@ function renderChart() {
       animation: false,
       interaction: { mode: "index", intersect: false },
       onClick: (event, _elements, chartInstance) => openBar(event, chartInstance),
-      onHover: (event, elements) => {
+      onHover: (event, elements, chartInstance) => {
         event.native.target.style.cursor = elements.length ? "pointer" : "default";
+        // Glow the bar a click would open, or the whole column above the bars.
+        const [hit] = chartInstance.getElementsAtEventForMode(event, "nearest", { intersect: true }, false);
+        const glow = hit ? [hit] : elements;
+        const key = glow.map((e) => `${e.datasetIndex}:${e.index}`).join();
+        if (key !== chartInstance.$glowKey) {
+          chartInstance.$glowKey = key;
+          chartInstance.$glow = glow;
+          chartInstance.draw();
+        }
       },
       plugins: {
         legend: { display: false }, // the HTML legend above the chart has links
@@ -876,6 +911,8 @@ function downloadPng() {
   // Leave out a tooltip that is showing from the last hover or click.
   chart.tooltip.setActiveElements([], { x: 0, y: 0 });
   chart.setActiveElements([]);
+  chart.$glow = [];
+  chart.$glowKey = "";
   chart.update("none");
   const source = $("chart");
   const { request, results } = state.seasonal;
